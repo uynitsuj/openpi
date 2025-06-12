@@ -562,7 +562,7 @@ class TrainConfig:
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
     # checkpoint_base_dir: str = "./checkpoints"
-    checkpoint_base_dir: str = "/home/justinyu/nfs_us/justinyu/checkpoints"
+    checkpoint_base_dir: str = "/home/justinyu/checkpoints"
 
     # Random seed that will be used by random generators during training.
     seed: int = 42

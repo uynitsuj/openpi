@@ -587,7 +587,7 @@ class TrainConfig:
     resume: bool = False
 
     # If true, will enable wandb logging.
-    wandb_enabled: bool = True
+    wandb_enabled: bool = False # TEMPORARY WANDB OUTAGE LOL
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -999,7 +999,7 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi0_xmi_rby",
-        model=pi0.Pi0Config(action_dim=20, action_horizon=10),
+        model=pi0.Pi0Config(action_horizon=10),
         data=LeRobotXmiRbyDataConfig(
             repo_id="uynitsuj/xmi_bimanual_testing",
             default_prompt="testing",
@@ -1025,7 +1025,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_xmi_rby_low_mem_finetune",
-        model=pi0.Pi0Config(action_dim=20, action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0.Pi0Config(action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotXmiRbyDataConfig(
             repo_id="uynitsuj/xmi_bimanual_testing",
             default_prompt="testing",
@@ -1035,8 +1035,7 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
-        freeze_filter=pi0.Pi0Config(
-            action_dim=20, action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        freeze_filter=pi0.Pi0Config(action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,
     ),

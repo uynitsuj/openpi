@@ -420,6 +420,14 @@ def main(
                     writer.close()
                 
             dataset.save_episode()
+            
+    dataset.push_to_hub(
+        tags=["xmi", "rby", "xdof"],
+        private=True,
+        push_videos=True,
+        license="apache-2.0",
+    )
+
 
     # Consolidate the dataset, skip computing stats since we will do that later
     # dataset.consolidate(run_compute_stats=False)

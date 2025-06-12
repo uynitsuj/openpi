@@ -84,7 +84,8 @@ class XmiRbyInputs(transforms.DataTransformFn):
 
         # Add actions if available (during training)
         if "actions" in data:
-            inputs["actions"] = data["actions"]
+            actions = np.asarray(data["actions"])
+            inputs["actions"] = transforms.pad_to_dim(actions, self.action_dim)
 
         # Add language instruction if available
         if "prompt" in data:

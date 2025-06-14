@@ -889,7 +889,7 @@ def main(cfg: YAMSConfig):
             except Exception as tag_error:
                 print(f"⚠️  Version tag creation failed (may already exist): {tag_error}")
             
-        except Exception as e:
+            except Exception as e:
             print(f"❌ Failed to create/verify repository: {e}")
             print("Cannot proceed with hub push without repository access.")
             return
@@ -921,8 +921,8 @@ def main(cfg: YAMSConfig):
                 print(f"✅ Dataset successfully pushed to hub: {cfg.repo_name}")
                 print(f"🔗 View at: https://huggingface.co/datasets/{cfg.repo_name}")
                 
-            except Exception as e:
-                print(f"❌ Failed to push to hub: {e}")
+        except Exception as e:
+            print(f"❌ Failed to push to hub: {e}")
                 print("Dataset was created successfully locally, but hub push failed.")
                 print(f"You can manually push later with:")
                 print(f"  dataset = LeRobotDataset(repo_id='{cfg.repo_name}', root='{dataset_root}')")

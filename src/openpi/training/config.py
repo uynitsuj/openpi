@@ -1040,6 +1040,23 @@ _CONFIGS = [
         ema_decay=None,
     ),
     #
+    # Fine-tuning YAM configs.
+    TrainConfig(
+        name="pi0_yam",
+        model=pi0.Pi0Config(),
+        data=LeRobotYamDataConfig(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_yam_low_mem_finetune",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamDataConfig(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    #
+    #
     # Debugging configs.
     #
     TrainConfig(

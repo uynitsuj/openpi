@@ -23,9 +23,18 @@ import gc
 
 @dataclass
 class YAMSConfig:
-    yam_data_path: str = "/home/justinyu/nfs_us/nfs/data/sz_05/20250425"
+    yam_data_path: str | List[str] = field(default_factory=lambda: [
+        "/home/justinyu/nfs_us/nfs/data/sz_05/20250416", 
+        "/home/justinyu/nfs_us/nfs/data/sz_05/20250425", 
+        "/home/justinyu/nfs_us/nfs/data/sz_04/20250415",
+        "/home/justinyu/nfs_us/nfs/data/sz_04/20250412",
+        "/home/justinyu/nfs_us/nfs/data/sz_04/20250411",
+        "/home/justinyu/nfs_us/nfs/data/sz_04/20250410",
+        "/home/justinyu/nfs_us/nfs/data/sz_03/20250423",
+        "/home/justinyu/nfs_us/nfs/data/sz_03/20250417"
+    ])
     output_dir: Path = Path("/home/justinyu/nfs_us/justinyu/yam_lerobot_datasets")
-    repo_name: str = "uynitsuj/yam_bimanual_load_dishes"
+    repo_name: str = "uynitsuj/yam_bimanual_load_dishes_061625_1215"
     language_instruction: str = "Perform bimanual manipulation task" # Default task name; gets overwritten by task name in metadata
     
     # YAMS camera keys
@@ -36,11 +45,14 @@ class YAMSConfig:
     resize_size: int = 224
     fps: int = 30
     chunk_size: int = 1000
-    max_workers: int = 8 # Set lower on machines with less memory
+    max_workers: int = 4 # Set lower on machines with less memory
     filter_quality: bool = True
     max_episodes: Optional[int] = None
     skip_videos: bool = False
     push_to_hub: bool = True
+    
+    # Memory management settings
+    max_frames_per_chunk: int = 1000  # Process episodes in chunks to avoid OOM on long episodes
     
     # Video encoding settings
     benchmark_encoders: bool = True  # Benchmark encoders on first episode
@@ -107,6 +119,7 @@ def extract_task_name_from_episode(episode_data: dict, episode_path: Path) -> st
 # Import LeRobotDataset for hub operations
 try:
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.common.datasets.utils import write_episode_stats
     HAS_LEROBOT = True
 except ImportError:
     print("Warning: LeRobot not available. Hub push functionality disabled.")
@@ -523,78 +536,236 @@ def encode_video_simple(frames: List[np.ndarray], save_path: Path, fps: int):
             pass
 
 
+def compute_basic_episode_stats(episode_idx: int, episode_info: dict, cfg: YAMSConfig, base_dir: Path) -> dict:
+    """Compute basic statistics for an episode to create v2.1 compatible episodes_stats.jsonl"""
+    
+    # Load the episode parquet file
+    chunk_id = episode_idx // cfg.chunk_size
+    parquet_path = base_dir / "data" / f"chunk-{chunk_id:03d}" / f"episode_{episode_idx:06d}.parquet"
+    
+    if not parquet_path.exists():
+        # Return minimal stats if parquet doesn't exist
+        return {
+            "state": {
+                "min": np.zeros(14, dtype=np.float32),
+                "max": np.zeros(14, dtype=np.float32), 
+                "mean": np.zeros(14, dtype=np.float32),
+                "std": np.ones(14, dtype=np.float32),
+                "count": np.array([1], dtype=np.int64)
+            },
+            "actions": {
+                "min": np.zeros(14, dtype=np.float32),
+                "max": np.zeros(14, dtype=np.float32),
+                "mean": np.zeros(14, dtype=np.float32),
+                "std": np.ones(14, dtype=np.float32),
+                "count": np.array([1], dtype=np.int64)
+            },
+        }
+    
+    # Load episode data
+    df = pd.read_parquet(parquet_path)
+    episode_length = len(df)
+    
+    episode_stats = {}
+    
+    # Compute stats for state and actions (vector features)
+    for feature_name in ["state", "actions"]:
+        if feature_name in df.columns:
+            # Convert list columns to numpy arrays
+            data = np.array(df[feature_name].tolist(), dtype=np.float32)
+            
+            episode_stats[feature_name] = {
+                "min": data.min(axis=0),
+                "max": data.max(axis=0), 
+                "mean": data.mean(axis=0),
+                "std": data.std(axis=0),
+                "count": np.array([episode_length], dtype=np.int64),
+            }
+    
+    # Add stats for scalar features with proper keepdims handling
+    for feature_name in ["timestamp", "frame_index", "episode_index", "index", "task_index"]:
+        if feature_name in df.columns:
+            data = df[feature_name].values.astype(np.float32)
+            if len(data.shape) > 1:
+                data = data.flatten()
+            
+            # For 1D data, LeRobot expects keepdims=True if original was 1D
+            episode_stats[feature_name] = {
+                "min": np.array([data.min()], dtype=np.float32),
+                "max": np.array([data.max()], dtype=np.float32),
+                "mean": np.array([data.mean()], dtype=np.float32),
+                "std": np.array([data.std()], dtype=np.float32),
+                "count": np.array([episode_length], dtype=np.int64),
+            }
+    
+    # Add video stats if not skipping videos (normalized to [0,1] range)
+    if not cfg.skip_videos:
+        for cam_key in cfg.camera_keys:
+            # For images/videos, LeRobot expects shape (C, H, W) stats normalized to [0,1]
+            # We provide reasonable defaults for RGB images
+            episode_stats[cam_key] = {
+                "min": np.array([0.0, 0.0, 0.0], dtype=np.float32).reshape(3, 1, 1),
+                "max": np.array([1.0, 1.0, 1.0], dtype=np.float32).reshape(3, 1, 1),
+                "mean": np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(3, 1, 1),
+                "std": np.array([0.25, 0.25, 0.25], dtype=np.float32).reshape(3, 1, 1),
+                "count": np.array([episode_length], dtype=np.int64),
+            }
+    
+    return episode_stats
+
+
+def write_episode_metadata_immediately(episode_data: dict, tasks: list[str], base_dir: Path):
+    """Write episode and task metadata immediately after processing each episode."""
+    
+    # Write episode metadata
+    episodes_file = base_dir / "meta" / "episodes.jsonl"
+    with open(episodes_file, "a") as f:
+        f.write(json.dumps(episode_data) + "\n")
+    
+    # Load existing tasks to avoid duplicates
+    existing_tasks = {}
+    tasks_file = base_dir / "meta" / "tasks.jsonl"
+    
+    if tasks_file.exists():
+        with open(tasks_file, "r") as f:
+            for line in f:
+                task_data = json.loads(line.strip())
+                existing_tasks[task_data['task']] = task_data['task_index']
+    
+    # Add new tasks if they don't exist
+    new_tasks_added = False
+    for task in tasks:
+        if task not in existing_tasks:
+            task_index = len(existing_tasks)
+            existing_tasks[task] = task_index
+            new_tasks_added = True
+            
+            # Append new task immediately
+            with open(tasks_file, "a") as f:
+                f.write(json.dumps({"task_index": task_index, "task": task}) + "\n")
+    
+    return existing_tasks
+
+
+def process_episode_in_chunks(episode_data: dict, cfg: YAMSConfig, max_chunk_frames: int = 1000) -> tuple[list, dict]:
+    """Process episode data in memory-efficient chunks to handle long episodes."""
+    
+    # Process joint data first (this is relatively small)
+    full_joint_state = process_joint_data(episode_data['joint_data'])
+    if full_joint_state is None:
+        return [], {}
+    
+    # Determine sequence length
+    total_length = len(full_joint_state) - 1  # -1 because we need next state for actions
+    if total_length <= 0:
+        return [], {}
+    
+    # Calculate actions for the full episode (joint data is manageable)
+    joint_states, joint_actions = calculate_actions(full_joint_state, total_length)
+    
+    all_records = []
+    all_image_data = {}
+    
+    # Process in chunks to avoid OOM
+    for chunk_start in range(0, total_length, max_chunk_frames):
+        chunk_end = min(chunk_start + max_chunk_frames, total_length)
+        chunk_length = chunk_end - chunk_start
+        
+        # print(f"  Processing frames {chunk_start}-{chunk_end-1} ({chunk_length} frames)")
+        
+        # Process joint data for this chunk
+        chunk_joint_states = joint_states[chunk_start:chunk_end]
+        chunk_joint_actions = joint_actions[chunk_start:chunk_end]
+        
+        # Process images for this chunk if not skipping videos
+        chunk_image_data = {}
+        if not cfg.skip_videos and 'images' in episode_data:
+            for cam_key in cfg.camera_keys:
+                if cam_key in episode_data['images']:
+                    # Get images for this chunk
+                    images = episode_data['images'][cam_key][chunk_start:chunk_end]
+                    
+                    # Resize images for this chunk
+                    resized_images = []
+                    for img in images:
+                        if isinstance(img, np.ndarray):
+                            resized_img = resize_with_pad(img, cfg.resize_size, cfg.resize_size)
+                            resized_images.append(convert_to_uint8(resized_img))
+                    
+                    if cam_key not in all_image_data:
+                        all_image_data[cam_key] = []
+                    all_image_data[cam_key].extend(resized_images)
+                    
+                    # Clear chunk data to free memory
+                    del resized_images
+        
+        # Create records for this chunk
+        for step in range(chunk_length):
+            global_step = chunk_start + step
+            joint_pos = chunk_joint_states[step]
+            action = chunk_joint_actions[step]
+            
+            record = {
+                "state": joint_pos.tolist(),
+                "actions": action.tolist(),
+                "timestamp": [global_step / cfg.fps],
+                "frame_index": [global_step],
+                "episode_index": [0],  # Will be updated later
+                "index": [global_step],
+                "task_index": [0],  # Will be updated later
+            }
+            all_records.append(record)
+        
+        # Force garbage collection after each chunk
+        gc.collect()
+    
+    return all_records, all_image_data
+
+
 def process_yam_episode(
     idx: int, episode_path: Path, language_instruction: str, cfg: YAMSConfig, episode_base: Path,
     base_dir: Path, encoder_name: str = None, encoding_quality: str = 'fast'
 ):
     """Process a single YAM episode and save it directly to LeRobot format."""
     
+    # print(f"Processing episode {idx}: {episode_path.name}")
+    
     # Quality filtering
     if cfg.filter_quality and not is_episode_good_quality(episode_path):
+        print(f"  Skipping episode {idx}: poor quality")
         return None
     
     # Load episode data
     episode_data = load_yams_episode_data_fast(episode_path)
     if not episode_data:
+        print(f"  Failed to load episode {idx}")
         return None
     
     # Extract task name from episode metadata instead of using hardcoded value
     task_name = extract_task_name_from_episode(episode_data, episode_path)
     
-    # Process joint data
-    full_joint_state = process_joint_data(episode_data['joint_data'])
-    if full_joint_state is None:
+    # Process episode in memory-efficient chunks
+    try:
+        records, image_data = process_episode_in_chunks(episode_data, cfg, max_chunk_frames=cfg.max_frames_per_chunk)
+        if not records:
+            print(f"  No valid data in episode {idx}")
+            return None
+        
+        seq_length = len(records)
+        print(f"  Episode {idx}: {seq_length} frames total")
+        
+    except Exception as e:
+        print(f"  Error processing episode {idx}: {e}")
         return None
     
-    # Determine sequence length
-    seq_length = len(full_joint_state) - 1  # -1 because we need next state for actions
-    if seq_length <= 0:
-        return None
-    
-    # Calculate actions
-    joint_states, joint_actions = calculate_actions(full_joint_state, seq_length)
-    
-    # Process images if not skipping videos
-    image_data = {}
-    if not cfg.skip_videos and 'images' in episode_data:
-        for cam_key in cfg.camera_keys:
-            if cam_key in episode_data['images']:
-                images = episode_data['images'][cam_key]
-                
-                if len(images) > seq_length:
-                    images = images[:seq_length]
-                elif len(images) < seq_length:
-                    # Repeat last frame if needed
-                    last_image = images[-1] if images else np.zeros((cfg.resize_size, cfg.resize_size, 3), dtype=np.uint8)
-                    images.extend([last_image] * (seq_length - len(images)))
-                
-                # Resize images
-                resized_images = []
-                for img in images:
-                    if isinstance(img, np.ndarray):
-                        resized_img = resize_with_pad(img, cfg.resize_size, cfg.resize_size)
-                        resized_images.append(convert_to_uint8(resized_img))
-                
-                image_data[cam_key] = resized_images
+    # Update episode and task indices in records
+    for record in records:
+        record["episode_index"] = [idx]
+        record["index"] = [record["frame_index"][0]]  # Global frame index will be updated later
     
     # Save parquet (joint positions + actions per frame)
-    records = []
-    for step in range(seq_length):
-        joint_pos = joint_states[step]
-        action = joint_actions[step]
-        
-        record = {
-            "state": joint_pos.tolist(),
-            "actions": action.tolist(),
-            "timestamp": [step / cfg.fps],
-            "frame_index": [step],
-            "episode_index": [idx],
-            "index": [step],
-            "task_index": [0],
-        }
-        records.append(record)
-    
     episode_path_out = episode_base / f"episode_{idx:06d}.parquet"
+    episode_path_out.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(records).to_parquet(episode_path_out)
     
     # Save videos if not skipping
@@ -608,36 +779,187 @@ def process_yam_episode(
                 
                 frames = image_data[cam_key]
                 if frames:
+                    # print(f"  Encoding video {cam_key}: {len(frames)} frames")
                     if encoder_name:
                         encode_video_optimized(frames, save_path, cfg.fps, encoder_name, encoding_quality)
                     else:
                         encode_video_simple(frames, save_path, cfg.fps)
     
-    # Clean up memory
-    del episode_data, full_joint_state, joint_states, joint_actions, image_data
-    gc.collect()
+    # Compute and write episode stats immediately
+    episode_stats = compute_basic_episode_stats(idx, {"length": seq_length}, cfg, base_dir)
+    if HAS_LEROBOT:
+        write_episode_stats(idx, episode_stats, base_dir)
     
-    # Return metadata for episode
-    return {
+    # Write episode metadata immediately
+    episode_metadata = {
         "episode_index": idx,
         "tasks": [task_name],
         "length": seq_length,
     }
+    
+    task_mapping = write_episode_metadata_immediately(episode_metadata, [task_name], base_dir)
+    
+    # Update task index in the episode metadata
+    task_index = task_mapping.get(task_name, 0)
+    episode_metadata["task_index"] = task_index
+    
+    # Clean up memory
+    del episode_data, records, image_data
+    gc.collect()
+    
+    # print(f"  Completed episode {idx}: {seq_length} frames, task '{task_name}'")
+    
+    # Return metadata for final statistics
+    return episode_metadata
+
+
+def find_completed_episodes(base_dir: Path, total_episodes: int, chunk_size: int) -> set[int]:
+    """Find episodes that have already been processed by checking for existing parquet files."""
+    completed_episodes = set()
+    
+    data_dir = base_dir / "data"
+    if not data_dir.exists():
+        return completed_episodes
+    
+    # Check each chunk directory for completed episodes
+    for chunk_id in range((total_episodes + chunk_size - 1) // chunk_size):
+        chunk_dir = data_dir / f"chunk-{chunk_id:03d}"
+        if chunk_dir.exists():
+            for parquet_file in chunk_dir.glob("episode_*.parquet"):
+                # Extract episode index from filename
+                episode_name = parquet_file.stem  # removes .parquet
+                if episode_name.startswith("episode_"):
+                    try:
+                        episode_idx = int(episode_name.split("_")[1])
+                        completed_episodes.add(episode_idx)
+                    except (ValueError, IndexError):
+                        continue
+    
+    return completed_episodes
+
+
+def reconstruct_metadata_from_files(base_dir: Path, completed_episodes: set[int], cfg: YAMSConfig) -> tuple[list, dict]:
+    """Reconstruct missing metadata from existing parquet files for backwards compatibility."""
+    print("Reconstructing metadata from existing files for backwards compatibility...")
+    
+    reconstructed_episodes = []
+    reconstructed_tasks = {}
+    task_counter = 0
+    
+    for episode_idx in sorted(completed_episodes):
+        # Load the parquet file to extract metadata
+        chunk_id = episode_idx // cfg.chunk_size
+        parquet_path = base_dir / "data" / f"chunk-{chunk_id:03d}" / f"episode_{episode_idx:06d}.parquet"
+        
+        if parquet_path.exists():
+            try:
+                df = pd.read_parquet(parquet_path)
+                episode_length = len(df)
+                
+                # Try to determine task name from episode directory structure or use default
+                # Since we don't have access to original episode path here, use default
+                default_task = "Perform bimanual manipulation task"
+                
+                # Add task if not already present
+                if default_task not in reconstructed_tasks:
+                    reconstructed_tasks[default_task] = task_counter
+                    task_counter += 1
+                
+                task_index = reconstructed_tasks[default_task]
+                
+                # Create episode metadata
+                episode_metadata = {
+                    "episode_index": episode_idx,
+                    "tasks": [default_task],
+                    "length": episode_length,
+                    "task_index": task_index
+                }
+                
+                reconstructed_episodes.append(episode_metadata)
+                print(f"  Reconstructed metadata for episode {episode_idx}: {episode_length} frames")
+                
+            except Exception as e:
+                print(f"  Warning: Could not reconstruct metadata for episode {episode_idx}: {e}")
+    
+    return reconstructed_episodes, reconstructed_tasks
+
+
+def filter_episodes_for_resume(episode_dirs: list[Path], base_dir: Path, chunk_size: int) -> tuple[list[Path], list[int]]:
+    """Filter episode directories to only process incomplete episodes for resume functionality."""
+    total_episodes = len(episode_dirs)
+    completed_episodes = find_completed_episodes(base_dir, total_episodes, chunk_size)
+    
+    if completed_episodes:
+        print(f"Found {len(completed_episodes)} already completed episodes")
+        
+        # Check if metadata files exist (for backwards compatibility)
+        episodes_file = base_dir / "meta" / "episodes.jsonl"
+        tasks_file = base_dir / "meta" / "tasks.jsonl"
+        
+        if not episodes_file.exists() or not tasks_file.exists():
+            print("Metadata files missing - this appears to be from an old incomplete run")
+            print("Reconstructing metadata from existing files...")
+            
+            # Reconstruct metadata from parquet files
+            reconstructed_episodes, reconstructed_tasks = reconstruct_metadata_from_files(
+                base_dir, completed_episodes, YAMSConfig()  # Use default config for reconstruction
+            )
+            
+            # Write the reconstructed metadata
+            base_dir.joinpath("meta").mkdir(exist_ok=True)
+            
+            # Write episodes.jsonl
+            with open(episodes_file, "w") as f:
+                for episode in reconstructed_episodes:
+                    f.write(json.dumps(episode) + "\n")
+            
+            # Write tasks.jsonl
+            with open(tasks_file, "w") as f:
+                for task, task_index in reconstructed_tasks.items():
+                    f.write(json.dumps({"task_index": task_index, "task": task}) + "\n")
+            
+            print(f"Reconstructed metadata for {len(reconstructed_episodes)} episodes")
+        
+        print(f"Resuming from episode {min(set(range(total_episodes)) - completed_episodes) if completed_episodes != set(range(total_episodes)) else total_episodes}")
+    
+    # Filter out completed episodes
+    remaining_dirs = []
+    remaining_indices = []
+    
+    for idx, episode_dir in enumerate(episode_dirs):
+        if idx not in completed_episodes:
+            remaining_dirs.append(episode_dir)
+            remaining_indices.append(idx)
+    
+    return remaining_dirs, remaining_indices
 
 
 def main(cfg: YAMSConfig):
     """Main function to convert YAMS data to LeRobot format."""
     
     print("=== Direct YAMS to LeRobot Converter ===")
-    print(f"Input path: {cfg.yam_data_path}")
+    
+    # Handle both single path and list of paths for display
+    if isinstance(cfg.yam_data_path, list):
+        print(f"Input paths:")
+        for i, path in enumerate(cfg.yam_data_path, 1):
+            print(f"  {i}. {path}")
+    else:
+        print(f"Input path: {cfg.yam_data_path}")
+    
     print(f"Output path: {cfg.output_dir}")
     print(f"Repository name: {cfg.repo_name}")
     print(f"Skip videos: {cfg.skip_videos}")
     print(f"Max episodes: {cfg.max_episodes or 'unlimited'}")
     print(f"Max workers: {cfg.max_workers}")
     
-    # Find episodes
-    episode_dirs = find_episode_directories(Path(cfg.yam_data_path))
+    # Find episodes - handle both single path and list of paths
+    if isinstance(cfg.yam_data_path, list):
+        input_paths = [Path(path) for path in cfg.yam_data_path]
+    else:
+        input_paths = Path(cfg.yam_data_path)
+    
+    episode_dirs = find_episode_directories(input_paths)
     if cfg.max_episodes:
         episode_dirs = episode_dirs[:cfg.max_episodes]
     
@@ -649,14 +971,39 @@ def main(cfg: YAMSConfig):
     
     # Prepare folders - include repo_name in path structure
     base_dir = cfg.output_dir / cfg.repo_name
-    if base_dir.exists():
-        import shutil
-        shutil.rmtree(base_dir)
     
-    (base_dir / "data").mkdir(parents=True, exist_ok=True)
-    (base_dir / "meta").mkdir(exist_ok=True)
-    if not cfg.skip_videos:
-        (base_dir / "videos").mkdir(exist_ok=True)
+    # Check for resume capability
+    resume_mode = False
+    if base_dir.exists():
+        print("Dataset directory already exists - checking for resume capability...")
+        remaining_dirs, remaining_indices = filter_episodes_for_resume(episode_dirs, base_dir, cfg.chunk_size)
+        
+        if len(remaining_dirs) < len(episode_dirs):
+            resume_mode = True
+            print(f"Resume mode: {len(episode_dirs) - len(remaining_dirs)} episodes already completed")
+            print(f"Will process {len(remaining_dirs)} remaining episodes")
+            episode_dirs = remaining_dirs
+            episode_indices = remaining_indices
+        else:
+            print("No completed episodes found - starting fresh")
+            import shutil
+            shutil.rmtree(base_dir)
+            episode_indices = list(range(len(episode_dirs)))
+    else:
+        episode_indices = list(range(len(episode_dirs)))
+    
+    if not resume_mode:
+        # Only create/clear directories if not in resume mode
+        (base_dir / "data").mkdir(parents=True, exist_ok=True)
+        (base_dir / "meta").mkdir(exist_ok=True)
+        if not cfg.skip_videos:
+            (base_dir / "videos").mkdir(exist_ok=True)
+    else:
+        # Ensure directories exist for resume mode
+        (base_dir / "data").mkdir(parents=True, exist_ok=True)
+        (base_dir / "meta").mkdir(exist_ok=True)
+        if not cfg.skip_videos:
+            (base_dir / "videos").mkdir(exist_ok=True)
     
     # Create chunk directories
     num_chunks = (len(episode_dirs) + cfg.chunk_size - 1) // cfg.chunk_size
@@ -706,18 +1053,18 @@ def main(cfg: YAMSConfig):
     # Process episodes
     all_episodes = []
     
-    print(f"\nProcessing {len(episode_dirs)} episodes...")
+    # print(f"\nProcessing {len(episode_dirs)} episodes...")
     
     if cfg.max_workers > 1:
         # Parallel processing
         with ProcessPoolExecutor(max_workers=cfg.max_workers) as executor:
             futures = []
-            for idx, episode_path in enumerate(episode_dirs):
-                chunk_id = idx // cfg.chunk_size
+            for i, (episode_idx, episode_path) in enumerate(zip(episode_indices, episode_dirs)):
+                chunk_id = episode_idx // cfg.chunk_size
                 futures.append(
                     executor.submit(
                         process_yam_episode,
-                        idx,
+                        episode_idx,  # Use original episode index
                         episode_path,
                         cfg.language_instruction,
                         cfg,
@@ -734,10 +1081,10 @@ def main(cfg: YAMSConfig):
                     all_episodes.append(result)
     else:
         # Sequential processing (for debugging)
-        for idx, episode_path in enumerate(tqdm(episode_dirs, desc="Processing episodes")):
-            chunk_id = idx // cfg.chunk_size
+        for episode_idx, episode_path in zip(episode_indices, tqdm(episode_dirs, desc="Processing episodes")):
+            chunk_id = episode_idx // cfg.chunk_size
             result = process_yam_episode(
-                idx,
+                episode_idx,  # Use original episode index
                 episode_path, 
                 cfg.language_instruction,
                 cfg,
@@ -752,38 +1099,42 @@ def main(cfg: YAMSConfig):
     print(f"Successfully processed {len(all_episodes)} episodes")
     
     if not all_episodes:
-        print("No episodes were successfully processed!")
-        return
+        print("No new episodes were processed!")
+        # Still need to update info.json and complete if we're in resume mode
+        if resume_mode:
+            print("Updating dataset info for resume completion...")
+        else:
+            return
     
-    # Collect unique task names and create task mapping
-    unique_tasks = set()
-    for episode in all_episodes:
-        unique_tasks.update(episode['tasks'])
+    # For resume mode or if we have processed episodes, read all metadata to get totals
+    print("Reading all metadata to calculate final statistics...")
     
-    unique_tasks = sorted(list(unique_tasks))  # Sort for consistency
-    task_to_index = {task: idx for idx, task in enumerate(unique_tasks)}
+    # Read all episodes from episodes.jsonl
+    all_combined_episodes = []
+    episodes_file = base_dir / "meta" / "episodes.jsonl"
+    if episodes_file.exists():
+        with open(episodes_file, 'r') as f:
+            for line in f:
+                all_combined_episodes.append(json.loads(line.strip()))
     
-    print(f"Found {len(unique_tasks)} unique tasks:")
-    for idx, task in enumerate(unique_tasks):
-        print(f"  {idx}: {task}")
+    # Read all tasks from tasks.jsonl
+    all_tasks = {}
+    tasks_file = base_dir / "meta" / "tasks.jsonl"
+    if tasks_file.exists():
+        with open(tasks_file, 'r') as f:
+            for line in f:
+                task_data = json.loads(line.strip())
+                all_tasks[task_data['task_index']] = task_data['task']
     
-    # Write tasks.jsonl with actual task names
-    with open(base_dir / "meta" / "tasks.jsonl", "w") as f:
-        for idx, task in enumerate(unique_tasks):
-            f.write(json.dumps({"task_index": idx, "task": task}) + "\n")
+    # Sort episodes by episode_index for consistency
+    all_combined_episodes.sort(key=lambda x: x['episode_index'])
     
-    # Update episodes with correct task indices and write episodes.jsonl
-    with open(base_dir / "meta" / "episodes.jsonl", "w") as f:
-        for epi in all_episodes:
-            # Convert task names to task indices
-            task_indices = [task_to_index[task] for task in epi['tasks']]
-            epi_updated = epi.copy()
-            epi_updated['task_index'] = task_indices[0] if task_indices else 0  # Use first task index
-            f.write(json.dumps(epi_updated) + "\n")
+    print(f"Dataset contains {len(all_combined_episodes)} total episodes")
+    print(f"Dataset contains {len(all_tasks)} unique tasks")
     
-    # Calculate dataset statistics
-    total_frames = sum(e["length"] for e in all_episodes)
-    actual_chunks = (len(all_episodes) + cfg.chunk_size - 1) // cfg.chunk_size
+    # Calculate final dataset statistics
+    total_frames = sum(e["length"] for e in all_combined_episodes)
+    actual_chunks = (len(all_combined_episodes) + cfg.chunk_size - 1) // cfg.chunk_size
     
     # Write info.json
     features = {
@@ -824,16 +1175,16 @@ def main(cfg: YAMSConfig):
             }
     
     info = {
-        "codebase_version": "v2.0",
+        "codebase_version": "v2.1",
         "robot_type": "yams",
-        "total_episodes": len(all_episodes),
+        "total_episodes": len(all_combined_episodes),
         "total_frames": total_frames,
-        "total_tasks": len(unique_tasks),
-        "total_videos": len(cfg.camera_keys) * len(all_episodes) if not cfg.skip_videos else 0,
+        "total_tasks": len(all_tasks),
+        "total_videos": len(cfg.camera_keys) * len(all_combined_episodes) if not cfg.skip_videos else 0,
         "total_chunks": actual_chunks,
         "chunks_size": cfg.chunk_size,
         "fps": cfg.fps,
-        "splits": {"train": f"0:{len(all_episodes)}"},
+        "splits": {"train": f"0:{len(all_combined_episodes)}"},
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
         "features": features
@@ -844,7 +1195,11 @@ def main(cfg: YAMSConfig):
     
     print(f"\n=== Conversion Complete ===")
     print(f"Dataset saved to: {cfg.output_dir}")
-    print(f"Total episodes: {len(all_episodes)}")
+    if resume_mode:
+        print(f"Processed {len(all_episodes)} new episodes")
+        print(f"Total episodes in dataset: {len(all_combined_episodes)}")
+    else:
+        print(f"Total episodes: {len(all_combined_episodes)}")
     print(f"Total frames: {total_frames}")
     print(f"Total chunks: {actual_chunks}")
 
@@ -882,14 +1237,14 @@ def main(cfg: YAMSConfig):
             try:
                 api.create_tag(
                     repo_id=cfg.repo_name,
-                    tag="v2.0",  # Match the codebase_version in info.json
+                    tag="v2.1",  # Match the codebase_version in info.json
                     repo_type="dataset"
                 )
-                print(f"✅ Version tag created: v2.0")
+                print(f"✅ Version tag created: v2.1")
             except Exception as tag_error:
                 print(f"⚠️  Version tag creation failed (may already exist): {tag_error}")
             
-            except Exception as e:
+        except Exception as e:
             print(f"❌ Failed to create/verify repository: {e}")
             print("Cannot proceed with hub push without repository access.")
             return
@@ -921,8 +1276,8 @@ def main(cfg: YAMSConfig):
                 print(f"✅ Dataset successfully pushed to hub: {cfg.repo_name}")
                 print(f"🔗 View at: https://huggingface.co/datasets/{cfg.repo_name}")
                 
-        except Exception as e:
-            print(f"❌ Failed to push to hub: {e}")
+            except Exception as e:
+                print(f"❌ Failed to push to hub: {e}")
                 print("Dataset was created successfully locally, but hub push failed.")
                 print(f"You can manually push later with:")
                 print(f"  dataset = LeRobotDataset(repo_id='{cfg.repo_name}', root='{dataset_root}')")

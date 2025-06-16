@@ -28,12 +28,20 @@ CAMERA_KEY_MAPPING = {
 }
 
 
-def find_episode_directories(parent_dir: Path) -> List[Path]:
+def find_episode_directories(parent_dir: Path | List[Path]) -> List[Path]:
     """Find all YAMS episode directories."""
+    
+    # Handle both single path and list of paths
+    if isinstance(parent_dir, list):
+        parent_dirs = [Path(dir) for dir in parent_dir]
+    else:
+        parent_dirs = [Path(parent_dir)]
+
     episode_dirs = []
-    for item in parent_dir.iterdir():
-        if item.is_dir() and item.name.startswith("episode_") and item.name.endswith(".npy.mp4"):
-            episode_dirs.append(item)
+    for parent in parent_dirs:
+        for item in parent.iterdir():
+            if item.is_dir() and item.name.startswith("episode_") and item.name.endswith(".npy.mp4"):
+                episode_dirs.append(item)
     return sorted(episode_dirs)
 
 
@@ -219,4 +227,4 @@ def create_frame_data(joint_states: np.ndarray, joint_actions: np.ndarray,
         
         frames_data.append(frame_data)
     
-    return frames_data 
+    return frames_data

@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.xmi_rby_policy as xmi_rby_policy
+import openpi.policies.yam_policy as yam_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -523,6 +524,54 @@ class LeRobotXmiRbyDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotYamDataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms for the YAM bimanual robot dataset.
+    
+    The YAM data uses absolute joint positions:
+    - State format: [left_6_joints, left_1_gripper, right_6_joints, right_1_gripper] = 14D
+    - Three camera views: left exterior, right exterior, and top
+    - Actions are absolute joint positions
+    """
+    
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "left_camera-images-rgb": "left_camera-images-rgb",
+                        "right_camera-images-rgb": "right_camera-images-rgb", 
+                        "top_camera-images-rgb": "top_camera-images-rgb",
+                        "state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        # Data transforms using YAM policy transforms           
+        data_transforms = _transforms.Group(
+            inputs=[yam_policy.YamInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[yam_policy.YamOutputs()],
+        )
+
+        # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1043,17 +1092,38 @@ _CONFIGS = [
     # Fine-tuning YAM configs.
     TrainConfig(
         name="pi0_yam",
-        model=pi0.Pi0Config(),
-        data=LeRobotYamDataConfig(),
+        model=pi0.Pi0Config(action_horizon=10),
+        data=LeRobotYamDataConfig(
+            repo_id="uynitsuj/yam_bimanual_load_dishes",
+            default_prompt="load dishes",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
     ),
     TrainConfig(
         name="pi0_yam_low_mem_finetune",
-        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-        data=LeRobotYamDataConfig(),
+        model=pi0.Pi0Config(action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamDataConfig(
+            repo_id="uynitsuj/yam_bimanual_load_dishes",
+            default_prompt="load dishes",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
     ),
     #
     #

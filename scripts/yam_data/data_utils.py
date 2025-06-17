@@ -189,21 +189,25 @@ def process_images(images: Dict, seq_length: int, resize_size: int, skip_videos:
     
     return processed_images
 
-
-def calculate_actions(full_joint_state: np.ndarray, seq_length: int) -> tuple:
-    """Calculate joint actions from joint states."""
-    # Pre-calculate all actions at once (vectorized)
-    joint_states = full_joint_state[:seq_length]  # Current states
-    next_states = full_joint_state[1:seq_length+1]  # Next states
-    
-    # Calculate delta actions vectorized
-    joint_actions = next_states - joint_states
-    
-    # For grippers, use absolute position instead of delta (vectorized)
-    joint_actions[:, 6] = next_states[:, 6]    # left gripper absolute
-    joint_actions[:, 13] = next_states[:, 13]  # right gripper absolute
-    
+def calculate_actions(full_joint_state: np.ndarray, seq_length: int):
+    joint_states = full_joint_state[:seq_length]
+    joint_actions = joint_states.copy()  # absolute actions = joint state itself
     return joint_states, joint_actions
+
+# def calculate_actions(full_joint_state: np.ndarray, seq_length: int) -> tuple: # RELATIVE, DOES NOT SEEM TO WORK WELL
+#     """Calculate joint actions from joint states."""
+#     # Pre-calculate all actions at once (vectorized)
+#     joint_states = full_joint_state[:seq_length]  # Current states
+#     next_states = full_joint_state[1:seq_length+1]  # Next states
+    
+#     # Calculate delta actions vectorized
+#     joint_actions = next_states - joint_states
+    
+#     # For grippers, use absolute position instead of delta (vectorized)
+#     joint_actions[:, 6] = next_states[:, 6]    # left gripper absolute
+#     joint_actions[:, 13] = next_states[:, 13]  # right gripper absolute
+    
+#     return joint_states, joint_actions
 
 
 def create_frame_data(joint_states: np.ndarray, joint_actions: np.ndarray, 

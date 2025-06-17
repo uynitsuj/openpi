@@ -558,7 +558,7 @@ class LeRobotYamDataConfig(DataConfigFactory):
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
-        # Data transforms using YAM policy transforms           
+        # Data transforms using YAM policy transforms
         data_transforms = _transforms.Group(
             inputs=[yam_policy.YamInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
             outputs=[yam_policy.YamOutputs()],
@@ -636,7 +636,7 @@ class TrainConfig:
     resume: bool = False
 
     # If true, will enable wandb logging.
-    wandb_enabled: bool = False # TEMPORARY WANDB OUTAGE LOL
+    wandb_enabled: bool = True
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None

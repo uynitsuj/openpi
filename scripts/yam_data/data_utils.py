@@ -103,7 +103,10 @@ def load_yams_episode_data_fast(episode_path: Path) -> Optional[Dict]:
             "left-joint_pos.npy",
             "right-joint_pos.npy", 
             "left-gripper_pos.npy",
-            "right-gripper_pos.npy"
+            "right-gripper_pos.npy",
+
+            "action-left-pos.npy",
+            "action-right-pos.npy"
         ]
         
         # Load all joint files at once
@@ -140,19 +143,19 @@ def load_yams_episode_data_fast(episode_path: Path) -> Optional[Dict]:
         return None
 
 
-def process_joint_data(joint_data: Dict) -> Optional[np.ndarray]:
+def process_joint_data(joint_data: Dict) -> tuple[np.ndarray, Optional[np.ndarray]]:
     """Process and combine joint data from YAMS episode."""
     # Check if we have the required joint data
     required_keys = ['left-joint_pos', 'right-joint_pos', 'left-gripper_pos', 'right-gripper_pos']
     if not all(key in joint_data for key in required_keys):
-        return None
+        raise ValueError("Missing required joint data keys")
     
     # Get joint positions and gripper positions (use views, not copies)
     left_joint_pos = joint_data['left-joint_pos']  # Shape: (N, 6)
     right_joint_pos = joint_data['right-joint_pos']  # Shape: (N, 6)
     left_gripper_pos = joint_data['left-gripper_pos']  # Shape: (N, 1)
     right_gripper_pos = joint_data['right-gripper_pos']  # Shape: (N, 1)
-    
+
     # Apply joint position flipping (create copies only when needed)
     # left_joint_pos = np.flip(left_joint_pos, axis=1).copy()  # Copy needed for flip # BAD BAD BAD
     # right_joint_pos = np.flip(right_joint_pos, axis=1).copy()  # Copy needed for flip # BAD BAD BAD
@@ -165,8 +168,16 @@ def process_joint_data(joint_data: Dict) -> Optional[np.ndarray]:
     full_joint_state[:, 6:7] = left_gripper_pos
     full_joint_state[:, 7:13] = right_joint_pos
     full_joint_state[:, 13:14] = right_gripper_pos
-    
-    return full_joint_state
+
+    if 'action-left-pos' in joint_data and 'action-right-pos' in joint_data: # Some datasets have action data, some don't
+        full_joint_action = np.empty((seq_length, 14), dtype=np.float32)
+        left_action_pos = joint_data['action-left-pos']  # Shape: (N, 7) (includes gripper)
+        right_action_pos = joint_data['action-right-pos']  # Shape: (N, 7) (includes gripper)
+        full_joint_action[:, :7] = left_action_pos
+        full_joint_action[:, 7:14] = right_action_pos
+        return full_joint_state, full_joint_action
+        
+    return full_joint_state, None
 
 
 def process_images(images: Dict, seq_length: int, resize_size: int, skip_videos: bool = False) -> Dict:
@@ -184,14 +195,23 @@ def process_images(images: Dict, seq_length: int, resize_size: int, skip_videos:
     
     return processed_images
 
-def calculate_actions(full_joint_state: np.ndarray, seq_length: int):
+def calculate_actions(full_joint_state: np.ndarray, full_joint_action: Optional[np.ndarray], seq_length: int):
     joint_states = full_joint_state[:seq_length]
-    joint_actions = joint_states.copy()  # absolute actions = joint state itself
+    if full_joint_action is None:
+        joint_actions = joint_states.copy()
+    else: # If no action data, use joint states as actions
+        joint_actions = full_joint_action[:seq_length]
+        
     return joint_states, joint_actions
 
-def calculate_actions_cartesian(full_joint_state: np.ndarray, seq_length: int, robot: Any):
+def calculate_actions_cartesian(full_joint_state: np.ndarray, full_joint_action: Optional[np.ndarray], seq_length: int, robot: Any):
     from openpi.utils.matrix_utils import quat_to_rot_6d
     joint_states = full_joint_state[:seq_length]
+
+    if full_joint_action is None:
+        joint_actions = joint_states
+    else: # If no action data, use joint states as actions
+        joint_actions = full_joint_action[:seq_length]
 
     # joint states ordering: left_joint_pos, left_gripper_pos, right_joint_pos, right_gripper_pos
     # T_left_ee, T_right_ee = robot.solve_fk_base(joint_states[:, :6], joint_states[:, 7:13]) # BUGGY, INTRODUCES A POSE DELAY
@@ -199,17 +219,28 @@ def calculate_actions_cartesian(full_joint_state: np.ndarray, seq_length: int, r
     cartesian_actions_list = []
 
     for i in range(seq_length): # For some reason running batched FK is buggy -- camera lags behind pose so delay is introduced somewhere somehow
-        T_left_ee, T_right_ee = robot.solve_fk_base(joint_states[i, :6], joint_states[i, 7:13])
-        T_left_ee_6d = quat_to_rot_6d(T_left_ee.rotation().wxyz[None, :], scalar_first=True)
-        T_right_ee_6d = quat_to_rot_6d(T_right_ee.rotation().wxyz[None, :], scalar_first=True)
-        T_left_ee_pos = T_left_ee.wxyz_xyz[-3:].reshape(1, -1)
-        T_right_ee_pos = T_right_ee.wxyz_xyz[-3:].reshape(1, -1)
-        left_gripper_pos = joint_states[i, 6].reshape(-1, 1)
-        right_gripper_pos = joint_states[i, 13].reshape(-1, 1)
-        cartesian_states = np.concatenate([T_left_ee_6d, T_left_ee_pos, left_gripper_pos, T_right_ee_6d, T_right_ee_pos, right_gripper_pos], axis=1)[0]
-        cartesian_actions = cartesian_states.copy()  # absolute actions = state itself
+        T_left_ee_state, T_right_ee_state = robot.solve_fk_base(joint_states[i, :6], joint_states[i, 7:13])
+        T_left_ee_6d_state = quat_to_rot_6d(T_left_ee_state.rotation().wxyz[None, :], scalar_first=True)
+        T_right_ee_6d_state = quat_to_rot_6d(T_right_ee_state.rotation().wxyz[None, :], scalar_first=True)
+        T_left_ee_pos_state = T_left_ee_state.wxyz_xyz[-3:].reshape(1, -1)
+        T_right_ee_pos_state = T_right_ee_state.wxyz_xyz[-3:].reshape(1, -1)
+        left_gripper_pos_state = joint_states[i, 6].reshape(-1, 1)
+        right_gripper_pos_state = joint_states[i, 13].reshape(-1, 1)
+        cartesian_states = np.concatenate([T_left_ee_6d_state, T_left_ee_pos_state, left_gripper_pos_state, T_right_ee_6d_state, T_right_ee_pos_state, right_gripper_pos_state], axis=1)[0]
         cartesian_states_list.append(cartesian_states)
-        cartesian_actions_list.append(cartesian_actions)
+
+        if full_joint_action is not None:
+            T_left_ee_action, T_right_ee_action = robot.solve_fk_base(joint_actions[i, :6], joint_actions[i, 7:13])
+            T_left_ee_6d_action = quat_to_rot_6d(T_left_ee_action.rotation().wxyz[None, :], scalar_first=True)
+            T_right_ee_6d_action = quat_to_rot_6d(T_right_ee_action.rotation().wxyz[None, :], scalar_first=True)
+            T_left_ee_pos_action = T_left_ee_action.wxyz_xyz[-3:].reshape(1, -1)
+            T_right_ee_pos_action = T_right_ee_action.wxyz_xyz[-3:].reshape(1, -1)
+            left_gripper_pos_action = joint_actions[i, 6].reshape(-1, 1)
+            right_gripper_pos_action = joint_actions[i, 13].reshape(-1, 1)
+            cartesian_actions = np.concatenate([T_left_ee_6d_action, T_left_ee_pos_action, left_gripper_pos_action, T_right_ee_6d_action, T_right_ee_pos_action, right_gripper_pos_action], axis=1)[0]
+            cartesian_actions_list.append(cartesian_actions)
+        else:
+            cartesian_actions_list.append(cartesian_states)
 
     cartesian_states = np.stack(cartesian_states_list, axis=0)
     cartesian_actions = np.stack(cartesian_actions_list, axis=0)

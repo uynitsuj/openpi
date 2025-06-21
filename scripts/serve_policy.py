@@ -61,7 +61,7 @@ class Args:
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     EnvMode.XDOF: Checkpoint(
         config="pi0_yam_low_mem_finetune",
-        dir="/home/justinyu/checkpoints/pi0_yam_low_mem_finetune/unload_dishes_from_dishrack/17000",
+        dir="/home/justinyu/checkpoints/pi0_yam_low_mem_finetune/unload_dishes_from_dishrack/20000",
     ),
     EnvMode.XDOF_FAST: Checkpoint(
         config="pi0fast_yam_low_mem_finetune",

@@ -45,10 +45,12 @@ class YAMSConfig:
 
         "/home/justinyu/nfs_us/philipp/internal_justin/061825_annotated_dishes/unload_dishes_from_tabletop_dish_rack" # Dish Unloading Dataset
 
+        # "/home/justinyu/nfs_us/justinyu/sz_test_01_sim/20250619" # Red Cube Pick Mujoco Sim DATA BAD
     ])
-    repo_name: str = "uynitsuj/yam_unload_dishes_dishrack_joint_space" # TODO: Change this before running
 
-    language_instruction: str = "Perform bimanual manipulation task" # Gets overwritten by the task name in episode metadata
+    repo_name: str = "uynitsuj/yam_unload_dishes_dishrack_abs_joint_use_action" # TODO: Change this before running
+
+    language_instruction: str = "Unload dishes from tabletop dish rack" # Gets overwritten by the task name in episode metadata
     
     # YAMS camera keys
     camera_keys: List[str] = field(default_factory=lambda: [
@@ -69,7 +71,7 @@ class YAMSConfig:
     push_to_hub: bool = False # If True, will push to huggingface hub after processing (Not required, can convert dataset and train using the local directory)
     push_to_hub_only: bool = False  # Only push existing dataset to hub, skip processing
 
-    action_space: Literal["abs_joint", "abs_cartesian"] = "abs_cartesian" # "abs_joint" for absolute joint positions, "abs_cartesian" for absolute cartesian positions
+    action_space: Literal["abs_joint", "abs_cartesian"] = "abs_joint" # "abs_joint" for absolute joint positions, "abs_cartesian" for absolute cartesian positions
     
     # Memory management settings
     max_frames_per_chunk: int = 1000  # Process episodes in chunks to avoid OOM on long episodes
@@ -683,7 +685,7 @@ def process_episode_in_chunks(episode_data: dict, cfg: YAMSConfig, max_chunk_fra
     """Process episode data in memory-efficient chunks to handle long episodes."""
     
     # Process joint data first (this is relatively small)
-    full_joint_state = process_joint_data(episode_data['joint_data'])
+    full_joint_state, full_joint_action = process_joint_data(episode_data['joint_data'])
     if full_joint_state is None:
         return [], {}
     
@@ -694,9 +696,9 @@ def process_episode_in_chunks(episode_data: dict, cfg: YAMSConfig, max_chunk_fra
     
     # Calculate actions for the full episode (joint data is manageable)
     if cfg.action_space == 'abs_joint':
-        states, actions = calculate_actions(full_joint_state, total_length)
+        states, actions = calculate_actions(full_joint_state, full_joint_action, total_length)
     elif cfg.action_space == 'abs_cartesian':
-        states, actions = calculate_actions_cartesian(full_joint_state, total_length, cfg.robot)
+        states, actions = calculate_actions_cartesian(full_joint_state, full_joint_action, total_length, cfg.robot)
     else:
         raise ValueError(f"Invalid action space: {cfg.action_space}, or not implemented yet")
 
@@ -783,18 +785,18 @@ def process_yam_episode(
     task_name = extract_task_name_from_episode(episode_data, episode_path)
     
     # Process episode in memory-efficient chunks
-    try:
-        records, image_data = process_episode_in_chunks(episode_data, cfg, max_chunk_frames=cfg.max_frames_per_chunk)
-        if not records:
-            print(f"  No valid data in episode {idx}")
-            return None
-        
-        seq_length = len(records)
-        print(f"  Episode {idx}: {seq_length} frames total")
-        
-    except Exception as e:
-        print(f"  Error processing episode {idx}: {e}")
+    # try:
+    records, image_data = process_episode_in_chunks(episode_data, cfg, max_chunk_frames=cfg.max_frames_per_chunk)
+    if not records:
+        print(f"  No valid data in episode {idx}")
         return None
+    
+    seq_length = len(records)
+    print(f"  Episode {idx}: {seq_length} frames total")
+        
+    # except Exception as e:
+    #     print(f"  Error processing episode {idx}: {e}")
+    #     return None
     
     # Update episode and task indices in records
     for record in records:

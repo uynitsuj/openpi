@@ -101,6 +101,6 @@ class YamOutputs(transforms.DataTransformFn):
 
     def __call__(self, data: dict) -> dict:
         # Only return the first 14 dims (YAM joint space).
-        actions = np.asarray(data["actions"][:, :self.robot_action_dim])
+        actions = np.asarray(data["actions"][:, :self.robot_action_dim]) # TEMPORARY HALF THE ACTION HORIZON
         # YAM uses absolute joint actions - no conversion needed
         return {"actions": actions}

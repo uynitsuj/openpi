@@ -886,7 +886,7 @@ _CONFIGS = [
         name="pi0_yam_low_mem_finetune",
         model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotYamDataConfig(
-            repo_id="uynitsuj/yam_unload_dishes_dishrack_joint_space",
+            repo_id="uynitsuj/yam_unload_dishes_dishrack_abs_joint_use_action",
             action_space="joint", # "joint" for absolute joint positions, "cartesian" for absolute cartesian positions
             default_prompt="Unload dishes from tabletop dish rack",
             base_config=DataConfig(
@@ -905,6 +905,31 @@ _CONFIGS = [
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
     ),
+
+    TrainConfig(
+        name="pi0_yam_sim_low_mem_finetune",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamDataConfig(
+            repo_id="uynitsuj/yam_unload_dishes_dishrack_abs_joint_use_action",
+            action_space="joint", # "joint" for absolute joint positions, "cartesian" for absolute cartesian positions
+            default_prompt="Unload dishes from tabletop dish rack",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
+
     TrainConfig(
         name="pi0fast_yam_low_mem_finetune",
         model=pi0_fast.Pi0FASTConfig(action_dim=14, paligemma_variant="gemma_2b_lora"),

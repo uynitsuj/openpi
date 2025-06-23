@@ -910,8 +910,8 @@ _CONFIGS = [
         name="pi0_yam_sim_low_mem_finetune",
         model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotYamDataConfig(
-            repo_id="uynitsuj/yam_unload_dishes_dishrack_abs_joint_use_action",
-            action_space="joint", # "joint" for absolute joint positions, "cartesian" for absolute cartesian positions
+            repo_id="uynitsuj/yam_unload_dishes_dishrack_abs_cartesian_use_action",
+            action_space="cartesian", # "joint" for absolute joint positions, "cartesian" for absolute cartesian positions
             default_prompt="Unload dishes from tabletop dish rack",
             base_config=DataConfig(
                 prompt_from_task=True,

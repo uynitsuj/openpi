@@ -48,7 +48,7 @@ class YAMSConfig:
         # "/home/justinyu/nfs_us/justinyu/sz_test_01_sim/20250619" # Red Cube Pick Mujoco Sim DATA BAD
     ])
 
-    repo_name: str = "uynitsuj/yam_unload_dishes_dishrack_abs_joint_use_action" # TODO: Change this before running
+    repo_name: str = "uynitsuj/yam_unload_dishes_dishrack_abs_cartesian_use_action" # TODO: Change this before running
 
     language_instruction: str = "Unload dishes from tabletop dish rack" # Gets overwritten by the task name in episode metadata
     
@@ -71,7 +71,7 @@ class YAMSConfig:
     push_to_hub: bool = False # If True, will push to huggingface hub after processing (Not required, can convert dataset and train using the local directory)
     push_to_hub_only: bool = False  # Only push existing dataset to hub, skip processing
 
-    action_space: Literal["abs_joint", "abs_cartesian"] = "abs_joint" # "abs_joint" for absolute joint positions, "abs_cartesian" for absolute cartesian positions
+    action_space: Literal["abs_joint", "abs_cartesian"] = "abs_cartesian" # "abs_joint" for absolute joint positions, "abs_cartesian" for absolute cartesian positions
     
     # Memory management settings
     max_frames_per_chunk: int = 1000  # Process episodes in chunks to avoid OOM on long episodes

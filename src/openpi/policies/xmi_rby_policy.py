@@ -10,10 +10,10 @@ from openpi.models import model as _model
 def make_xmi_rby_example() -> dict:
     """Creates a random input example for the XMI RBY policy."""
     return {
-        "observation/exterior_image_1_left": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
-        "observation/exterior_image_2_right": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
-        "observation/exterior_image_3_top": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
-        "observation/state": np.random.rand(20),  # [left_6d_rot, left_3d_pos, left_1d_gripper, right_6d_rot, right_3d_pos, right_1d_gripper]
+        "left_camera-images-rgb": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "right_camera-images-rgb": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "top_camera-images-rgb": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "state": np.random.rand(20),  # [left_6d_rot, left_3d_pos, left_1d_gripper, right_6d_rot, right_3d_pos, right_1d_gripper]
         "prompt": "do something",
     }
 
@@ -49,26 +49,26 @@ class XmiRbyInputs(transforms.DataTransformFn):
 
         # Extract the 20D end-effector state vector
         # Format: [left_6d_rot, left_3d_pos, left_1d_gripper, right_6d_rot, right_3d_pos, right_1d_gripper]
-        state = data["observation/state"]
+        state = data["state"]
         state = transforms.pad_to_dim(state, self.action_dim)
 
         # Parse images to uint8 (H,W,C) format
-        exterior_left_image = _parse_image(data["observation/exterior_image_1_left"])
-        exterior_right_image = _parse_image(data["observation/exterior_image_2_right"])
-        top_image = _parse_image(data["observation/exterior_image_3_top"])
+        exterior_left_image = _parse_image(data["left_camera-images-rgb"])
+        exterior_right_image = _parse_image(data["right_camera-images-rgb"])
+        top_image = _parse_image(data["top_camera-images-rgb"])
 
         match self.model_type:
             case _model.ModelType.PI0:
                 # Pi0 models support three image inputs: one third-person view and two wrist views
                 # For XMI, we use: base (top view), left wrist (left exterior), right wrist (right exterior)
-                names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+                names = ("top_camera-images-rgb", "left_camera-images-rgb", "right_camera-images-rgb")
                 images = (top_image, exterior_left_image, exterior_right_image)
                 image_masks = (np.True_, np.True_, np.True_)
                 
             case _model.ModelType.PI0_FAST:
                 # Pi0-FAST uses: base_0, base_1, wrist_0
                 # We'll use top as base_0, left exterior as base_1, right exterior as wrist_0
-                names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
+                names = ("top_camera-images-rgb", "left_camera-images-rgb", "right_camera-images-rgb")
                 images = (top_image, exterior_left_image, exterior_right_image)
                 # We don't mask out images for FAST models
                 image_masks = (np.True_, np.True_, np.True_)

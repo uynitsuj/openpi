@@ -60,7 +60,7 @@ class YAMSConfig:
     resize_size: int = 224 # image size
     fps: int = 30 # video fps
     chunk_size: int = 1000 # number of frames per chunk (for memory considerations)
-    max_workers: int = 1 # Set lower on machines with less memory -- must be 1 for cartesian
+    max_workers: int = 6 # Set lower on machines with less memory -- must be 1 for cartesian
     no_filter_quality: bool = False # If True, will not filter out low quality episodes
     max_episodes: Optional[int] = None # If specified, will only process this many episodes
     skip_videos: bool = False # If True, will not process videos

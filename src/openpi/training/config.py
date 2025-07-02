@@ -349,10 +349,10 @@ class LeRobotXmiRbyDataConfig(DataConfigFactory):
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation/exterior_image_1_left": "exterior_image_1_left",
-                        "observation/exterior_image_2_right": "exterior_image_2_right",
-                        "observation/exterior_image_3_top": "exterior_image_3_top",
-                        "observation/state": "state",
+                        "left_camera-images-rgb": "left_camera-images-rgb",
+                        "right_camera-images-rgb": "right_camera-images-rgb", 
+                        "top_camera-images-rgb": "top_camera-images-rgb",
+                        "state": "state",
                         "actions": "actions",
                         "prompt": "prompt",
                     }
@@ -371,8 +371,8 @@ class LeRobotXmiRbyDataConfig(DataConfigFactory):
         # for the rotations and positions (indices 0:6, 6:9, 10:16, 16:19) while keeping
         # grippers absolute (indices 9, 19)
         delta_action_mask = _transforms.make_bool_mask(
-            6, 3, -1,  # left: 6d_rot (delta), 3d_pos (delta), gripper (absolute)
-            6, 3, -1   # right: 6d_rot (delta), 3d_pos (delta), gripper (absolute) 
+            9, -1,  # left: 6d_rot (delta), 3d_pos (delta), gripper (absolute)
+            9, -1   # right: 6d_rot (delta), 3d_pos (delta), gripper (absolute) 
         )
         data_transforms = data_transforms.push(
             inputs=[_transforms.DeltaActions(delta_action_mask)],
@@ -826,7 +826,7 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi0_xmi_rby",
-        model=pi0.Pi0Config(action_horizon=10),
+        model=pi0.Pi0Config(action_horizon=50),
         data=LeRobotXmiRbyDataConfig(
             repo_id="uynitsuj/xmi_bimanual_testing",
             default_prompt="testing",

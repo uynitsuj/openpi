@@ -85,6 +85,7 @@ class XMIConfig:
     max_workers: int = 6
     max_episodes: Optional[int] = None
     skip_videos: bool = False
+    first_frame_head_reorient: bool = False
     
     # Hub settings
     push_to_hub: bool = False
@@ -530,6 +531,7 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig) -> tuple[Optional
 
     # HEAD PROCESSING
     # Determine direction that head z axis is pointing in the first frame to reorient the RBY1 base frame
+    
     head_z_tf = vtf.SE3.from_matrix(action_data["action-left-head"][0])
     head_data_all = vtf.SE3.from_matrix(action_data["action-left-head"])
 
@@ -541,23 +543,37 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig) -> tuple[Optional
     print(f"Average head height: {head_height}m")
 
     head_translation = np.array([head_z_tf.translation()[0], -head_z_tf.translation()[1], 0.0])
+    if cfg.first_frame_head_reorient:
+        head_z_axis_rot = vtf.SO3.from_rpy_radians(
+            -head_z_tf.rotation().as_rpy_radians().roll,
+            head_z_tf.rotation().as_rpy_radians().pitch,
+            -head_z_tf.rotation().as_rpy_radians().yaw
+        )
 
-    head_z_axis_rot = vtf.SO3.from_rpy_radians(
-        -head_z_tf.rotation().as_rpy_radians().roll,
-        head_z_tf.rotation().as_rpy_radians().pitch,
-        -head_z_tf.rotation().as_rpy_radians().yaw
-    )
+        head_z_axis = head_z_axis_rot.as_matrix()[:, 2]
 
-    head_z_axis = head_z_axis_rot.as_matrix()[:, 2]
+        # Project onto x-y plane
+        head_z_axis_xy = head_z_axis[:2]
+        head_z_axis_xy = head_z_axis_xy / np.linalg.norm(head_z_axis_xy)
 
-    # Project onto x-y plane
-    head_z_axis_xy = head_z_axis[:2]
-    head_z_axis_xy = head_z_axis_xy / np.linalg.norm(head_z_axis_xy)
+        # Convert to angle
+        head_z_axis_angle = np.arctan2(head_z_axis_xy[1], head_z_axis_xy[0])
 
-    # Convert to angle
-    head_z_axis_angle = np.arctan2(head_z_axis_xy[1], head_z_axis_xy[0])
+        rby1_base_frame_wxyz = vtf.SO3.from_rpy_radians(0.0, 0.0, head_z_axis_angle).wxyz
+        print(f"Head z axis angle: {head_z_axis_angle}")
+    else:
+        # Default to the direction of left gripper z axis (worried that world frame proprio input messing up inference time distribution)
+        # Make the current hand z axis point toward world negative x axis
 
-    rby1_base_frame_wxyz = vtf.SO3.from_rpy_radians(0.0, 0.0, head_z_axis_angle).wxyz
+        left_hand_matrix = action_data["action-left-hand_in_quest_world_frame"][0]
+        world_frame = action_data["action-left-quest_world_frame"][0]
+        left_hand_tf = vtf.SE3.from_matrix(left_hand_matrix)
+        left_hand_tf = q2w @ vtf.SE3.from_matrix(world_frame) @ left_hand_tf
+        hand_z_axis = left_hand_tf.as_matrix()[:, 2]
+        hand_z_axis_angle = np.arctan2(hand_z_axis[1], hand_z_axis[0])
+        rby1_base_frame_wxyz = (vtf.SO3.from_rpy_radians(0.0, 0.0, hand_z_axis_angle + np.pi)).wxyz
+        print(f"Left gripper z axis angle: {hand_z_axis_angle}")
+
     rby1_base_frame_position = head_translation
 
     # LEFT HAND PROCESSING

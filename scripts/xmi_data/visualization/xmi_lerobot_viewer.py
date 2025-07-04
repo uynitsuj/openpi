@@ -618,7 +618,7 @@ class XMILeRobotViewer:
 
 
 def main(
-    dataset_path: str = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/xmi_bimanual_testing",
+    dataset_path: str = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/xmi_rby_coffee_cup_on_dish_subsampled",
 ):
     """
     Main function for XMI LeRobot trajectory viewer.

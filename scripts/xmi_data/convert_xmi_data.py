@@ -54,11 +54,11 @@ class XMIConfig:
     
     # Language instructions corresponding to each dataset folder
     language_instructions: List[str] = field(default_factory=lambda: [
-        "testing"
+        "place the coffee cup on the dish"
     ])
     
     # Repository name for output dataset
-    repo_name: str = "uynitsuj/xmi_bimanual_testing"
+    repo_name: str = "uynitsuj/xmi_rby_coffee_cup_on_dish_subsampled"
     
     # Camera settings
     camera_keys: List[str] = field(default_factory=lambda: [
@@ -79,7 +79,8 @@ class XMIConfig:
     
     # Processing settings
     resize_size: int = 224
-    fps: int = 30
+    fps: int = 30 # Framerate of original video
+    temporal_subsample_factor: int = 2  # Subsample every N frames (1 = no subsampling)
     chunk_size: int = 1000
     max_workers: int = 6
     max_episodes: Optional[int] = None
@@ -260,7 +261,7 @@ def get_encoder_settings(encoder_name: str, quality: str = 'fast') -> dict:
     return settings
 
 
-def benchmark_encoder(encoder_name: str, test_frames: List[np.ndarray], fps: int):
+def benchmark_encoder(encoder_name: str, test_frames: List[np.ndarray], fps: int, temporal_subsample_factor: int = 1):
     """Benchmark an encoder with test frames."""
     import tempfile
     import time
@@ -288,7 +289,7 @@ def benchmark_encoder(encoder_name: str, test_frames: List[np.ndarray], fps: int
                     '-f', 'rawvideo',
                     '-pix_fmt', 'rgb24',
                     '-s', f'{width}x{height}',
-                    '-framerate', str(fps),
+                    '-framerate', str(fps/temporal_subsample_factor),
                     '-i', temp_input.name,
                     '-vcodec', encoder_name,
                 ]
@@ -322,7 +323,7 @@ def benchmark_encoder(encoder_name: str, test_frames: List[np.ndarray], fps: int
                     pass
 
 
-def select_best_encoder(test_frames: List[np.ndarray] = None, fps: int = 30):
+def select_best_encoder(test_frames: List[np.ndarray] = None, fps: int = 30, temporal_subsample_factor: int = 1):
     """Select the best available encoder, optionally with benchmarking."""
     encoders = detect_available_encoders()
     
@@ -344,7 +345,7 @@ def select_best_encoder(test_frames: List[np.ndarray] = None, fps: int = 30):
             print(f"Testing {encoder_name} ({description})...")
             # Use subset of frames for benchmarking
             test_subset = test_frames[:min(10, len(test_frames))]
-            encode_time = benchmark_encoder(encoder_name, test_subset, fps)
+            encode_time = benchmark_encoder(encoder_name, test_subset, fps, temporal_subsample_factor)
             if encode_time != float('inf'):
                 benchmark_results.append((encoder_name, encode_time, description))
                 print(f"  {encoder_name}: {encode_time:.2f}s for {len(test_subset)} frames")
@@ -380,7 +381,7 @@ def select_best_encoder(test_frames: List[np.ndarray] = None, fps: int = 30):
     return encoder_name, quality
 
 
-def encode_video_optimized(frames: List[np.ndarray], save_path: Path, fps: int, 
+def encode_video_optimized(frames: List[np.ndarray], save_path: Path, fps: int, temporal_subsample_factor: int = 1,
                           encoder_name: str = None, quality: str = 'fast'):
     """Encode frames into a video using optimized ffmpeg settings."""
     import subprocess
@@ -403,13 +404,16 @@ def encode_video_optimized(frames: List[np.ndarray], save_path: Path, fps: int,
         temp_file.write(frame_data.tobytes())
     
     try:
+        # Calculate effective framerate (frames are already subsampled)
+        effective_fps = fps / temporal_subsample_factor
+        
         # Build optimized ffmpeg command
         cmd = [
             'ffmpeg', '-y',
             '-f', 'rawvideo',
             '-pix_fmt', 'rgb24',
             '-s', f'{width}x{height}',
-            '-framerate', str(fps),
+            '-framerate', str(effective_fps),
             '-i', temp_path,
             '-vcodec', encoder_name,
         ]
@@ -420,7 +424,7 @@ def encode_video_optimized(frames: List[np.ndarray], save_path: Path, fps: int,
                 cmd.extend([f'-{key}', str(value)])
         
         # Add common settings
-        cmd.extend(['-r', str(fps)])
+        cmd.extend(['-r', str(effective_fps)])
         cmd.append(str(save_path))
         
         result = subprocess.run(cmd, capture_output=True, timeout=60)
@@ -428,12 +432,12 @@ def encode_video_optimized(frames: List[np.ndarray], save_path: Path, fps: int,
             print(f"Warning: Optimized encoding failed for {save_path}, trying fallback")
             print(f"Error: {result.stderr.decode()}")
             # Fallback to simple encoding
-            encode_video_simple(frames, save_path, fps)
+            encode_video_simple(frames, save_path, fps, temporal_subsample_factor)
         
     except Exception as e:
         print(f"Exception in optimized encoding for {save_path}: {e}")
         # Fallback to simple encoding
-        encode_video_simple(frames, save_path, fps)
+        encode_video_simple(frames, save_path, fps, temporal_subsample_factor)
     finally:
         # Clean up temporary file
         try:
@@ -442,7 +446,7 @@ def encode_video_optimized(frames: List[np.ndarray], save_path: Path, fps: int,
             pass
 
 
-def encode_video_simple(frames: List[np.ndarray], save_path: Path, fps: int):
+def encode_video_simple(frames: List[np.ndarray], save_path: Path, fps: int, temporal_subsample_factor: int = 1):
     """Simple fallback encoding function."""
     import subprocess
     import tempfile
@@ -458,18 +462,21 @@ def encode_video_simple(frames: List[np.ndarray], save_path: Path, fps: int):
         temp_file.write(frame_data.tobytes())
     
     try:
+        # Calculate effective framerate (frames are already subsampled)
+        effective_fps = fps / temporal_subsample_factor
+        
         cmd = [
             'ffmpeg', '-y',
             '-f', 'rawvideo',
             '-pix_fmt', 'rgb24',
             '-s', f'{width}x{height}',
-            '-framerate', str(fps),
+            '-framerate', str(effective_fps),
             '-i', temp_path,
             '-vcodec', 'libx264',
             '-preset', 'ultrafast',
             '-crf', '28',
             '-pix_fmt', 'yuv420p',
-            '-r', str(fps),
+            '-r', str(effective_fps),
             str(save_path)
         ]
         
@@ -754,10 +761,20 @@ def process_episode_in_chunks(episode_data: dict, cfg: XMIConfig, max_chunk_fram
     if states is None or actions is None:
         return [], {}
     
-    total_length = len(states)
-    if total_length <= 0:
+    original_total_length = len(states)
+    if original_total_length <= 0:
         return [], {}
     
+    # Calculate global subsampling indices for consistency
+    if cfg.temporal_subsample_factor > 1:
+        global_subsample_indices = list(range(0, original_total_length, cfg.temporal_subsample_factor))
+        states = states[global_subsample_indices]
+        actions = actions[global_subsample_indices]
+        print(f"Applied temporal subsampling factor {cfg.temporal_subsample_factor}: {len(states)} frames after subsampling")
+    else:
+        global_subsample_indices = list(range(original_total_length))
+    
+    total_length = len(states)
     all_records = []
     all_image_data = {}
     
@@ -775,14 +792,18 @@ def process_episode_in_chunks(episode_data: dict, cfg: XMIConfig, max_chunk_fram
         if not cfg.skip_videos and 'images' in episode_data:
             for cam_key in cfg.camera_keys:
                 if cam_key in episode_data['images']:
-                    # Get images for this chunk, handling potential length mismatches
                     available_images = episode_data['images'][cam_key]
-                    start_idx = min(chunk_start, len(available_images))
-                    end_idx = min(chunk_end, len(available_images))
                     
-                    if start_idx < end_idx:
-                        images = available_images[start_idx:end_idx]
-                        
+                    # Get the corresponding original image indices for this chunk
+                    chunk_global_indices = global_subsample_indices[chunk_start:chunk_end]
+                    
+                    # Extract images at the exact same indices as the subsampled states/actions
+                    images = []
+                    for orig_idx in chunk_global_indices:
+                        if orig_idx < len(available_images):
+                            images.append(available_images[orig_idx])
+                    
+                    if images:
                         # Resize images for this chunk
                         resized_images = []
                         for img in images:
@@ -811,7 +832,7 @@ def process_episode_in_chunks(episode_data: dict, cfg: XMIConfig, max_chunk_fram
             record = {
                 "state": state.tolist(),
                 "actions": action.tolist(),
-                "timestamp": [global_step / cfg.fps],
+                "timestamp": [global_step / (cfg.fps / cfg.temporal_subsample_factor)],
                 "frame_index": [global_step],
                 "episode_index": [0],  # Will be updated later
                 "index": [global_step],
@@ -988,9 +1009,9 @@ def process_xmi_episode(
                 if frames:
                     print(f"  Encoding video {cam_key}: {len(frames)} frames")
                     if encoder_name:
-                        encode_video_optimized(frames, save_path, cfg.fps, encoder_name, encoding_quality)
+                        encode_video_optimized(frames, save_path, cfg.fps, cfg.temporal_subsample_factor, encoder_name, encoding_quality)
                     else:
-                        encode_video_simple(frames, save_path, cfg.fps)
+                        encode_video_simple(frames, save_path, cfg.fps, cfg.temporal_subsample_factor)
     
     # Compute and write episode stats immediately
     episode_stats = compute_basic_episode_stats(idx, {"length": seq_length}, cfg, base_dir)
@@ -1153,7 +1174,7 @@ def main(cfg: XMIConfig):
                             break  # Use first available camera for benchmarking
                     
                     if sample_frames:
-                        best_encoder, encoding_quality = select_best_encoder(sample_frames, cfg.fps)
+                        best_encoder, encoding_quality = select_best_encoder(sample_frames, cfg.fps, cfg.temporal_subsample_factor)
                     else:
                         best_encoder, encoding_quality = select_best_encoder()
                 else:
@@ -1272,7 +1293,7 @@ def main(cfg: XMIConfig):
                     "shape": [cfg.resize_size, cfg.resize_size, 3],
                     "names": ["height", "width", "channel"],
                     "info": {
-                        "video.fps": cfg.fps,
+                        "video.fps": cfg.fps / cfg.temporal_subsample_factor,
                         "video.height": cfg.resize_size,
                         "video.width": cfg.resize_size,
                         "video.channels": 3,
@@ -1292,7 +1313,7 @@ def main(cfg: XMIConfig):
         "total_videos": len(cfg.camera_keys) * len(all_episodes) if not cfg.skip_videos else 0,
         "total_chunks": actual_chunks,
         "chunks_size": cfg.chunk_size,
-        "fps": cfg.fps,
+        "fps": cfg.fps / cfg.temporal_subsample_factor,
         "splits": {"train": f"0:{len(all_episodes)}"},
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",

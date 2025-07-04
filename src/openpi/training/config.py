@@ -852,10 +852,10 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_xmi_rby_low_mem_finetune",
-        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_horizon=25, action_expert_variant="gemma_300m_lora"),
         data=LeRobotXmiRbyDataConfig(
-            repo_id="uynitsuj/xmi_bimanual_testing",
-            default_prompt="testing",
+            repo_id="uynitsuj/xmi_rby_coffee_cup_on_dish_subsampled",
+            default_prompt="place the coffee cup on the dish",
             base_config=DataConfig(
                 prompt_from_task=True,
             ),

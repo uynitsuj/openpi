@@ -63,7 +63,7 @@ class XmiRbyInputs(transforms.DataTransformFn):
                 # For XMI, we use: base (top view), left wrist (left exterior), right wrist (right exterior)
                 names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
                 images = (np.zeros_like(top_image), exterior_left_image, exterior_right_image)
-                image_masks = (np.False_, np.True_, np.True_) # For now skip top camera
+                image_masks = (np.False_, np.True_, np.True_) # For now skip top camera (XMI head and RBY head visual gap)
                 
             case _model.ModelType.PI0_FAST:
                 # Pi0-FAST uses: base_0, base_1, wrist_0

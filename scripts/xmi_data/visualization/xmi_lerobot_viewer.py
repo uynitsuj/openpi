@@ -411,11 +411,11 @@ class XMILeRobotViewer:
             )
 
         with self.viser_server.gui.add_folder("XMI State"):
-            self.left_gripper_pos = self.viser_server.gui.add_number(
-                "Left Gripper", 0.0, disabled=True
+            self.left_gripper_pos = self.viser_server.gui.add_text(
+                "Left Gripper", "0.0"
             )
-            self.right_gripper_pos = self.viser_server.gui.add_number(
-                "Right Gripper", 0.0, disabled=True
+            self.right_gripper_pos = self.viser_server.gui.add_text(
+                "Right Gripper", "0.0"
             )
             self.left_ee_pos_info = self.viser_server.gui.add_text(
                 "Left EE Position", "0.000, 0.000, 0.000"
@@ -558,8 +558,8 @@ class XMILeRobotViewer:
                 left_se3, left_gripper, right_se3, right_gripper = self._parse_xmi_state(state)
                 
                 # Update gripper displays
-                self.left_gripper_pos.value = float(left_gripper)
-                self.right_gripper_pos.value = float(right_gripper)
+                self.left_gripper_pos.value = f"{left_gripper:.3f}"
+                self.right_gripper_pos.value = f"{right_gripper:.3f}"
                 
                 # Update position displays
                 left_pos = left_se3.translation()
@@ -618,7 +618,7 @@ class XMILeRobotViewer:
 
 
 def main(
-    dataset_path: str = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/xmi_rby_coffee_cup_on_dish_subsampled",
+    dataset_path: str = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/xmi_rby_coffee_cup_on_dish_subsampled_and_gripper_action",
 ):
     """
     Main function for XMI LeRobot trajectory viewer.

@@ -63,7 +63,7 @@ class XmiRbyInputs(transforms.DataTransformFn):
                 # For XMI, we use: base (top view), left wrist (left exterior), right wrist (right exterior)
                 names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
                 images = (top_image, exterior_left_image, exterior_right_image)
-                image_masks = (np.True_, np.True_, np.True_)
+                image_masks = (np.False_, np.True_, np.True_) # For now skip top camera
                 
             case _model.ModelType.PI0_FAST:
                 # Pi0-FAST uses: base_0, base_1, wrist_0
@@ -71,7 +71,7 @@ class XmiRbyInputs(transforms.DataTransformFn):
                 names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
                 images = (top_image, exterior_left_image, exterior_right_image)
                 # We don't mask out images for FAST models
-                image_masks = (np.True_, np.True_, np.True_)
+                image_masks = (np.False_, np.True_, np.True_)
                 
             case _:
                 raise ValueError(f"Unsupported model type: {self.model_type}")

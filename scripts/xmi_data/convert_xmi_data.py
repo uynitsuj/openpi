@@ -58,7 +58,7 @@ class XMIConfig:
     ])
     
     # Repository name for output dataset
-    repo_name: str = "uynitsuj/xmi_rby_coffee_cup_on_dish_subsampled"
+    repo_name: str = "uynitsuj/xmi_rby_coffee_cup_on_dish_subsampled_and_gripper_action"
     
     # Camera settings
     camera_keys: List[str] = field(default_factory=lambda: [
@@ -518,7 +518,8 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig) -> tuple[Optional
     """
     
     # Extract relevant data
-    action_data = episode_data['action_data']
+    action_data = episode_data['action_data'] # (oculus gripper action)
+    joint_data = episode_data['joint_data'] # (robotiq gripper proprio)
     
     # Load controller calibration transformations
     left_controller_calib_tf = vtf.SE3.from_matrix(np.load(cfg.left_controller_calib)).inverse()
@@ -652,8 +653,11 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig) -> tuple[Optional
     right_ee_ik_target_handle_wxyz = right_ee_transforms_rby1_base.wxyz_xyz[:, :4]
 
     # Get gripper positions
-    left_gripper_pos = action_data['action-left-pos']
-    right_gripper_pos = action_data['action-right-pos']
+    left_gripper_pos = joint_data['left-joint_pos'][..., None]
+    right_gripper_pos = joint_data['right-joint_pos'][..., None]
+
+    left_gripper_action = action_data['action-left-pos']
+    right_gripper_action = action_data['action-right-pos']
 
     # Check array lengths are consistent  
     assert len(left_gripper_pos) == len(right_gripper_pos)
@@ -688,12 +692,20 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig) -> tuple[Optional
     right_ee_ik_target_handle_position = pad_to_length(right_ee_ik_target_handle_position, seq_length)
     left_gripper_pos = pad_to_length(left_gripper_pos, seq_length)
     right_gripper_pos = pad_to_length(right_gripper_pos, seq_length)
+
+    left_gripper_action = pad_to_length(left_gripper_action, seq_length)
+    right_gripper_action = pad_to_length(right_gripper_action, seq_length)
     
     # Combine into full end-effector state
     # FORMAT: [left_6d_rot, left_3d_pos, left_1d_gripper, right_6d_rot, right_3d_pos, right_1d_gripper]
     proprio_data = np.concatenate([
         left_6d_rot, left_ee_ik_target_handle_position, left_gripper_pos,
         right_6d_rot, right_ee_ik_target_handle_position, right_gripper_pos
+    ], axis=1)
+
+    action_data = np.concatenate([
+        left_6d_rot, left_ee_ik_target_handle_position, left_gripper_action,
+        right_6d_rot, right_ee_ik_target_handle_position, right_gripper_action
     ], axis=1)
 
     # We need seq_length - 1 steps since we calculate actions as deltas
@@ -712,11 +724,11 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig) -> tuple[Optional
         
         # Calculate delta action (next state - current state)
         # action_t = proprio_data[step + 1] - state_t
-        action_t = proprio_data[step]
+        action_t = action_data[step]
         
         # For grippers, use absolute position from t+1 instead of delta
-        action_t[9] = proprio_data[step + 1][9]    # left gripper (index 9)
-        action_t[19] = proprio_data[step + 1][19]  # right gripper (index 19)
+        # action_t[9] = proprio_data[step + 1][9]    # left gripper (index 9)
+        # action_t[19] = proprio_data[step + 1][19]  # right gripper (index 19)
         
         states.append(state_t)
         actions.append(action_t)
@@ -989,18 +1001,18 @@ def process_xmi_episode(
         return None
     
     # Process episode in memory-efficient chunks
-    try:
-        records, image_data = process_episode_in_chunks(episode_data, cfg, max_chunk_frames=cfg.max_frames_per_chunk)
-        if not records:
-            print(f"  No valid data in episode {idx}")
-            return None
-        
-        seq_length = len(records)
-        print(f"  Episode {idx}: {seq_length} frames total")
-            
-    except Exception as e:
-        print(f"  Error processing episode {idx}: {e}")
+    # try:
+    records, image_data = process_episode_in_chunks(episode_data, cfg, max_chunk_frames=cfg.max_frames_per_chunk)
+    if not records:
+        print(f"  No valid data in episode {idx}")
         return None
+    
+    seq_length = len(records)
+    print(f"  Episode {idx}: {seq_length} frames total")
+            
+    # except Exception as e:
+    #     print(f"  Error processing episode {idx}: {e}")
+    #     return None
     
     # Update episode and task indices in records
     for record in records:

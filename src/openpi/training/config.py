@@ -838,17 +838,19 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     TrainConfig(
-        name="pi0_fast_xmi_rby",
-        model=pi0_fast.Pi0FASTConfig(action_dim=20, action_horizon=10, max_token_len=250),
+        name="pi0_fast_xmi_rby_low_mem_finetune",
+        model=pi0_fast.Pi0FASTConfig(action_dim=20, action_horizon=25, max_token_len=250, paligemma_variant="gemma_2b_lora"),
         data=LeRobotXmiRbyDataConfig(
-            repo_id="uynitsuj/xmi_bimanual_testing",
-            default_prompt="testing",
+            repo_id="uynitsuj/xmi_rby_coffee_cup_on_dish_subsampled_and_gripper_action",
+            default_prompt="place the coffee cup on the dish",
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=30_000,
+        freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
+        ema_decay=None,
     ),
     TrainConfig(
         name="pi0_xmi_rby_low_mem_finetune",

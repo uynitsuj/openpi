@@ -50,6 +50,40 @@ class TransformedDataset(Dataset[T_co]):
         return len(self._dataset)
 
 
+class IterableTransformedDataset(IterableDataset[T_co]):
+    def __init__(
+        self,
+        dataset: IterableDataset,
+        transforms: Sequence[_transforms.DataTransformFn],
+        *,
+        is_batched: bool = False,
+    ):
+        self._dataset = dataset
+        self._transform = _transforms.compose(transforms)
+        self._is_batched = is_batched
+
+    def __iter__(self):
+        for sample in self._dataset:
+            if self._is_batched:
+                # Transforms are designed to be applied to individual samples. So we need to split the batch into
+                # individual samples and apply the transform to each sample individually.
+                batch_size = next(v.shape[0] for v in sample.values())
+
+                # Split batch into individual samples using tree_map
+                individual_samples = [jax.tree.map(lambda x: x[i], sample) for i in range(batch_size)]  # noqa: B023
+
+                # Transform each sample
+                transformed = [self._transform(s) for s in individual_samples]
+
+                # Recombine batch with tree_map
+                yield jax.tree.map(lambda *x: np.stack(x, axis=0), *transformed)
+            else:
+                yield self._transform(sample)
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+
 class FakeDataset(Dataset):
     def __init__(self, model_config: _model.BaseModelConfig, num_samples: int):
         self._num_samples = num_samples

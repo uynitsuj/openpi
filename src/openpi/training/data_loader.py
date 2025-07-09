@@ -26,6 +26,15 @@ class Dataset(Protocol[T_co]):
     def __len__(self) -> int:
         raise NotImplementedError("Subclasses of Dataset should implement __len__.")
 
+class IterableDataset(Protocol[T_co]):
+    """Interface for an iterable dataset."""
+
+    def __iter__(self) -> Iterator[T_co]:
+        raise NotImplementedError("Subclasses of IterableDataset should implement __iter__.")
+
+    def __len__(self) -> int:
+        raise NotImplementedError("Subclasses of Dataset should implement __len__.")
+
 
 class DataLoader(Protocol[T_co]):
     """Interface for a data loader."""
@@ -115,7 +124,9 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseModelConfig, video_backend = 'pyav') -> Dataset:
+def create_torch_dataset(
+    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
     if repo_id is None:
@@ -127,17 +138,14 @@ def create_dataset(data_config: _config.DataConfig, model_config: _model.BaseMod
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(model_config.action_horizon)]
-            for key in data_config.action_sequence_keys
+            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
-        video_backend=video_backend,
     )
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
-
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
@@ -186,7 +194,7 @@ def create_data_loader(
     """
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    dataset = create_dataset(data_config, config.model)
+    dataset = create_torch_dataset(data_config, config.model.action_horizon, config.model)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     data_loader = TorchDataLoader(

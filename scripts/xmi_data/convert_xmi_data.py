@@ -50,6 +50,7 @@ class XMIConfig:
     # Input data paths
     raw_dataset_folders: List[str] = field(default_factory=lambda: [
         "/home/justinyu/Downloads/20250630",
+        "/home/justinyu/Downloads/data_20250708",
     ])
     
     # Language instructions corresponding to each dataset folder
@@ -58,7 +59,7 @@ class XMIConfig:
     ])
     
     # Repository name for output dataset
-    repo_name: str = "uynitsuj/xmi_rby_coffee_cup_on_dish_subsampled_and_gripper_action"
+    repo_name: str = "uynitsuj/xmi_rby_coffee_cup_on_dish_combined"
     
     # Camera settings
     camera_keys: List[str] = field(default_factory=lambda: [
@@ -74,8 +75,8 @@ class XMIConfig:
     })
     
     # Calibration files
-    left_controller_calib: str = "/home/justinyu/Left_Controller_20250603_15/calib_results/controller2franka.npy"
-    right_controller_calib: str = "/home/justinyu/Right_Controller_20250603_15/calib_results/controller2franka.npy"
+    left_controller_calib: str = "/nfs_us/justinyu/us_xmi_calib/Left_Controller_20250603_15/calib_results/controller2franka.npy"
+    right_controller_calib: str = "/nfs_us/justinyu/us_xmi_calib/Right_Controller_20250603_15/calib_results/controller2franka.npy"
     
     # Processing settings
     resize_size: int = 224
@@ -926,18 +927,35 @@ def compute_basic_episode_stats(episode_idx: int, episode_info: dict, cfg: XMICo
     # Add stats for scalar features with proper keepdims handling
     for feature_name in ["timestamp", "frame_index", "episode_index", "index", "task_index"]:
         if feature_name in df.columns:
-            data = df[feature_name].values.astype(np.float32)
+            # Handle potential list columns by converting to numpy array first
+            # Use pandas Series to avoid numpy deprecation warnings
+            raw_series = df[feature_name]
+            
+            # Safely check if this is a list column
+            try:
+                first_item = raw_series.iloc[0]
+                if isinstance(first_item, list):
+                    # If it's a list column, flatten it properly
+                    data = np.array([item for sublist in raw_series for item in sublist], dtype=np.float32)
+                else:
+                    # If it's already flat, convert using pandas to_numpy() which avoids deprecation warnings
+                    data = raw_series.to_numpy(dtype=np.float32)
+            except (IndexError, AttributeError):
+                # Fallback: try to convert using pandas to_numpy()
+                data = raw_series.to_numpy(dtype=np.float32)
+            
             if len(data.shape) > 1:
                 data = data.flatten()
             
             # For 1D data, LeRobot expects keepdims=True if original was 1D
             episode_stats[feature_name] = {
-                "min": np.array([data.min()], dtype=np.float32),
-                "max": np.array([data.max()], dtype=np.float32),
-                "mean": np.array([data.mean()], dtype=np.float32),
-                "std": np.array([data.std()], dtype=np.float32),
+                "min": np.array([data.min().item()], dtype=np.float32),
+                "max": np.array([data.max().item()], dtype=np.float32),
+                "mean": np.array([data.mean().item()], dtype=np.float32),
+                "std": np.array([data.std().item()], dtype=np.float32),
                 "count": np.array([episode_length], dtype=np.int64),
             }
+    
     
     # Add video stats if not skipping videos (normalized to [0,1] range)
     if not cfg.skip_videos:

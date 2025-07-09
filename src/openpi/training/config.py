@@ -844,7 +844,7 @@ _CONFIGS = [
         name="pi0_fast_xmi_rby_low_mem_finetune",
         model=pi0_fast.Pi0FASTConfig(action_dim=20, action_horizon=25, max_token_len=250, paligemma_variant="gemma_2b_lora"),
         data=LeRobotXmiRbyDataConfig(
-            repo_id="uynitsuj/xmi_rby_coffee_cup_on_dish_subsampled_and_gripper_action",
+            repo_id="uynitsuj/xmi_rby_coffee_cup_on_dish_combined",
             default_prompt="place the coffee cup on the dish",
             base_config=DataConfig(
                 prompt_from_task=True,
@@ -859,7 +859,7 @@ _CONFIGS = [
         name="pi0_xmi_rby_low_mem_finetune",
         model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_horizon=25, action_expert_variant="gemma_300m_lora"),
         data=LeRobotXmiRbyDataConfig(
-            repo_id="uynitsuj/xmi_rby_coffee_cup_on_dish_subsampled_and_gripper_action",
+            repo_id="uynitsuj/xmi_rby_coffee_cup_on_dish_combined",
             default_prompt="place the coffee cup on the dish",
             base_config=DataConfig(
                 prompt_from_task=True,

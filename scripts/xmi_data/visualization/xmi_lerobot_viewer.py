@@ -21,11 +21,11 @@ import json
 import pandas as pd
 from typing import Literal
 import jsonlines
-from openpi.utils.matrix_utils import rot_6d_to_quat, rot_6d_to_rot_mat
+from openpi.utils.matrix_utils import rot_6d_to_quat
 
 
 class XMILeRobotViewer:
-    def __init__(self, dataset_path: str):
+    def __init__(self, dataset_path: str, action_horizon: int = 15):
         """
         Initialize XMI LeRobot trajectory viewer.
         
@@ -33,7 +33,7 @@ class XMILeRobotViewer:
             dataset_path: Path to LeRobot dataset directory
         """
         self.dataset_path = Path(dataset_path)
-        
+        self.action_horizon = action_horizon
         if not self.dataset_path.exists():
             raise FileNotFoundError(f"Dataset path does not exist: {dataset_path}")
         
@@ -306,7 +306,17 @@ class XMILeRobotViewer:
         self.right_ee_frame = self.viser_server.scene.add_frame(
             "/right_ee", axes_length=0.1, axes_radius=0.005, origin_radius=0.02
         )
-        
+
+        self.left_ee_action_frames = []
+        self.right_ee_action_frames = []
+        for i in range(self.action_horizon):
+            self.left_ee_action_frames.append(self.viser_server.scene.add_frame(
+                f"/left_ee_action_{i}", axes_length=0.07, axes_radius=0.003, origin_radius=0.01
+            ))
+            self.right_ee_action_frames.append(self.viser_server.scene.add_frame(
+                f"/right_ee_action_{i}", axes_length=0.07, axes_radius=0.003, origin_radius=0.01
+            ))
+
         # Add camera frustums for visualization
         self.camera_frustums = {}
         # Define some default poses for cameras relative to the RBY1 base frame
@@ -428,6 +438,13 @@ class XMILeRobotViewer:
             )
             self.right_ee_rot_info = self.viser_server.gui.add_text(
                 "Right EE Rotation (wxyz)", "1.000, 0.000, 0.000, 0.000"
+            )
+        with self.viser_server.gui.add_folder("XMI Action"):
+            self.left_gripper_action = self.viser_server.gui.add_text(
+                "Left Gripper", "0.0"
+            )
+            self.right_gripper_action = self.viser_server.gui.add_text(
+                "Right Gripper", "0.0"
             )
 
         self.camera_displays = {}
@@ -553,13 +570,38 @@ class XMILeRobotViewer:
 
         if 'states' in self.episode_data and frame_idx < len(self.episode_data['states']):
             state = self.episode_data['states'][frame_idx]
+            action = self.episode_data['actions'][frame_idx]
+            action_horizon = self.episode_data['actions'][frame_idx:frame_idx+min(self.action_horizon, self.episode_length-frame_idx)]
+
+            if len(action_horizon) < self.action_horizon:
+                # pad with last action
+                action_horizon = np.concatenate([action_horizon, action_horizon[-1:].repeat(self.action_horizon - len(action_horizon), axis=0)], axis=0)
+                assert len(action_horizon) == self.action_horizon
+
+            for i in range(self.action_horizon):
+                left_se3_action, left_gripper_action, right_se3_action, right_gripper_action = self._parse_xmi_state(action_horizon[i])
+
+                left_ee_action_frame = self.left_ee_action_frames[i]
+                right_ee_action_frame = self.right_ee_action_frames[i]
+
+                left_ee_action_frame.position = left_se3_action.wxyz_xyz[-3:]
+                left_ee_action_frame.wxyz = left_se3_action.rotation().wxyz
+
+                right_ee_action_frame.position = right_se3_action.wxyz_xyz[-3:]
+                right_ee_action_frame.wxyz = right_se3_action.rotation().wxyz
+                
             
             try:
                 left_se3, left_gripper, right_se3, right_gripper = self._parse_xmi_state(state)
-                
+                _, left_gripper_action, _, right_gripper_action = self._parse_xmi_state(action)
+
+
                 # Update gripper displays
                 self.left_gripper_pos.value = f"{left_gripper:.3f}"
                 self.right_gripper_pos.value = f"{right_gripper:.3f}"
+                self.left_gripper_action.value = f"{left_gripper_action:.3f}"
+                self.right_gripper_action.value = f"{right_gripper_action:.3f}"
+
                 
                 # Update position displays
                 left_pos = left_se3.translation()
@@ -618,7 +660,7 @@ class XMILeRobotViewer:
 
 
 def main(
-    dataset_path: str = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/xmi_rby_coffee_cup_on_dish_subsampled_and_gripper_action",
+    dataset_path: str = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/xmi_rby_coffee_cup_on_dish_combined",
 ):
     """
     Main function for XMI LeRobot trajectory viewer.

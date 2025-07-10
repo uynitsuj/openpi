@@ -1,0 +1,93 @@
+# Data Delivery Job Configuration
+
+workdir: .
+
+envs:
+  DATASET_PATH: "s3://xdof-internal-research/sim/sim_red_cube_20250630"
+  CONFIG_NAME: "pi0_yam_test_cube"
+  REPO_NAME: "xdof_default/red_cube"
+  # Environment variables that don't normally need changing
+  XDOF_NFS_FS: "aws"
+  FAST_TMP: "/speedy_tmp"
+  # HF_LEROBOT_HOME: "/speedy_tmp/lerobot"
+  SAVE_PATH: "s3://xdof-internal-research/lerobot_data/"
+
+
+
+resources:
+  cloud: aws
+  instance_type: m6idn.32xlarge #c7i.48xlarge
+  region: us-west-2
+  disk_size: 50  # GB - adjust based on data size
+  image_id: ami-067cc81f948e50e06
+  autostop:
+    down: true
+
+setup: |
+  echo "--- Setting up ephemeral NVMe disk (Hardcoded to /dev/nvme1n1) ---"
+  # WARNING: This script assumes the ephemeral drive is ALWAYS /dev/nvme1n1.
+  # This may fail on different instance types or if no ephemeral drive exists.
+  DEVICE_PATH="/dev/nvme1n1"
+
+  # Check if the block device exists before proceeding
+  if [ -b "$DEVICE_PATH" ]; then
+      echo "Device ${DEVICE_PATH} found."
+
+      # Format the drive with ext4 if it doesn't already have a filesystem
+      if ! sudo file -s "${DEVICE_PATH}" | grep -q "filesystem"; then
+          echo "Formatting ${DEVICE_PATH}..."
+          sudo mkfs.ext4 "${DEVICE_PATH}"
+      fi
+
+      # Mount the drive to the mount point
+      echo "Mounting ${DEVICE_PATH} to ${FAST_TMP}..."
+      sudo mkdir -p "${FAST_TMP}"
+      sudo mount "${DEVICE_PATH}" "${FAST_TMP}"
+
+      # Change ownership to the 'ubuntu' user
+      echo "Setting permissions on ${FAST_TMP}..."
+      sudo chmod 777 "${FAST_TMP}"
+
+      echo "Ephemeral disk setup complete. Mounted at ${FAST_TMP}."
+  else
+      echo "WARN: Device ${DEVICE_PATH} not found. Skipping disk setup."
+  fi
+  echo "--- Ephemeral disk setup finished ---"
+
+  echo "Setting up Python environment..."
+  conda deactivate
+  echo "Setting up openpi"
+
+  sudo apt-get update
+  sudo apt-get install git
+  sudo apt-get install curl
+  sudo apt-get install unzip
+  curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+  unzip awscliv2.zip
+  sudo ./aws/install
+
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  uv venv --python 3.11
+  source .venv/bin/activate
+  GIT_LFS_SKIP_SMUDGE=1 uv sync
+  GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+  echo "Setup complete!"
+
+  sudo apt update
+  sudo apt install -y libgl1
+  sudo apt install -y ffmpeg
+  uv pip install ffmpeg
+  echo "Setup complete!"
+
+run: |
+  echo "##########################################################"
+  echo "## Starting data prep job with XDOF_NFS_FS=$XDOF_NFS_FS ##"
+  echo "##########################################################"
+  conda deactivate
+  source .venv/bin/activate
+  source /opt/pytorch/bin/activate
+
+  aws s3 sync "${DATASET_PATH}" "${FAST_TMP}/s3_data/"
+  uv run scripts/yam_data/convert_yam_data.py --yam_data_path "${FAST_TMP}/s3_data/" --repo_name $REPO_NAME --no-filter-quality --max_workers=32
+  # aws s3 sync "${FAST_TMP}/$REPO_NAME" "${SAVE_PATH}/$REPO_NAME"
+  uv run scripts/compute_norm_stats.py --config-name $CONFIG_NAME --epsilon 1e-2

@@ -1,0 +1,55 @@
+# Data Delivery Job Configuration
+
+workdir: .
+
+envs:
+  DATASET_PATH: "s3://xdof-internal-research/uynitsuj/xmi_rby_coffee_cup_on_dish_combined"
+  CONFIG_NAME: "pi0_xmi_rby_low_mem_finetune"
+  SAVE_NAME: "uynitsuj/xmi_rby_coffee_cup_on_dish_combined"
+  EXP_NAME: "skypilot_train_experiment"
+  CHECKPOINT_BASE_DIR: "./tmp_checkpoints"
+  S3_CHECKPOINT_PATH: "s3://xdof-internal-research/model_ckpts/pi0_xmi_rby_low_mem_finetune/skypilot_train_experiment_combined"
+
+  # Environment variables that don't normally need changing
+  XDOF_NFS_FS: "aws"
+
+resources:
+  cloud: aws
+  accelerators: A100:8
+  region: us-west-2
+  # disk_size: 10  # GB - adjust based on data size
+  image_id: ami-067cc81f948e50e06
+  autostop:
+    down: true
+
+num_nodes: 1  # Number of VMs to launch
+
+setup: |
+  echo "Setting up openpi"
+  conda deactivate
+  # git clone https://github.com/wuphilipp/openpi.git
+  # cd openpi
+  apt-get update && apt-get install git curl
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  uv venv --python 3.11
+  source .venv/bin/activate
+  GIT_LFS_SKIP_SMUDGE=1 uv sync
+  GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+  echo "Setup complete!"
+
+run: |
+  echo "######################"
+  echo "## Starting job ... ##"
+  echo "######################"
+
+  mkdir -p ~/.cache/huggingface/lerobot/
+  aws s3 sync "$DATASET_PATH" "/home/ubuntu/.cache/huggingface/lerobot/${SAVE_NAME}"
+
+  conda deactivate
+  source .venv/bin/activate
+  source /opt/pytorch/bin/activate
+  echo "Running training script settings"
+  CUDA_VISIBLE_DEVICES=0 uv run scripts/compute_norm_stats.py --config-name $CONFIG_NAME
+  echo "running training script with command: "
+  echo "WANDB_MODE=disabled XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py $CONFIG_NAME --exp-name=$EXP_NAME --overwrite --checkpoint_base_dir $CHECKPOINT_BASE_DIR --s3_checkpoint_path $S3_CHECKPOINT_PATH"
+  WANDB_MODE=disabled XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py $CONFIG_NAME --exp-name=$EXP_NAME --overwrite --checkpoint_base_dir $CHECKPOINT_BASE_DIR --s3_checkpoint_path $S3_CHECKPOINT_PATH

@@ -566,6 +566,9 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
+    # S3 path for saving checkpoints (optional). If set, checkpoints will be saved to S3.
+    s3_checkpoint_path: str | None = None
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""
@@ -873,6 +876,26 @@ _CONFIGS = [
     ),
     #
     # Fine-tuning YAM configs.
+    #
+    TrainConfig(
+        name="pi0_yam_tshirt_test",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamDataConfig(
+            repo_id="yam_pi0/tshirt-folding/test",
+            action_space="joint",
+            default_prompt="Fold the shirt",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
     TrainConfig(
         name="pi0_yam",
         model=pi0.Pi0Config(),
@@ -884,8 +907,82 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_yam_test_cube",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamDataConfig(
+            repo_id="xdof_default/red_cube",
+            action_space="joint",  # "joint" for absolute joint positions, "cartesian" for absolute cartesian positions
+            default_prompt="Pick up the red cube",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=20_000,
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_yam_pick_cube_finetune_joint",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamDataConfig(
+            repo_id="Qianzhong-Chen/yam_pick_up_cube_sim_policy_pi0_joint_image_flip_new_0630",
+            # repo_id="Qianzhong-Chen/yam_pick_up_cube_sim_policy_pi0_joint_image_flip_extend_0630",
+            # repo_id="Qianzhong-Chen/yam_pick_up_cube_sim_policy_pi0_joint_image_flip_extend_0630_test_2",
+            action_space="joint",  # "joint" for absolute joint positions, "cartesian" for absolute cartesian positions
+            default_prompt="Pick up the red cube",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        # lr_schedule=_optimizer.CosineDecaySchedule(
+        #     warmup_steps=1_000,
+        #     peak_lr=5e-5,
+        #     decay_steps=10_000,
+        #     decay_lr=5e-5,
+        # ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("/home/david_chen/pi0/checkpoints/pi0_yam_pick_cube_finetune_joint/0627_joint/29999/params"),
+        num_train_steps=20_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_yam_pick_cube_finetune_cartesian",
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamDataConfig(
+            repo_id="Qianzhong-Chen/yam_pick_up_cube_sim_policy_pi0_debug_cartesian",
+            # repo_id="Qianzhong-Chen/yam_pick_up_cube_sim_policy_pi0_no_quality",
+            action_space="cartesian",  # "joint" for absolute joint positions, "cartesian" for absolute cartesian positions
+            default_prompt="Pick up the red cube",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # you chose above.
+        freeze_filter=pi0.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
     ),
     TrainConfig(
         name="pi0_yam_low_mem_finetune",

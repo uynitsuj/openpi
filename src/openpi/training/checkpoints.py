@@ -1,20 +1,20 @@
-from __future__ import annotations
-
-import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
-from typing import Protocol
+import subprocess
+from typing import TYPE_CHECKING, Protocol
 
 from etils import epath
 import jax
 import orbax.checkpoint as ocp
-import orbax.checkpoint.future as future
 
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
+
+if TYPE_CHECKING:
+    pass
 
 
 def initialize_checkpoint_dir(
@@ -68,6 +68,7 @@ def save_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
+    s3_checkpoint_path: str | None = None,
 ):
     def save_assets(directory: epath.Path):
         # Save the normalization stats.
@@ -85,6 +86,42 @@ def save_state(
         "params": {"params": params},
     }
     checkpoint_manager.save(step, items)
+
+    # Save to S3 if configured
+    if s3_checkpoint_path is not None:
+        _sync_to_s3(checkpoint_manager.directory, s3_checkpoint_path, step)
+
+
+def _sync_to_s3(local_checkpoint_dir: epath.Path, s3_checkpoint_path: str, step: int):
+    """Sync checkpoint step to S3."""
+    try:
+        # Construct the S3 path for this specific step
+        s3_step_path = f"{s3_checkpoint_path.rstrip('/')}/{step}"
+
+        # Use AWS CLI to sync the checkpoint directory to S3
+        cmd = [
+            "aws",
+            "s3",
+            "sync",
+            str(local_checkpoint_dir / str(step)),
+            s3_step_path,
+            "--delete",  # Remove files in S3 that are not in local
+        ]
+
+        logging.info(f"Syncing checkpoint step {step} to S3: {s3_step_path}")
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+        if result.returncode == 0:
+            logging.info(f"Successfully synced checkpoint step {step} to S3")
+        else:
+            logging.error(f"Failed to sync checkpoint step {step} to S3: {result.stderr}")
+
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error syncing checkpoint step {step} to S3: {e}")
+        logging.error(f"Command output: {e.stdout}")
+        logging.error(f"Command error: {e.stderr}")
+    except Exception as e:
+        logging.error(f"Unexpected error syncing checkpoint step {step} to S3: {e}")
 
 
 def restore_state(
@@ -122,12 +159,18 @@ class Callback(Protocol):
 class CallbackHandler(ocp.AsyncCheckpointHandler):
     """A CheckpointHandler for calling an arbitrary function asynchronously. Only for saving, not for restoring."""
 
-    def save(self, directory: epath.Path, args: CallbackSave):
+    def __init__(self):
+        self._executor = futures.ThreadPoolExecutor(max_workers=1)
+
+    def close(self):
+        self._executor.shutdown()
+
+    def save(self, directory: epath.Path, args: "CallbackSave"):
         if jax.process_index() == 0:
             args.callback(directory)
 
-    async def async_save(self, directory: epath.Path, args: CallbackSave) -> list[futures.Future]:
-        return [future.CommitFutureAwaitingContractedSignals(asyncio.to_thread(self.save, directory, args))]
+    async def async_save(self, directory: epath.Path, args: "CallbackSave") -> list[futures.Future]:
+        return [self._executor.submit(self.save, directory, args)]
 
     def restore(self, *args, **kwargs):
         raise NotImplementedError("CallbackHandler does not support restore")

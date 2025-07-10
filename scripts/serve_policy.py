@@ -20,6 +20,8 @@ class EnvMode(enum.Enum):
     LIBERO = "libero"
     XDOF = "xdof"
     XDOF_FAST = "xdof_fast"
+    XDOF_FAST_XMI_RBY = "xdof_fast_xmi_rby"
+    XDOF_XMI_RBY = "xdof_xmi_rby"
 
 
 @dataclasses.dataclass
@@ -82,6 +84,14 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     EnvMode.LIBERO: Checkpoint(
         config="pi0_fast_libero",
         dir="gs://openpi-assets/checkpoints/pi0_fast_libero",
+    ),
+    EnvMode.XDOF_FAST_XMI_RBY: Checkpoint(
+        config="pi0fast_xmi_rby_low_mem_finetune",
+        dir="/home/justinyu/checkpoints/pi0fast_xmi_rby_low_mem_finetune/coffee_cup_on_dish_subsampled_and_gripper_proprio/29999",
+    ),
+    EnvMode.XDOF_XMI_RBY: Checkpoint(
+        config="pi0_xmi_rby_low_mem_finetune",
+        dir="/home/justinyu/checkpoints/pi0_xmi_rby_low_mem_finetune/coffee_cup_on_dish_subsampled_and_gripper_proprio/29999",
     ),
 }
 

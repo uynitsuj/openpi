@@ -84,7 +84,7 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(config_name: str, max_frames: int | None = None, epsilon: float = 0.0):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
@@ -106,6 +106,10 @@ def main(config_name: str, max_frames: int | None = None):
             stats[key].update(values.reshape(-1, values.shape[-1]))
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+    
+    # Clamp std with epsilon
+    for key in norm_stats:
+        norm_stats[key].std = np.maximum(norm_stats[key].std, epsilon)
 
     output_path = config.assets_dirs / data_config.repo_id
     print(f"Writing stats to: {output_path}")

@@ -2,7 +2,7 @@ from collections.abc import Iterator, Sequence
 import multiprocessing
 import os
 import typing
-from typing import Protocol, SupportsIndex, TypeVar
+from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -13,6 +13,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 import openpi.transforms as _transforms
+
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -125,7 +126,7 @@ class FakeDataset(Dataset):
 
 
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig, video_backend: Literal["pyav", None] = "pyav",  # set to 'pyav' if torchcodec gives issues
 ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
@@ -140,6 +141,7 @@ def create_torch_dataset(
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        video_backend=video_backend,
     )
 
     if data_config.prompt_from_task:

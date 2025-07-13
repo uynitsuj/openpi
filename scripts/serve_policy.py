@@ -91,7 +91,7 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     ),
     EnvMode.XDOF_XMI_RBY: Checkpoint(
         config="pi0_xmi_rby_low_mem_finetune",
-        dir="/home/justinyu/checkpoints/pi0_xmi_rby_low_mem_finetune/coffee_cup_on_dish_subsampled_and_gripper_proprio/29999",
+        dir="/home/justinyu/checkpoints/pi0_xmi_rby_low_mem_finetune/sky_xmi_rby_coffee_cup_on_dish_combined_20250710_005840/29999",
     ),
 }
 

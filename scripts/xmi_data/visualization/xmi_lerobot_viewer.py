@@ -23,6 +23,7 @@ from typing import Literal
 import jsonlines
 from openpi.utils.matrix_utils import rot_6d_to_quat
 
+DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/hummus_xmi_full"
 
 class XMILeRobotViewer:
     def __init__(self, dataset_path: str, action_horizon: int = 15):
@@ -660,7 +661,7 @@ class XMILeRobotViewer:
 
 
 def main(
-    dataset_path: str = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/xmi_rby_coffee_cup_on_dish_combined",
+    dataset_path: str = DATASET_PATH,
 ):
     """
     Main function for XMI LeRobot trajectory viewer.

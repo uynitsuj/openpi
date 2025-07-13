@@ -201,12 +201,18 @@ class DeltaActions(DataTransformFn):
     # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
     # See `make_bool_mask` for more details.
     mask: Sequence[bool] | None
+    use_actions_as_state: bool = False # Used when proprio state may contain partial delta rather than absolute states
 
     def __call__(self, data: DataDict) -> DataDict:
         if "actions" not in data or self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
+        # state, actions = data["state"], data["actions"]
+        actions = data["actions"]
+        if self.use_actions_as_state:
+            state = actions[0]
+        else:
+            state = data["state"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)

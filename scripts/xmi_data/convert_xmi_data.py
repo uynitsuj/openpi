@@ -29,7 +29,7 @@ import gc
 import h5py
 import shutil
 import viser.transforms as vtf
-from openpi.utils.xmi_dataloader_utils import load_episode_data
+from openpi.utils.xmi_dataloader_utils import load_episode_data, validate_episode_data, validate_array_data, validate_records, validate_images
 from openpi.utils.matrix_utils import *
 from openpi_client.image_tools import resize_with_pad
 
@@ -49,17 +49,38 @@ except ImportError:
 class XMIConfig:
     # Input data paths
     raw_dataset_folders: List[str] = field(default_factory=lambda: [
+        "/nfs_us/hummus_xmi_data/pick_place_beverage",
+        "/nfs_us/hummus_xmi_data/pick_place_chips_bag",
+        "/nfs_us/hummus_xmi_data/pick_place_candy_bag",
+        "/nfs_us/hummus_xmi_data/pick_place_cleaning_sponge",
+        "/nfs_us/hummus_xmi_data/pick_place_dish_detergent",
+        "/nfs_us/hummus_xmi_data/pick_place_paper_towel",
+        "/nfs_us/hummus_xmi_data/pick_place_shaving_razor",
+        "/nfs_us/hummus_xmi_data/pick_place_soup_can",
+        "/nfs_us/hummus_xmi_data/pick_place_toothpaste",
+        "/nfs_us/hummus_xmi_data/pick_place_yoghurt",
         "/home/justinyu/Downloads/20250630",
         "/home/justinyu/Downloads/data_20250708",
     ])
     
-    # Language instructions corresponding to each dataset folder
+    # Language instructions corresponding to each dataset folder (ANNOTATION OVERRIDES)
     language_instructions: List[str] = field(default_factory=lambda: [
+        "pick up the beverage and place it in the bin",
+        "pick up the chips bag and place it in the bin",
+        "pick up the candy bag and place it in the bin",
+        "pick up the cleaning sponge and place it in the bin",
+        "pick up the dish detergent and place it in the bin",
+        "pick up the paper towel and place it in the bin",
+        "pick up the shaving razor and place it in the bin",
+        "pick up the soup can and place it in the bin",
+        "pick up the toothpaste and place it in the bin",
+        "pick up the yoghurt and place it in the bin",
+        "place the coffee cup on the dish",
         "place the coffee cup on the dish"
     ])
     
     # Repository name for output dataset
-    repo_name: str = "uynitsuj/xmi_rby_coffee_cup_on_dish_combined"
+    repo_name: str = "uynitsuj/hummus_xmi_full_subsample_2_cleaned2"
     
     # Camera settings
     camera_keys: List[str] = field(default_factory=lambda: [
@@ -81,12 +102,14 @@ class XMIConfig:
     # Processing settings
     resize_size: int = 224
     fps: int = 30 # Framerate of original video
-    temporal_subsample_factor: int = 2  # Subsample every N frames (1 = no subsampling)
+    temporal_subsample_factor: int = 2 # Subsample every N frames (1 = no subsampling)
     chunk_size: int = 1000
-    max_workers: int = 6
+    max_workers: int = 10
     max_episodes: Optional[int] = None
     skip_videos: bool = False
     first_frame_head_reorient: bool = False
+
+    delta_proprio_keys: str = "z" # Makes the proprioceptive state for this axis delta. Can set to None to keep absolute
     
     # Hub settings
     push_to_hub: bool = False
@@ -99,9 +122,15 @@ class XMIConfig:
     benchmark_encoders: bool = True
     encoder_name: Optional[str] = None
     encoding_quality: str = 'fast'
-    
+
     # Debug settings
     debug: bool = False
+    problematic_data_dir: Optional[str] = None  # Directory to move problematic episodes
+    
+    def __post_init__(self):
+        # Set default problematic data directory if not specified
+        if self.problematic_data_dir is None:
+            self.problematic_data_dir = f"./problematic_episodes_{self.repo_name.replace('/', '_')}"
 
 
 def convert_to_uint8(img: np.ndarray) -> np.ndarray:
@@ -511,12 +540,70 @@ def find_episode_directories(raw_dataset_folders: List[str]) -> List[Path]:
     return sorted(episode_dirs)
 
 
-def process_xmi_transforms(episode_data: dict, cfg: XMIConfig) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+def move_problematic_episode(episode_path: Path, error_msg: str, cfg: XMIConfig, episode_idx: int = None) -> bool:
+    """
+    Move a problematic episode to a separate directory for analysis.
+    
+    Args:
+        episode_path: Path to the problematic episode
+        error_msg: Error message describing the problem
+        cfg: Configuration object
+        episode_idx: Optional episode index for logging
+        
+    Returns:
+        bool: True if move was successful, False otherwise
+    """
+    try:
+        # Create problematic data directory
+        problematic_dir = Path(cfg.problematic_data_dir)
+        problematic_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create subdirectory based on error type
+        error_type = error_msg.split(':')[0].replace(' ', '_').replace('❌', '').strip()
+        error_subdir = problematic_dir / error_type
+        error_subdir.mkdir(parents=True, exist_ok=True)
+        
+        # Generate destination path
+        dest_path = error_subdir / episode_path.name
+        
+        # Move the episode directory
+        if episode_path.exists():
+            shutil.move(str(episode_path), str(dest_path))
+            
+            # Create error log file
+            error_log_path = dest_path / "error_log.txt"
+            with open(error_log_path, 'w') as f:
+                f.write(f"Episode Index: {episode_idx}\n")
+                f.write(f"Original Path: {episode_path}\n")
+                f.write(f"Error: {error_msg}\n")
+                f.write(f"Moved At: {pd.Timestamp.now()}\n")
+            
+            episode_str = f"episode {episode_idx}" if episode_idx is not None else "episode"
+            print(f"  📁 Moved problematic {episode_str} to: {dest_path}")
+            return True
+        else:
+            print(f"  ⚠️  Episode path does not exist: {episode_path}")
+            return False
+            
+    except Exception as e:
+        print(f"  ❌ Failed to move problematic episode: {e}")
+        return False
+
+
+def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Path = None, episode_idx: int = None) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Process XMI episode data and apply all coordinate transformations.
     Returns (states, actions) as numpy arrays with shape (seq_length, 20).
     
     """
+    
+    # VALIDATION: Check episode data structure
+    is_valid, error_msg = validate_episode_data(episode_data)
+    if not is_valid:
+        print(f"❌ Episode data validation failed: {error_msg}")
+        if episode_path is not None:
+            move_problematic_episode(episode_path, f"Episode data validation failed: {error_msg}", cfg, episode_idx)
+        return None, None
     
     # Extract relevant data
     action_data = episode_data['action_data'] # (oculus gripper action)
@@ -542,7 +629,7 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig) -> tuple[Optional
 
     # average head height
     head_height = np.mean(head_data_all.wxyz_xyz[:, -1])
-    print(f"Average head height: {head_height}m")
+    # print(f"Average head height: {head_height}m")
 
     head_translation = np.array([head_z_tf.translation()[0], -head_z_tf.translation()[1], 0.0])
     if cfg.first_frame_head_reorient:
@@ -562,19 +649,59 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig) -> tuple[Optional
         head_z_axis_angle = np.arctan2(head_z_axis_xy[1], head_z_axis_xy[0])
 
         rby1_base_frame_wxyz = vtf.SO3.from_rpy_radians(0.0, 0.0, head_z_axis_angle).wxyz
-        print(f"Head z axis angle: {head_z_axis_angle}")
+        # print(f"Head z axis angle: {head_z_axis_angle}")
     else:
-        # Default to the direction of left gripper z axis (worried that world frame proprio input messing up inference time distribution)
+        # Default to the direction of left gripper z axis (worried that world frame proprio input messing up normalization statistics)
         # Make the current hand z axis point toward world negative x axis
 
         left_hand_matrix = action_data["action-left-hand_in_quest_world_frame"][0]
         world_frame = action_data["action-left-quest_world_frame"][0]
         left_hand_tf = vtf.SE3.from_matrix(left_hand_matrix)
         left_hand_tf = q2w @ vtf.SE3.from_matrix(world_frame) @ left_hand_tf
-        hand_z_axis = left_hand_tf.as_matrix()[:, 2]
-        hand_z_axis_angle = np.arctan2(hand_z_axis[1], hand_z_axis[0])
-        rby1_base_frame_wxyz = (vtf.SO3.from_rpy_radians(0.0, 0.0, hand_z_axis_angle + np.pi)).wxyz
-        print(f"Left gripper z axis angle: {hand_z_axis_angle}")
+
+        left_hand_tf_pos = left_hand_tf.wxyz_xyz[-3:]
+        left_hand_tf_pos[1] = -left_hand_tf_pos[1]
+
+        left_hand_tf_reflected = vtf.SE3.from_rotation_and_translation(vtf.SO3.from_rpy_radians(
+            -left_hand_tf.rotation().as_rpy_radians().roll,
+            left_hand_tf.rotation().as_rpy_radians().pitch,
+            -left_hand_tf.rotation().as_rpy_radians().yaw,
+        ), left_hand_tf_pos)
+
+        # Add end effector TCP frame with offset (same as combined viewer)
+        pitch_180 = vtf.SE3.from_rotation_and_translation(vtf.SO3.from_rpy_radians(0.0, np.pi, 0.0), np.array([0.0, 0.0, 0.0]))
+        yaw_45 = vtf.SE3.from_rotation_and_translation(vtf.SO3.from_rpy_radians(0.0, 0.0, np.pi/4), np.array([0.0, 0.0, 0.0]))
+        offset = vtf.SE3.from_rotation_and_translation(vtf.SO3.identity(), np.array([-0.08275, 0.0, 0.005]))
+        ee_tf = yaw_45 @ offset @ pitch_180
+
+        tf_left_ee_ik_target = left_hand_tf_reflected @ left_controller_calib_tf @ ee_tf
+
+        hand_z_axis = tf_left_ee_ik_target.as_matrix()[:, 2] 
+        hand_z_axis_angle_left = np.arctan2(hand_z_axis[1], hand_z_axis[0])
+
+        right_hand_matrix = action_data["action-right-hand_in_quest_world_frame"][0]
+        right_world_frame = action_data["action-right-quest_world_frame"][0]
+        right_hand_in_world = np.linalg.inv(world_frame) @ right_world_frame @ right_hand_matrix
+        right_hand_tf = vtf.SE3.from_matrix(right_hand_in_world)
+        right_hand_tf = q2w @ vtf.SE3.from_matrix(right_world_frame) @ right_hand_tf
+
+        right_hand_tf_pos = right_hand_tf.wxyz_xyz[-3:]
+        right_hand_tf_pos[1] = -right_hand_tf_pos[1]
+
+        right_hand_tf_reflected = vtf.SE3.from_rotation_and_translation(vtf.SO3.from_rpy_radians(
+            -right_hand_tf.rotation().as_rpy_radians().roll,
+            right_hand_tf.rotation().as_rpy_radians().pitch,
+            -right_hand_tf.rotation().as_rpy_radians().yaw,
+        ), right_hand_tf_pos)
+
+        tf_right_ee_ik_target = right_hand_tf_reflected @ right_controller_calib_tf @ ee_tf
+
+        hand_z_axis = tf_right_ee_ik_target.as_matrix()[:, 2]
+        hand_z_axis_angle_right = np.arctan2(hand_z_axis[1], hand_z_axis[0])
+        # Average the two angles
+        rby1_base_frame_wxyz = (vtf.SO3.from_rpy_radians(0.0, 0.0, np.pi + (hand_z_axis_angle_left + hand_z_axis_angle_right) / 2.0)).wxyz
+
+
 
     rby1_base_frame_position = head_translation
 
@@ -699,6 +826,25 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig) -> tuple[Optional
     
     # Combine into full end-effector state
     # FORMAT: [left_6d_rot, left_3d_pos, left_1d_gripper, right_6d_rot, right_3d_pos, right_1d_gripper]
+    if len(left_gripper_pos.shape) == 1:
+        left_gripper_pos = left_gripper_pos[..., None]
+        right_gripper_pos = right_gripper_pos[..., None]
+    elif len(left_gripper_pos.shape) == 3:
+        left_gripper_pos = left_gripper_pos[:, :, 0]
+        right_gripper_pos = right_gripper_pos[:, :, 0]
+    if len(left_gripper_action.shape) == 1:
+        left_gripper_action = left_gripper_action[..., None]
+        right_gripper_action = right_gripper_action[..., None]
+    elif len(left_gripper_action.shape) == 3:
+        left_gripper_action = left_gripper_action[:, :, 0]
+        right_gripper_action = right_gripper_action[:, :, 0]
+
+    assert len(left_gripper_pos.shape) == 2
+    assert len(right_gripper_pos.shape) == 2
+    assert len(left_gripper_action.shape) == 2
+    assert len(right_gripper_action.shape) == 2
+
+
     proprio_data = np.concatenate([
         left_6d_rot, left_ee_ik_target_handle_position, left_gripper_pos,
         right_6d_rot, right_ee_ik_target_handle_position, right_gripper_pos
@@ -721,15 +867,19 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig) -> tuple[Optional
     
     for step in range(seq_length):
         # Current state
-        state_t = proprio_data[step]
-        
-        # Calculate delta action (next state - current state)
-        # action_t = proprio_data[step + 1] - state_t
+        state_t = proprio_data[step].copy()
+
+        if cfg.delta_proprio_keys is not None:
+            # Make the proprioceptive state for this axis delta instead of absolute
+            if "z" in cfg.delta_proprio_keys:
+                if step > 0:
+                    state_t[8] = proprio_data[step][8] - proprio_data[step-1][8]
+                    state_t[18] = proprio_data[step][18] - proprio_data[step-1][18]
+                else:
+                    state_t[8] = 0.0
+                    state_t[18] = 0.0
+
         action_t = action_data[step]
-        
-        # For grippers, use absolute position from t+1 instead of delta
-        # action_t[9] = proprio_data[step + 1][9]    # left gripper (index 9)
-        # action_t[19] = proprio_data[step + 1][19]  # right gripper (index 19)
         
         states.append(state_t)
         actions.append(action_t)
@@ -737,56 +887,30 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig) -> tuple[Optional
     states = np.array(states, dtype=np.float32)
     actions = np.array(actions, dtype=np.float32)
     
-    # Optional debug visualization
-    if cfg.debug:
-        print("Setting up debug visualization...")
-        import viser
-        viser_server = viser.ViserServer()
-        
-        # Convert 6D rotations back to quaternions for visualization
-        left_6d_rot_recovered = states[:, 0:6]    # indices 0:6
-        left_ee_xyz_recovered = states[:, 6:9]    # indices 6:9
-        right_6d_rot_recovered = states[:, 10:16] # indices 10:16
-        right_ee_xyz_recovered = states[:, 16:19] # indices 16:19
-        
-        left_ee_quat_recovered = rot_6d_to_quat(left_6d_rot_recovered)  # Returns [w, x, y, z]
-        right_ee_quat_recovered = rot_6d_to_quat(right_6d_rot_recovered)  # Returns [w, x, y, z]
-        
-        # Add transforms to viser for visualization
-        for i in range(min(len(states), 100)):  # Limit to first 100 for performance
-            viser_server.scene.add_frame(
-                f"right_hand_tf/tf_{i}",
-                position=right_ee_xyz_recovered[i],
-                wxyz=right_ee_quat_recovered[i],
-                axes_length=0.02,
-                axes_radius=0.0003,
-            )
-            viser_server.scene.add_frame(
-                f"left_hand_tf/tf_{i}",
-                position=left_ee_xyz_recovered[i],
-                wxyz=left_ee_quat_recovered[i],
-                axes_length=0.02,
-                axes_radius=0.0003,
-            )
-        
-        viser_server.scene.add_frame(
-            "rby1_base_frame",
-            position=rby1_base_frame_position,
-            wxyz=rby1_base_frame_wxyz,
-            axes_length=0.15,
-            axes_radius=0.004,
-        )
-        
-        print("Debug visualization ready. Check viser server.")
+    # VALIDATION: Check final processed arrays
+    is_valid, error_msg = validate_array_data(states, "states", expected_shape=(seq_length, 20))
+    if not is_valid:
+        print(f"❌ States validation failed: {error_msg}")
+        if episode_path is not None:
+            move_problematic_episode(episode_path, f"States validation failed: {error_msg}", cfg, episode_idx)
+        return None, None
+    
+    is_valid, error_msg = validate_array_data(actions, "actions", expected_shape=(seq_length, 20))
+    if not is_valid:
+        print(f"❌ Actions validation failed: {error_msg}")
+        if episode_path is not None:
+            move_problematic_episode(episode_path, f"Actions validation failed: {error_msg}", cfg, episode_idx)
+        return None, None
+
     
     return states, actions
 
 
-def process_episode_in_chunks(episode_data: dict, cfg: XMIConfig, max_chunk_frames: int = 1000) -> tuple[list, dict]:
+def process_episode_in_chunks(episode_data: dict, cfg: XMIConfig, max_chunk_frames: int = 1000, episode_path: Path = None, episode_idx: int = None) -> tuple[list, dict]:
     """Process episode data in memory-efficient chunks to handle long episodes."""
     
     # Process XMI transforms first
-    states, actions = process_xmi_transforms(episode_data, cfg)
+    states, actions = process_xmi_transforms(episode_data, cfg, episode_path, episode_idx)
     if states is None or actions is None:
         return [], {}
     
@@ -799,7 +923,7 @@ def process_episode_in_chunks(episode_data: dict, cfg: XMIConfig, max_chunk_fram
         global_subsample_indices = list(range(0, original_total_length, cfg.temporal_subsample_factor))
         states = states[global_subsample_indices]
         actions = actions[global_subsample_indices]
-        print(f"Applied temporal subsampling factor {cfg.temporal_subsample_factor}: {len(states)} frames after subsampling")
+        # print(f"Applied temporal subsampling factor {cfg.temporal_subsample_factor}: {len(states)} frames after subsampling")
     else:
         global_subsample_indices = list(range(original_total_length))
     
@@ -833,6 +957,14 @@ def process_episode_in_chunks(episode_data: dict, cfg: XMIConfig, max_chunk_fram
                             images.append(available_images[orig_idx])
                     
                     if images:
+                        # VALIDATION: Check images before processing
+                        is_valid, error_msg = validate_images(images, cam_key)
+                        if not is_valid:
+                            print(f"❌ Image validation failed for {cam_key}: {error_msg}")
+                            if episode_path is not None:
+                                move_problematic_episode(episode_path, f"Image validation failed for {cam_key}: {error_msg}", cfg, episode_idx)
+                            return [], {}  # Return empty to skip episode
+                        
                         # Resize images for this chunk
                         resized_images = []
                         for img in images:
@@ -871,6 +1003,14 @@ def process_episode_in_chunks(episode_data: dict, cfg: XMIConfig, max_chunk_fram
         
         # Force garbage collection after each chunk
         gc.collect()
+    
+    # VALIDATION: Check final records before returning
+    is_valid, error_msg = validate_records(all_records)
+    if not is_valid:
+        print(f"❌ Records validation failed: {error_msg}")
+        if episode_path is not None:
+            move_problematic_episode(episode_path, f"Records validation failed: {error_msg}", cfg, episode_idx)
+        return [], {}
     
     return all_records, all_image_data
 
@@ -1010,37 +1150,54 @@ def process_xmi_episode(
 ):
     """Process a single XMI episode and save it directly to LeRobot format."""
     
-    print(f"Processing episode {idx}: {episode_path.name}")
+    # print(f"Processing episode {idx}: {episode_path.name}")
     
     # Load episode data
     episode_data = load_episode_data(episode_path)
     if not episode_data:
-        print(f"  Failed to load episode {idx}")
+        print(f"  ❌ Failed to load episode {idx}")
+        move_problematic_episode(episode_path, "Failed to load episode data", cfg, idx)
         return None
     
     # Process episode in memory-efficient chunks
-    # try:
-    records, image_data = process_episode_in_chunks(episode_data, cfg, max_chunk_frames=cfg.max_frames_per_chunk)
-    if not records:
-        print(f"  No valid data in episode {idx}")
+    try:
+        records, image_data = process_episode_in_chunks(episode_data, cfg, max_chunk_frames=cfg.max_frames_per_chunk, episode_path=episode_path, episode_idx=idx)
+        if not records:
+            print(f"  ❌ No valid data in episode {idx}")
+            # Episode already moved by process_episode_in_chunks if it was a validation failure
+            return None
+        
+        seq_length = len(records)
+        # print(f"  Episode {idx}: {seq_length} frames total")
+                
+    except Exception as e:
+        error_msg = f"Error processing episode {idx}: {e}"
+        print(f"  ❌ {error_msg}")
+        move_problematic_episode(episode_path, error_msg, cfg, idx)
         return None
-    
-    seq_length = len(records)
-    print(f"  Episode {idx}: {seq_length} frames total")
-            
-    # except Exception as e:
-    #     print(f"  Error processing episode {idx}: {e}")
-    #     return None
     
     # Update episode and task indices in records
     for record in records:
         record["episode_index"] = [idx]
         record["index"] = [record["frame_index"][0]]  # Global frame index will be updated later
     
+    # VALIDATION: Final check before saving
+    is_valid, error_msg = validate_records(records)
+    if not is_valid:
+        print(f"  ❌ Final validation failed for episode {idx}: {error_msg}")
+        move_problematic_episode(episode_path, f"Final validation failed: {error_msg}", cfg, idx)
+        return None
+    
     # Save parquet (joint positions + actions per frame)
     episode_path_out = episode_base / f"episode_{idx:06d}.parquet"
     episode_path_out.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(records).to_parquet(episode_path_out)
+    
+    try:
+        pd.DataFrame(records).to_parquet(episode_path_out)
+    except Exception as e:
+        print(f"  ❌ Failed to save parquet for episode {idx}: {e}")
+        move_problematic_episode(episode_path, f"Failed to save parquet for episode {idx}: {e}", cfg, idx)
+        return None
     
     # Save videos if not skipping
     if not cfg.skip_videos and image_data:
@@ -1053,11 +1210,22 @@ def process_xmi_episode(
                 
                 frames = image_data[cam_key]
                 if frames:
-                    print(f"  Encoding video {cam_key}: {len(frames)} frames")
-                    if encoder_name:
-                        encode_video_optimized(frames, save_path, cfg.fps, cfg.temporal_subsample_factor, encoder_name, encoding_quality)
-                    else:
-                        encode_video_simple(frames, save_path, cfg.fps, cfg.temporal_subsample_factor)
+                    # VALIDATION: Final check on video frames
+                    is_valid, error_msg = validate_images(frames, cam_key)
+                    if not is_valid:
+                        print(f"  ⚠️  Video validation failed for {cam_key} in episode {idx}: {error_msg}")
+                        move_problematic_episode(episode_path, f"Video validation failed for {cam_key} in episode {idx}: {error_msg}", cfg, idx)
+                        continue
+                    
+                    # print(f"  Encoding video {cam_key}: {len(frames)} frames")
+                    try:
+                        if encoder_name:
+                            encode_video_optimized(frames, save_path, cfg.fps, cfg.temporal_subsample_factor, encoder_name, encoding_quality)
+                        else:
+                            encode_video_simple(frames, save_path, cfg.fps, cfg.temporal_subsample_factor)
+                    except Exception as e:
+                        print(f"  ⚠️  Video encoding failed for {cam_key} in episode {idx}: {e}")
+                        move_problematic_episode(episode_path, f"Video encoding failed for {cam_key} in episode {idx}: {e}", cfg, idx)
     
     # Compute and write episode stats immediately
     episode_stats = compute_basic_episode_stats(idx, {"length": seq_length}, cfg, base_dir)
@@ -1081,10 +1249,187 @@ def process_xmi_episode(
     del episode_data, records, image_data
     gc.collect()
     
-    print(f"  Completed episode {idx}: {seq_length} frames, task '{language_instruction}'")
+    # print(f"  ✅ Completed episode {idx}: {seq_length} frames, task '{language_instruction}'")
     
     # Return metadata for final statistics
     return episode_metadata
+
+
+def renumber_episodes_consecutively(all_episodes: list, base_dir: Path, cfg: XMIConfig) -> list:
+    """
+    Renumber episodes consecutively to fill gaps from skipped episodes.
+    
+    Args:
+        all_episodes: List of successful episode metadata
+        base_dir: Base directory of the dataset
+        cfg: Configuration object
+        
+    Returns:
+        list: Updated episode metadata with consecutive indices
+    """
+    print(f"\n=== Renumbering Episodes Consecutively ===")
+    
+    # Sort episodes by original index to maintain order
+    all_episodes.sort(key=lambda x: x['episode_index'])
+    
+    # Create mapping from old to new indices
+    old_to_new_mapping = {}
+    updated_episodes = []
+    
+    for new_idx, episode_metadata in enumerate(all_episodes):
+        old_idx = episode_metadata['episode_index']
+        old_to_new_mapping[old_idx] = new_idx
+        
+        # Update the episode metadata
+        episode_metadata['episode_index'] = new_idx
+        updated_episodes.append(episode_metadata)
+        
+        print(f"  Episode {old_idx} → {new_idx}")
+    
+    # Now we need to rename all the files
+    print(f"Renaming files for {len(updated_episodes)} episodes...")
+    
+    # Rename parquet files
+    for episode_metadata in updated_episodes:
+        old_idx = None
+        new_idx = episode_metadata['episode_index']
+        
+        # Find the original index from the mapping
+        for old, new in old_to_new_mapping.items():
+            if new == new_idx:
+                old_idx = old
+                break
+        
+        if old_idx == new_idx:
+            continue  # No change needed
+        
+        # Rename parquet file
+        old_chunk_id = old_idx // cfg.chunk_size
+        new_chunk_id = new_idx // cfg.chunk_size
+        
+        old_parquet_path = base_dir / "data" / f"chunk-{old_chunk_id:03d}" / f"episode_{old_idx:06d}.parquet"
+        new_parquet_path = base_dir / "data" / f"chunk-{new_chunk_id:03d}" / f"episode_{new_idx:06d}.parquet"
+        
+        if old_parquet_path.exists():
+            # Create new chunk directory if needed
+            new_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old_parquet_path), str(new_parquet_path))
+        
+        # Rename video files
+        if not cfg.skip_videos:
+            for cam_key in cfg.camera_keys:
+                old_video_path = base_dir / "videos" / f"chunk-{old_chunk_id:03d}" / cam_key / f"episode_{old_idx:06d}.mp4"
+                new_video_path = base_dir / "videos" / f"chunk-{new_chunk_id:03d}" / cam_key / f"episode_{new_idx:06d}.mp4"
+                
+                if old_video_path.exists():
+                    # Create new video directory if needed
+                    new_video_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(old_video_path), str(new_video_path))
+    
+    # Update parquet files with new episode indices
+    print("Updating parquet files with new episode indices...")
+    for episode_metadata in updated_episodes:
+        new_idx = episode_metadata['episode_index']
+        new_chunk_id = new_idx // cfg.chunk_size
+        parquet_path = base_dir / "data" / f"chunk-{new_chunk_id:03d}" / f"episode_{new_idx:06d}.parquet"
+        
+        if parquet_path.exists():
+            # Load, update, and save the parquet file
+            df = pd.read_parquet(parquet_path)
+            # Preserve list format for scalar fields to maintain shape consistency
+            df['episode_index'] = [[new_idx] for _ in range(len(df))]
+            # Calculate global frame indices while preserving list format
+            global_indices = []
+            for _, row in df.iterrows():
+                frame_idx = row['frame_index'][0] if isinstance(row['frame_index'], list) else row['frame_index']
+                global_indices.append([frame_idx + new_idx * 10000])
+            df['index'] = global_indices
+            df.to_parquet(parquet_path)
+    
+    # Clean up empty chunk directories
+    for chunk_dir in (base_dir / "data").iterdir():
+        if chunk_dir.is_dir() and not any(chunk_dir.iterdir()):
+            shutil.rmtree(chunk_dir)
+    
+    if not cfg.skip_videos:
+        for chunk_dir in (base_dir / "videos").iterdir():
+            if chunk_dir.is_dir():
+                # Check if any camera subdirectories have files
+                has_files = False
+                for cam_dir in chunk_dir.iterdir():
+                    if cam_dir.is_dir() and any(cam_dir.iterdir()):
+                        has_files = True
+                        break
+                if not has_files:
+                    shutil.rmtree(chunk_dir)
+    
+    print(f"✅ Successfully renumbered {len(updated_episodes)} episodes")
+    return updated_episodes
+
+
+def rewrite_episode_metadata(all_episodes: list, base_dir: Path):
+    """
+    Rewrite episode and task metadata files with updated indices.
+    
+    Args:
+        all_episodes: List of episode metadata with updated indices
+        base_dir: Base directory of the dataset
+    """
+    print("Rewriting metadata files...")
+    
+    # Clear existing metadata files
+    episodes_file = base_dir / "meta" / "episodes.jsonl"
+    tasks_file = base_dir / "meta" / "tasks.jsonl"
+    
+    if episodes_file.exists():
+        episodes_file.unlink()
+    if tasks_file.exists():
+        tasks_file.unlink()
+    
+    # Collect all unique tasks
+    all_tasks = set()
+    for episode in all_episodes:
+        all_tasks.update(episode['tasks'])
+    
+    # Write tasks file
+    task_mapping = {}
+    with open(tasks_file, 'w') as f:
+        for task_index, task in enumerate(sorted(all_tasks)):
+            task_mapping[task] = task_index
+            f.write(json.dumps({"task_index": task_index, "task": task}) + "\n")
+    
+    # Write episodes file with updated task indices
+    with open(episodes_file, 'w') as f:
+        for episode in all_episodes:
+            # Update task_index to match the new mapping
+            episode['task_index'] = task_mapping.get(episode['tasks'][0], 0)
+            f.write(json.dumps(episode) + "\n")
+
+
+def rewrite_episodes_stats(all_episodes: list, base_dir: Path, cfg: XMIConfig):
+    """
+    Rewrite episode stats files with updated indices.
+    
+    Args:
+        all_episodes: List of episode metadata with updated indices
+        base_dir: Base directory of the dataset
+        cfg: Configuration object
+    """
+    if not HAS_LEROBOT:
+        return
+    
+    print("Rewriting episode stats...")
+    
+    # Clear existing stats files
+    stats_dir = base_dir / "meta" / "stats"
+    if stats_dir.exists():
+        shutil.rmtree(stats_dir)
+    
+    # Recreate stats for each episode with new indices
+    for episode in all_episodes:
+        new_idx = episode['episode_index']
+        episode_stats = compute_basic_episode_stats(new_idx, episode, cfg, base_dir)
+        write_episode_stats(new_idx, episode_stats, base_dir)
 
 
 def main(cfg: XMIConfig):
@@ -1184,7 +1529,7 @@ def main(cfg: XMIConfig):
     if not cfg.skip_videos:
         (base_dir / "videos").mkdir(exist_ok=True)
     
-    # Create chunk directories
+    # Create chunk directories (generous allocation for original indices)
     num_chunks = (len(episode_dirs) + cfg.chunk_size - 1) // cfg.chunk_size
     episode_base = base_dir / "data"
     for i in range(num_chunks):
@@ -1297,6 +1642,15 @@ def main(cfg: XMIConfig):
         print("No episodes were processed!")
         return
     
+    # Renumber episodes consecutively to fill gaps
+    all_episodes = renumber_episodes_consecutively(all_episodes, base_dir, cfg)
+    
+    # Rewrite metadata files with updated indices
+    rewrite_episode_metadata(all_episodes, base_dir)
+    
+    # Rewrite episode stats with updated indices
+    rewrite_episodes_stats(all_episodes, base_dir, cfg)
+    
     # Calculate final dataset statistics
     total_frames = sum(e["length"] for e in all_episodes)
     actual_chunks = (len(all_episodes) + cfg.chunk_size - 1) // cfg.chunk_size
@@ -1375,6 +1729,9 @@ def main(cfg: XMIConfig):
     print(f"Total frames: {total_frames}")
     print(f"Total chunks: {actual_chunks}")
     
+    # Print summary of problematic episodes
+    print_problematic_episodes_summary(cfg)
+    
     # Push to hub if enabled
     if cfg.push_to_hub and HAS_LEROBOT:
         print(f"\nPreparing to push dataset to Hugging Face Hub...")
@@ -1428,6 +1785,30 @@ def main(cfg: XMIConfig):
     elif cfg.push_to_hub and not HAS_LEROBOT:
         print("❌ Cannot push to hub: LeRobot not available")
         print("Install lerobot package to enable hub push functionality")
+
+
+def print_problematic_episodes_summary(cfg: XMIConfig):
+    """Print a summary of problematic episodes that were moved."""
+    problematic_dir = Path(cfg.problematic_data_dir)
+    
+    if not problematic_dir.exists():
+        return
+    
+    print(f"\n=== Problematic Episodes Summary ===")
+    print(f"Problematic data directory: {problematic_dir}")
+    
+    total_problematic = 0
+    for error_subdir in problematic_dir.iterdir():
+        if error_subdir.is_dir():
+            episode_count = len([d for d in error_subdir.iterdir() if d.is_dir()])
+            if episode_count > 0:
+                print(f"  {error_subdir.name}: {episode_count} episodes")
+                total_problematic += episode_count
+    
+    print(f"Total problematic episodes: {total_problematic}")
+    
+    if total_problematic > 0:
+        print(f"💡 You can investigate these episodes manually in: {problematic_dir}")
 
 
 if __name__ == "__main__":

@@ -375,7 +375,7 @@ class LeRobotXmiRbyDataConfig(DataConfigFactory):
             9, -1   # right: 6d_rot (delta), 3d_pos (delta), gripper (absolute) 
         )
         data_transforms = data_transforms.push(
-            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            inputs=[_transforms.DeltaActions(delta_action_mask, use_actions_as_state=True)],
             outputs=[_transforms.AbsoluteActions(delta_action_mask)],
         )
 
@@ -832,29 +832,29 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi0_xmi_rby",
-        model=pi0.Pi0Config(action_horizon=50),
+        model=pi0.Pi0Config(action_horizon=25),
         data=LeRobotXmiRbyDataConfig(
-            repo_id="uynitsuj/xmi_bimanual_testing",
-            default_prompt="testing",
+            repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned",
+            default_prompt="do something useful",
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30_000,
+        num_train_steps=100_000,
     ),
     TrainConfig(
         name="pi0_fast_xmi_rby_low_mem_finetune",
         model=pi0_fast.Pi0FASTConfig(action_dim=20, action_horizon=25, max_token_len=250, paligemma_variant="gemma_2b_lora"),
         data=LeRobotXmiRbyDataConfig(
-            repo_id="uynitsuj/xmi_rby_coffee_cup_on_dish_combined",
+            repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned",
             default_prompt="place the coffee cup on the dish",
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
+        num_train_steps=50_000,
         freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
         ema_decay=None,
     ),
@@ -862,14 +862,14 @@ _CONFIGS = [
         name="pi0_xmi_rby_low_mem_finetune",
         model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_horizon=25, action_expert_variant="gemma_300m_lora"),
         data=LeRobotXmiRbyDataConfig(
-            repo_id="uynitsuj/xmi_rby_coffee_cup_on_dish_combined",
+            repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned2",
             default_prompt="place the coffee cup on the dish",
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30_000,
+        num_train_steps=50_000,
         freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,

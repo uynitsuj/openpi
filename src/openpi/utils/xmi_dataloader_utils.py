@@ -104,12 +104,12 @@ def load_episode_data(episode_path: Path):
             min_frames = min(len(frames) for frames in images.values())
             for camera_name in images:
                 images[camera_name] = images[camera_name][:min_frames]
-            print(f"Loaded {len(images)} camera feeds with {min_frames} frames each")
+            # print(f"Loaded {len(images)} camera feeds with {min_frames} frames each")
             
             # Print resolution info for each camera
-            for camera_name in camera_names:
-                shape = images[camera_name].shape
-                print(f"  {camera_name}: {shape[1]}x{shape[2]} resolution")
+            # for camera_name in camera_names:
+            #     shape = images[camera_name].shape
+                # print(f"  {camera_name}: {shape[1]}x{shape[2]} resolution")
         
         return {
             'action_data': action_data,
@@ -131,3 +131,231 @@ def _load_episode_data(episode_path: Path):
     # This is the original function - keeping for any existing usage
     # But redirecting to the main function
     return load_episode_data(episode_path)
+
+
+# Add these validation functions after the existing imports and before the XMIConfig class
+
+def validate_episode_data(episode_data: dict) -> tuple[bool, str]:
+    """
+    Validate that episode data contains all required fields and has valid structure.
+    
+    Returns:
+        tuple[bool, str]: (is_valid, error_message)
+    """
+    if not isinstance(episode_data, dict):
+        return False, "Episode data is not a dictionary"
+    
+    # Check required top-level keys
+    required_keys = ['action_data', 'joint_data']
+    for key in required_keys:
+        if key not in episode_data:
+            return False, f"Missing required key: {key}"
+        if not isinstance(episode_data[key], dict):
+            return False, f"Key '{key}' is not a dictionary"
+    
+    # Check required action_data keys
+    required_action_keys = [
+        'action-left-head',
+        'action-left-hand_in_quest_world_frame',
+        'action-left-quest_world_frame',
+        'action-right-hand_in_quest_world_frame',
+        'action-right-quest_world_frame',
+        'action-left-pos',
+        'action-right-pos'
+    ]
+    
+    action_data = episode_data['action_data']
+    for key in required_action_keys:
+        if key not in action_data:
+            return False, f"Missing required action_data key: {key}"
+        if action_data[key] is None:
+            return False, f"action_data['{key}'] is None"
+    
+    # Check required joint_data keys
+    required_joint_keys = ['left-joint_pos', 'right-joint_pos']
+    joint_data = episode_data['joint_data']
+    for key in required_joint_keys:
+        if key not in joint_data:
+            return False, f"Missing required joint_data key: {key}"
+        if joint_data[key] is None:
+            return False, f"joint_data['{key}'] is None"
+    
+    # Check that arrays have reasonable lengths
+    try:
+        # Get lengths of key arrays
+        action_lengths = []
+        for key in required_action_keys:
+            if hasattr(action_data[key], '__len__'):
+                action_lengths.append(len(action_data[key]))
+            else:
+                return False, f"action_data['{key}'] is not array-like"
+        
+        joint_lengths = []
+        for key in required_joint_keys:
+            if hasattr(joint_data[key], '__len__'):
+                joint_lengths.append(len(joint_data[key]))
+            else:
+                return False, f"joint_data['{key}'] is not array-like"
+        
+        # Check if all arrays have reasonable and consistent lengths
+        all_lengths = action_lengths + joint_lengths
+        if len(set(all_lengths)) > 1:  # All arrays must have same length
+            return False, f"Inconsistent array lengths: {all_lengths}"
+        
+        min_length = min(all_lengths)
+        if min_length < 2:
+            return False, f"Episode too short: {min_length} frames"
+            
+    except Exception as e:
+        return False, f"Error checking array lengths: {str(e)}"
+    
+    return True, "Valid"
+
+
+def validate_array_data(data: np.ndarray, name: str, expected_shape: tuple = None) -> tuple[bool, str]:
+    """
+    Validate numpy array data for common issues.
+    
+    Args:
+        data: numpy array to validate
+        name: name of the data for error messages
+        expected_shape: optional expected shape (None means any shape is acceptable)
+    
+    Returns:
+        tuple[bool, str]: (is_valid, error_message)
+    """
+    if data is None:
+        return False, f"{name} is None"
+    
+    if not isinstance(data, np.ndarray):
+        return False, f"{name} is not a numpy array (type: {type(data)})"
+    
+    # Check for NaN values
+    if np.any(np.isnan(data)):
+        nan_count = np.sum(np.isnan(data))
+        return False, f"{name} contains {nan_count} NaN values"
+    
+    # Check for infinite values
+    if np.any(np.isinf(data)):
+        inf_count = np.sum(np.isinf(data))
+        return False, f"{name} contains {inf_count} infinite values"
+    
+    # Check dtype
+    if not np.issubdtype(data.dtype, np.number):
+        return False, f"{name} has non-numeric dtype: {data.dtype}"
+    
+    # Check shape if specified
+    if expected_shape is not None:
+        if data.shape != expected_shape:
+            return False, f"{name} has incorrect shape: {data.shape}, expected: {expected_shape}"
+    
+    # Check for reasonable value ranges (detect obvious data corruption)
+    if np.any(np.abs(data) > 1e6):  # Very large values might indicate corruption
+        max_val = np.max(np.abs(data))
+        return False, f"{name} contains suspiciously large values (max: {max_val})"
+    
+    return True, "Valid"
+
+
+def validate_records(records: list) -> tuple[bool, str]:
+    """
+    Validate final records before saving to ensure they're ready for LeRobot format.
+    
+    Args:
+        records: list of record dictionaries
+        
+    Returns:
+        tuple[bool, str]: (is_valid, error_message)
+    """
+    if not records:
+        return False, "No records provided"
+    
+    if not isinstance(records, list):
+        return False, f"Records is not a list (type: {type(records)})"
+    
+    required_keys = ["state", "actions", "timestamp", "frame_index", "episode_index", "index", "task_index"]
+    
+    for i, record in enumerate(records):
+        if not isinstance(record, dict):
+            return False, f"Record {i} is not a dictionary"
+        
+        # Check required keys
+        for key in required_keys:
+            if key not in record:
+                return False, f"Record {i} missing required key: {key}"
+            
+            if record[key] is None:
+                return False, f"Record {i}['{key}'] is None"
+        
+        # Validate state and actions arrays
+        try:
+            state = record["state"]
+            actions = record["actions"]
+            
+            if not isinstance(state, list) or not isinstance(actions, list):
+                return False, f"Record {i}: state and actions must be lists"
+            
+            if len(state) != 20:
+                return False, f"Record {i}: state has {len(state)} elements, expected 20"
+            
+            if len(actions) != 20:
+                return False, f"Record {i}: actions has {len(actions)} elements, expected 20"
+            
+            # Check for None values in state/actions
+            for j, val in enumerate(state):
+                if val is None:
+                    return False, f"Record {i}: state[{j}] is None"
+                if not isinstance(val, (int, float)) or np.isnan(val) or np.isinf(val):
+                    return False, f"Record {i}: state[{j}] has invalid value: {val}"
+            
+            for j, val in enumerate(actions):
+                if val is None:
+                    return False, f"Record {i}: actions[{j}] is None"
+                if not isinstance(val, (int, float)) or np.isnan(val) or np.isinf(val):
+                    return False, f"Record {i}: actions[{j}] has invalid value: {val}"
+        
+        except Exception as e:
+            return False, f"Record {i}: Error validating arrays: {str(e)}"
+    
+    return True, "Valid"
+
+
+def validate_images(images: list, camera_key: str) -> tuple[bool, str]:
+    """
+    Validate image data for a camera.
+    
+    Args:
+        images: list of image arrays
+        camera_key: name of the camera for error messages
+        
+    Returns:
+        tuple[bool, str]: (is_valid, error_message)
+    """
+    if not images:
+        return False, f"No images for camera {camera_key}"
+    
+    for i, img in enumerate(images):
+        if img is None:
+            return False, f"Image {i} for camera {camera_key} is None"
+        
+        if not isinstance(img, np.ndarray):
+            return False, f"Image {i} for camera {camera_key} is not a numpy array"
+        
+        if len(img.shape) != 3:
+            return False, f"Image {i} for camera {camera_key} has wrong dimensions: {img.shape}"
+        
+        if img.shape[2] != 3:
+            return False, f"Image {i} for camera {camera_key} does not have 3 channels: {img.shape}"
+        
+        # Check for reasonable image values
+        if img.dtype == np.uint8:
+            if np.any(img > 255) or np.any(img < 0):
+                return False, f"Image {i} for camera {camera_key} has invalid uint8 values"
+        elif np.issubdtype(img.dtype, np.floating):
+            if np.any(img > 1.0) or np.any(img < 0.0):
+                return False, f"Image {i} for camera {camera_key} has invalid float values (should be [0,1])"
+        else:
+            return False, f"Image {i} for camera {camera_key} has unsupported dtype: {img.dtype}"
+    
+    return True, "Valid"
+

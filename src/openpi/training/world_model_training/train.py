@@ -350,9 +350,44 @@ def validation_step(
     rng: jax.Array,
 ) -> dict:
     """Execute a validation step."""
-    model = state.ema_model if state.ema_model is not None else state.model
-    params = state.params  # Use params from state instead of model.params
-    loss, metrics = compute_loss(model, params, batch, rng, train=False)
+    # Use the same model as training (not EMA model) for consistency
+    model = state.model
+    
+    # Convert JAX arrays to PyTorch tensors for the model
+    import torch
+    
+    def jax_to_torch(arr):
+        return torch.from_numpy(np.array(arr)).float()
+    
+    # Update model parameters from JAX arrays to ensure consistency
+    def update_model_params(model, jax_params):
+        for name, param in model.named_parameters():
+            if name in jax_params:
+                param.data = jax_to_torch(jax_params[name])
+    
+    update_model_params(model, state.params)
+    
+    # Set model to eval mode for validation
+    model.eval()
+    
+    # Convert inputs to PyTorch tensors
+    video_frames = jax_to_torch(batch[0].video_frames)
+    mask = jax_to_torch(batch[0].mask).bool()
+    
+    # Forward pass with same precision as training
+    with torch.no_grad():
+        with torch.cuda.amp.autocast():  # Use same mixed precision as training
+            loss = model.compute_loss(video_frames, mask)
+    
+    # Convert back to JAX array
+    total_loss_jax = jnp.array(loss.detach().cpu().numpy())
+    
+    # Additional metrics
+    metrics = {
+        'reconstruction_loss': total_loss_jax,
+        'mask_ratio': jnp.array(mask.float().mean().cpu().numpy()),
+        'num_masked_patches': jnp.array(mask.float().sum().cpu().numpy()),
+    }
     
     return {f"val_{k}": v for k, v in metrics.items()}
 

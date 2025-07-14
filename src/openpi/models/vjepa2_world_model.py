@@ -545,6 +545,7 @@ class VJEPA2WorldModel(nn.Module):
                 self.target_encoder.parameters(), 
                 self.context_encoder.parameters()
             ):
+                # Update target parameter: target = momentum * target + (1 - momentum) * context
                 target_param.data.mul_(momentum).add_(context_param.data, alpha=1 - momentum)
     
     def predict_masked_regions(

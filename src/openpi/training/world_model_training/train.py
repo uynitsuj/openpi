@@ -332,9 +332,9 @@ def train_step(
     
     state.model.zero_grad()
     
-    with torch.cuda.amp.autocast():
+    with torch.amp.autocast('cuda'):
         loss = state.model.compute_loss(video_frames, mask)
-    
+
     if not hasattr(state, 'torch_optimizer'):
         state.torch_optimizer = torch.optim.AdamW(
             state.model.parameters(),
@@ -433,7 +433,7 @@ def validation_step(
     mask = jax_to_torch(batch[0].mask).bool()
     
     with torch.no_grad():
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             loss = model.compute_loss(video_frames, mask)
     
     total_loss_jax = jnp.array(loss.detach().cpu().numpy())
@@ -565,7 +565,9 @@ def main(config: WorldModelTrainConfig):
                 if key.startswith('_'):
                     continue
                 try:
-                    avg_metrics[key] = jnp.mean(jnp.array([m[key] for m in metrics_history]))
+                    values = [m[key] for m in metrics_history if m[key] is not None]
+                    if values:
+                        avg_metrics[key] = jnp.mean(jnp.array(values))
                 except (TypeError, ValueError):
                     continue
             
@@ -611,7 +613,9 @@ def main(config: WorldModelTrainConfig):
                 if key.startswith('_'):
                     continue
                 try:
-                    avg_val_metrics[key] = jnp.mean(jnp.array([m[key] for m in val_metrics]))
+                    values = [m[key] for m in val_metrics if m[key] is not None]
+                    if values:
+                        avg_val_metrics[key] = jnp.mean(jnp.array(values))
                 except (TypeError, ValueError):
                     continue
             

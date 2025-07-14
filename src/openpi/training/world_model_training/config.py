@@ -161,15 +161,15 @@ _WORLD_MODEL_CONFIGS = [
         model_config=VJEPA2WorldModelConfig(
             num_frames=8,  
             image_size=224,
-            encoder_hidden_size=288,  
-            predictor_hidden_size=144,  
-            encoder_num_layers=4,  
-            predictor_num_layers=4,  
+            encoder_hidden_size=768,  # Increased from 288 to 768
+            predictor_hidden_size=384,  # Increased from 144 to 384
+            encoder_num_layers=6,  # Increased from 4 to 6
+            predictor_num_layers=6,  # Increased from 4 to 6
             use_pretrained_encoder=False,  
         ),
         data_config=WorldModelDataConfig(
             repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned2",
-            num_frames=4,  
+            num_frames=8,  
             image_size=(224, 224),
             masking_strategy=MaskingStrategy.BLOCK,
             multi_view_batch_mode=True,  
@@ -179,9 +179,9 @@ _WORLD_MODEL_CONFIGS = [
         num_workers=16,  
         num_train_steps=30000,  
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10,
-            peak_lr=1e-4,
-            decay_steps=100,
+            warmup_steps=1000,  # Increased from 10
+            peak_lr=5e-5,  # Reduced from 1e-4
+            decay_steps=30000,  # Increased from 100
             decay_lr=1e-6,
         ),
     ),

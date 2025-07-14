@@ -11,6 +11,7 @@ import logging
 import platform
 from dataclasses import dataclass
 from typing import Any, Tuple
+import pathlib
 
 import jax
 import jax.numpy as jnp
@@ -32,6 +33,15 @@ from openpi.training import sharding
 
 logger = logging.getLogger("openpi")
 
+# Check for matplotlib availability
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    logger.warning("matplotlib not available, debug visualizations will be disabled")
+
 
 @dataclass
 class WorldModelTrainState:
@@ -46,6 +56,102 @@ class WorldModelTrainState:
     ema_decay: float | None = None
     progressive_masking_schedule: Any = None
     target_encoder_momentum: float = 0.99
+
+
+def save_debug_images(
+    batch: Tuple[WorldModelInput, WorldModelOutput],
+    step: int,
+    checkpoint_dir: pathlib.Path,
+    config: WorldModelTrainConfig,
+):
+    """Save sample images showing original vs masked frames for debugging."""
+    if not MATPLOTLIB_AVAILABLE:
+        return
+        
+    debug_dir = checkpoint_dir / "debug_images"
+    debug_dir.mkdir(exist_ok=True)
+    
+    model_input, model_output = batch
+    
+    # Convert JAX arrays to numpy
+    video_frames = np.array(model_input.video_frames)
+    mask = np.array(model_input.mask)
+    
+    # Save first sample from the batch
+    sample_idx = 0
+    step_dir = debug_dir / f"step_{step:06d}"
+    step_dir.mkdir(exist_ok=True)
+    
+    if sample_idx >= video_frames.shape[0]:
+        return
+    
+    # Get the first sample
+    frames = video_frames[sample_idx]  # Shape: (T, H, W, C)
+    sample_mask = mask[sample_idx]     # Shape: (T, H, W)
+    
+    # Create visualization
+    num_frames = frames.shape[0]
+    num_cameras = len(model_input.camera_names)
+    
+    # Create figure with subplots for each frame
+    fig, axes = plt.subplots(num_frames, 2, figsize=(12, 4 * num_frames))
+    if num_frames == 1:
+        axes = axes.reshape(1, -1)
+    
+    for t in range(num_frames):
+        # Original frame
+        original_frame = frames[t]
+        if original_frame.dtype == np.float32:
+            # Convert from float32 to uint8 if needed
+            original_frame = (np.clip(original_frame, -1, 1) * 127.5 + 127.5).astype(np.uint8)
+        
+        axes[t, 0].imshow(original_frame)
+        axes[t, 0].set_title(f"Original Frame {t}")
+        axes[t, 0].axis('off')
+        
+        # Masked frame
+        masked_frame = original_frame.copy()
+        frame_mask = sample_mask[t]
+        
+        # Apply mask (set masked regions to black or gray)
+        masked_frame[frame_mask] = 128  # Gray out masked regions
+        
+        axes[t, 1].imshow(masked_frame)
+        axes[t, 1].set_title(f"Masked Frame {t} (Mask Ratio: {frame_mask.mean():.2f})")
+        axes[t, 1].axis('off')
+    
+    plt.tight_layout()
+    
+    # Save visualization
+    viz_path = step_dir / f"step_{step:06d}_frames_vs_masked.png"
+    plt.savefig(viz_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    # Save individual frame data
+    for t in range(num_frames):
+        frame_data = {
+            'original_frame': frames[t],
+            'mask': sample_mask[t],
+            'mask_ratio': sample_mask[t].mean(),
+        }
+        np.save(step_dir / f"frame_{t:02d}_data.npy", frame_data)
+    
+    # Save stats
+    stats_path = step_dir / f"step_{step:06d}_stats.txt"
+    with open(stats_path, 'w') as f:
+        f.write(f"Step: {step}\n")
+        f.write(f"Sample index: {sample_idx}\n")
+        f.write(f"Camera names: {model_input.camera_names}\n")
+        f.write(f"Video shape: {frames.shape}\n")
+        f.write(f"Mask shape: {sample_mask.shape}\n")
+        f.write(f"Overall mask ratio: {sample_mask.mean():.4f}\n")
+        f.write(f"Frame-by-frame mask ratios: {[sample_mask[t].mean() for t in range(num_frames)]}\n")
+        f.write(f"Video min/max: {frames.min():.4f}/{frames.max():.4f}\n")
+        f.write(f"Video mean/std: {frames.mean():.4f}/{frames.std():.4f}\n")
+    
+    logger.info(f"Saved debug images for step {step} to {step_dir}")
+    
+    return viz_path
 
 
 def init_logging():
@@ -514,6 +620,18 @@ def main(config: WorldModelTrainConfig):
         
         if step % config.save_interval == 0 and step > 0:
             save_checkpoint(state, config, step)
+            
+            # Save debug images every save_interval
+            if MATPLOTLIB_AVAILABLE:
+                try:
+                    viz_path = save_debug_images(batch, step, config.checkpoint_dir, config)
+                    if viz_path and viz_path.exists():
+                        # Log to wandb
+                        wandb.log({
+                            "debug_frames_vs_masked": wandb.Image(str(viz_path)),
+                        }, step=step)
+                except Exception as e:
+                    logger.warning(f"Failed to save debug images for step {step}: {e}")
     
     save_checkpoint(state, config, config.num_train_steps)
     

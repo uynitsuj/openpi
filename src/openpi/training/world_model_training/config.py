@@ -144,8 +144,8 @@ _WORLD_MODEL_CONFIGS = [
             predictor_hidden_size=384,
             encoder_num_layers=6,
             predictor_num_layers=3,
-            use_pretrained_encoder=True,
-            pretrained_model="google/vit-base-patch16-224-in21k",
+            use_pretrained_encoder=False,
+            # pretrained_model="google/vit-base-patch16-224-in21k",
         ),
         data_config=WorldModelDataConfig(
             repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned2",
@@ -183,7 +183,7 @@ _WORLD_MODEL_CONFIGS = [
             image_size=(224, 224),
             masking_strategy=MaskingStrategy.BLOCK,
             # mask_ratio=0.5,
-            max_episodes=10,  # Limit episodes for debugging
+            # max_episodes=10,  # Limit episodes for debugging
             multi_view_batch_mode=True,  # Disable for faster debugging
             use_progressive_masking=True,  # Enable progressive masking
         ),

@@ -46,7 +46,7 @@ class WorldModelTrainConfig:
             num_frames=8,
             frame_skip=1,
             image_size=(224, 224),
-            masking_strategy=MaskingStrategy.BLOCK,
+            masking_strategy=MaskingStrategy.MULTI_SCALE,
             mask_ratio=0.5,
             multi_view_batch_mode=True,
         )
@@ -79,10 +79,13 @@ class WorldModelTrainConfig:
     num_workers: int = 2
     num_train_steps: int = 50000
     
+    # VJEPA-2 specific parameters
     target_encoder_momentum: float = 0.99
-    loss_exp: float = 2.0
+    loss_exp: float = 1.0  # Changed from 2.0 to 1.0 to match official VJEPA2
+    gradient_clip_norm: float = 1.0  # Gradient clipping for stability
+    loss_smoothing_factor: float = 0.9  # Exponential moving average for loss
     
-    log_interval: int = 100
+    log_interval: int = 10
     save_interval: int = 1000
     keep_period: Optional[int] = 5000
     
@@ -128,19 +131,19 @@ _WORLD_MODEL_CONFIGS = [
     name="hummus_vjepa2_world_model",
         exp_name="hummus_wm_training",
         model_config=VJEPA2WorldModelConfig(
-            num_frames=8,
+            num_frames=10,
             image_size=224,
             encoder_hidden_size=768,
             predictor_hidden_size=384,
             encoder_num_layers=6,
-            predictor_num_layers=3,
+            predictor_num_layers=6,
             use_pretrained_encoder=False,
         ),
         data_config=WorldModelDataConfig(
             repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned2",
-            num_frames=8,
+            num_frames=10,
             image_size=(224, 224),
-            masking_strategy=MaskingStrategy.BLOCK,
+            masking_strategy=MaskingStrategy.MULTI_SCALE,
             multi_view_batch_mode=True,
             use_progressive_masking=True,  
         ),
@@ -161,22 +164,22 @@ _WORLD_MODEL_CONFIGS = [
         model_config=VJEPA2WorldModelConfig(
             num_frames=8,  
             image_size=224,
-            encoder_hidden_size=768,  # Increased from 288 to 768
-            predictor_hidden_size=384,  # Increased from 144 to 384
-            encoder_num_layers=6,  # Increased from 4 to 6
-            predictor_num_layers=6,  # Increased from 4 to 6
+            encoder_hidden_size=288,  # Increased from 288 to 768
+            predictor_hidden_size=144,  # Increased from 144 to 384
+            encoder_num_layers=4,  # Increased from 4 to 6
+            predictor_num_layers=4,  # Increased from 4 to 6
             use_pretrained_encoder=False,  
         ),
         data_config=WorldModelDataConfig(
             repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned2",
             num_frames=8,  
             image_size=(224, 224),
-            masking_strategy=MaskingStrategy.BLOCK,
+            masking_strategy=MaskingStrategy.MULTI_SCALE,
             multi_view_batch_mode=True,  
             use_progressive_masking=True,  
         ),
-        batch_size=8,  
-        num_workers=16,  
+        batch_size=32,  
+        num_workers=128,  
         num_train_steps=30000,  
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,  # Increased from 10

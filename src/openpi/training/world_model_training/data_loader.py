@@ -159,6 +159,18 @@ class WorldModelDataset(Dataset):
             num_masked_patches=config.num_masked_patches,
         )
         
+        # Add multi-scale masking configuration if using multi-scale strategy
+        if config.masking_strategy == MaskingStrategy.MULTI_SCALE:
+            from openpi.models.video_masking import create_multi_scale_mask_config
+            multi_scale_config = create_multi_scale_mask_config(
+                spatial_scale=(0.15, 0.15),      # 15% spatial coverage
+                temporal_scale=(1.0, 1.0),       # Full temporal coverage
+                aspect_ratio=(0.75, 1.5),        # Variable aspect ratios
+                num_blocks=8,                     # Multiple blocks per sample
+                max_temporal_keep=1.0,           # Keep all temporal frames
+            )
+            self.mask_generator.multi_scale_config = multi_scale_config
+        
         # Progressive masking schedule
         if config.use_progressive_masking:
             if config.progressive_masking_schedule is None:

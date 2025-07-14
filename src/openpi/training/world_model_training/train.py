@@ -56,6 +56,7 @@ class WorldModelTrainState:
     ema_decay: float | None = None
     progressive_masking_schedule: Any = None
     target_encoder_momentum: float = 0.99
+    gradient_clip_norm: float = 1.0
 
 
 def save_debug_images(
@@ -264,6 +265,7 @@ def init_train_state(config: WorldModelTrainConfig, init_rng: jax.Array) -> Worl
         ema_decay=getattr(config, 'ema_decay', None),
         progressive_masking_schedule=progressive_masking_schedule,
         target_encoder_momentum=config.target_encoder_momentum,
+        gradient_clip_norm=getattr(config, 'gradient_clip_norm', 1.0),
     )
 
 
@@ -347,6 +349,10 @@ def train_step(
     
     state.grad_scaler.scale(loss).backward()
     
+    # Apply gradient clipping for stability
+    if hasattr(state, 'gradient_clip_norm'):
+        torch.nn.utils.clip_grad_norm_(state.model.parameters(), state.gradient_clip_norm)
+    
     state.grad_scaler.step(state.torch_optimizer)
     state.grad_scaler.update()
     
@@ -393,6 +399,8 @@ def train_step(
         'num_masked_patches': jnp.array(mask.float().sum().cpu().numpy()),
         'grad_norm': jnp.array(grad_norm),
         'param_norm': jnp.array(param_norm),
+        'learning_rate': jnp.array(state.torch_optimizer.param_groups[0]['lr']),
+        'loss_std': jnp.array(loss.detach().cpu().numpy()),  # For tracking loss variance
     }
     
     if hasattr(state, 'progressive_masking_schedule') and state.progressive_masking_schedule is not None:
@@ -520,6 +528,8 @@ def main(config: WorldModelTrainConfig):
     val_iter = iter(val_loader)
     
     metrics_history = []
+    loss_smoothing_factor = 0.9  # Exponential moving average factor
+    smoothed_loss = None
     
     pbar = tqdm.tqdm(
         range(config.num_train_steps),
@@ -557,7 +567,19 @@ def main(config: WorldModelTrainConfig):
         step_rng = jax.random.fold_in(train_rng, step)
         state, metrics = train_step(state, batch, step_rng)
         
+        # Apply loss smoothing for more stable training signals
+        current_loss = metrics['reconstruction_loss']
+        if smoothed_loss is None:
+            smoothed_loss = current_loss
+        else:
+            smoothed_loss = loss_smoothing_factor * smoothed_loss + (1 - loss_smoothing_factor) * current_loss
+        
+        metrics['smoothed_loss'] = smoothed_loss
         metrics_history.append(metrics)
+        
+        # Update progress bar every step with current metrics
+        current_metrics_str = ", ".join([f"{k}={v:.4f}" for k, v in metrics.items() if isinstance(v, (int, float))])
+        pbar.set_postfix_str(current_metrics_str)
         
         if step % config.log_interval == 0:
             avg_metrics = {}
@@ -573,8 +595,9 @@ def main(config: WorldModelTrainConfig):
             
             wandb.log(avg_metrics, step=step)
             
+            # Update progress bar with averaged metrics for logging
             metrics_str = ", ".join([f"{k}={v:.4f}" for k, v in avg_metrics.items()])
-            pbar.set_postfix_str(metrics_str)
+            pbar.set_postfix_str(f"avg: {metrics_str}")
             
             metrics_history = []
         

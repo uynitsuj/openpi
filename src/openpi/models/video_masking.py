@@ -9,9 +9,10 @@ learning from video data.
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Tuple, Optional, List, Union
+from typing import Tuple, Optional, List, Union, Dict, Any
 from enum import Enum
 import math
+import random
 
 
 class MaskingStrategy(Enum):
@@ -22,6 +23,31 @@ class MaskingStrategy(Enum):
     TEMPORAL = "temporal"
     SPATIAL = "spatial"
     RUNNING_CELL = "running_cell"
+    MULTI_SCALE = "multi_scale"  # New: Multi-scale masking like official VJEPA2
+
+
+class MultiScaleMaskConfig:
+    """Configuration for multi-scale masking similar to official VJEPA2."""
+    
+    def __init__(
+        self,
+        spatial_scale: Tuple[float, float] = (0.15, 0.15),
+        temporal_scale: Tuple[float, float] = (1.0, 1.0),
+        aspect_ratio: Tuple[float, float] = (0.75, 1.5),
+        num_blocks: int = 8,
+        max_temporal_keep: float = 1.0,
+        max_keep: Optional[int] = None,
+        full_complement: bool = False,
+        inv_block: bool = False,
+    ):
+        self.spatial_scale = spatial_scale
+        self.temporal_scale = temporal_scale
+        self.aspect_ratio = aspect_ratio
+        self.num_blocks = num_blocks
+        self.max_temporal_keep = max_temporal_keep
+        self.max_keep = max_keep
+        self.full_complement = full_complement
+        self.inv_block = inv_block
 
 
 class VideoMaskGenerator:
@@ -42,6 +68,7 @@ class VideoMaskGenerator:
         masking_strategy: MaskingStrategy = MaskingStrategy.BLOCK,
         num_masked_patches: int | None = None,
         device: str = "cpu",
+        multi_scale_config: Optional[MultiScaleMaskConfig] = None,
     ):
         """
         Initialize the video mask generator.
@@ -55,6 +82,7 @@ class VideoMaskGenerator:
             masking_strategy: Masking strategy to use
             num_masked_patches: If provided, always mask exactly this many patches
             device: Device to create masks on
+            multi_scale_config: Configuration for multi-scale masking
         """
         self.input_size = (num_frames, image_size[0], image_size[1])
         self.patch_size = patch_size
@@ -62,6 +90,7 @@ class VideoMaskGenerator:
         self.mask_ratio = mask_ratio
         self.strategy = masking_strategy
         self.device = device
+        self.multi_scale_config = multi_scale_config
         
         # Calculate patch dimensions
         self.num_patches_h = self.input_size[1] // patch_size[0]
@@ -74,6 +103,14 @@ class VideoMaskGenerator:
             self.num_masked = num_masked_patches
         else:
             self.num_masked = int(mask_ratio * self.total_patches)
+        
+        # Multi-scale masking parameters
+        if self.multi_scale_config is not None:
+            self.max_context_duration = max(
+                1, int(self.num_patches_t * self.multi_scale_config.max_temporal_keep)
+            )
+        else:
+            self.max_context_duration = self.num_patches_t
         
     def generate_mask(self, batch_size: int) -> torch.Tensor:
         """
@@ -98,6 +135,8 @@ class VideoMaskGenerator:
             return self._generate_spatial_mask(batch_size)
         elif self.strategy == MaskingStrategy.RUNNING_CELL:
             return self._generate_running_cell_mask(batch_size)
+        elif self.strategy == MaskingStrategy.MULTI_SCALE:
+            return self._generate_multi_scale_mask(batch_size)
         else:
             raise ValueError(f"Unknown masking strategy: {self.strategy}")
     
@@ -158,6 +197,101 @@ class VideoMaskGenerator:
         
         return torch.stack(masks, dim=0)
     
+    def _generate_multi_scale_mask(self, batch_size: int) -> torch.Tensor:
+        """
+        Generate multi-scale masks similar to official VJEPA2.
+        
+        This creates multiple blocks with variable sizes, aspect ratios, and scales.
+        """
+        if self.multi_scale_config is None:
+            # Fallback to default multi-scale config
+            self.multi_scale_config = MultiScaleMaskConfig()
+        
+        masks = []
+        for _ in range(batch_size):
+            # Create mask for this sample
+            mask = torch.ones((self.num_patches_t, self.num_patches_h, self.num_patches_w), 
+                            dtype=torch.int32, device=self.device)
+            
+            # Generate multiple blocks
+            for _ in range(self.multi_scale_config.num_blocks):
+                # Sample block size using multi-scale parameters
+                block_size = self._sample_block_size()
+                
+                # Sample block mask
+                block_mask = self._sample_block_mask(block_size)
+                
+                # Apply block mask (multiply to combine blocks)
+                mask *= block_mask
+            
+            # Convert to boolean mask and flatten
+            mask = (mask == 0).flatten()  # 0 = masked, 1 = visible
+            masks.append(mask)
+        
+        return torch.stack(masks, dim=0)
+    
+    def _sample_block_size(self) -> Tuple[int, int, int]:
+        """
+        Sample block size using multi-scale parameters.
+        
+        Returns:
+            Tuple of (temporal_size, height, width)
+        """
+        if self.multi_scale_config is None:
+            return (4, 4, 4)  # Default block size
+        
+        # Sample temporal block mask scale
+        min_t, max_t = self.multi_scale_config.temporal_scale
+        temporal_mask_scale = min_t + random.random() * (max_t - min_t)
+        t = max(1, int(self.num_patches_t * temporal_mask_scale))
+        
+        # Sample spatial block mask scale
+        min_s, max_s = self.multi_scale_config.spatial_scale
+        spatial_mask_scale = min_s + random.random() * (max_s - min_s)
+        spatial_num_keep = int(self.num_patches_h * self.num_patches_w * spatial_mask_scale)
+        
+        # Sample block aspect-ratio
+        min_ar, max_ar = self.multi_scale_config.aspect_ratio
+        aspect_ratio = min_ar + random.random() * (max_ar - min_ar)
+        
+        # Compute block height and width (given scale and aspect-ratio)
+        h = int(round(math.sqrt(spatial_num_keep * aspect_ratio)))
+        w = int(round(math.sqrt(spatial_num_keep / aspect_ratio)))
+        h = min(h, self.num_patches_h)
+        w = min(w, self.num_patches_w)
+        
+        return (t, h, w)
+    
+    def _sample_block_mask(self, block_size: Tuple[int, int, int]) -> torch.Tensor:
+        """
+        Sample a single block mask.
+        
+        Args:
+            block_size: Tuple of (temporal_size, height, width)
+            
+        Returns:
+            Block mask tensor of shape (num_patches_t, num_patches_h, num_patches_w)
+        """
+        t, h, w = block_size
+        
+        # Random starting position
+        top = random.randint(0, self.num_patches_h - h + 1)
+        left = random.randint(0, self.num_patches_w - w + 1)
+        start = random.randint(0, self.num_patches_t - t + 1)
+        
+        # Create mask (1 = visible, 0 = masked)
+        mask = torch.ones((self.num_patches_t, self.num_patches_h, self.num_patches_w), 
+                         dtype=torch.int32, device=self.device)
+        
+        # Apply block mask
+        mask[start:start + t, top:top + h, left:left + w] = 0
+        
+        # Context mask will only span the first X frames
+        if self.max_context_duration < self.num_patches_t:
+            mask[self.max_context_duration:, :, :] = 0
+        
+        return mask
+    
     def _generate_tube_mask(self, batch_size: int, tube_size: int = 3) -> torch.Tensor:
         """
         Generate tube masks that extend through time.
@@ -199,49 +333,41 @@ class VideoMaskGenerator:
         return torch.stack(masks, dim=0)
     
     def _generate_temporal_mask(self, batch_size: int) -> torch.Tensor:
-        """Generate masks that are consistent across time."""
+        """Generate temporal masks that mask entire frames."""
         masks = []
         for _ in range(batch_size):
             mask = torch.zeros(self.total_patches, dtype=torch.bool, device=self.device)
             
-            # Select spatial locations to mask
-            spatial_patches = self.num_patches_h * self.num_patches_w
-            num_spatial_masked = int(self.mask_ratio * spatial_patches)
+            # Randomly select frames to mask
+            num_frames_to_mask = int(self.mask_ratio * self.num_patches_t)
+            masked_frames = torch.randperm(self.num_patches_t, device=self.device)[:num_frames_to_mask]
             
-            # Random spatial locations
-            spatial_mask = torch.zeros(spatial_patches, dtype=torch.bool, device=self.device)
-            masked_spatial_indices = torch.randperm(spatial_patches, device=self.device)[:num_spatial_masked]
-            spatial_mask[masked_spatial_indices] = True
-            
-            # Apply mask to all temporal locations
-            for t in range(self.num_patches_t):
-                for spatial_idx in range(spatial_patches):
-                    if spatial_mask[spatial_idx]:
-                        h = spatial_idx // self.num_patches_w
-                        w = spatial_idx % self.num_patches_w
-                        patch_idx = self._get_patch_index(t, h, w)
-                        mask[patch_idx] = True
+            for frame_idx in masked_frames:
+                start_idx = frame_idx * self.num_patches_h * self.num_patches_w
+                end_idx = (frame_idx + 1) * self.num_patches_h * self.num_patches_w
+                mask[start_idx:end_idx] = True
             
             masks.append(mask)
         
         return torch.stack(masks, dim=0)
     
     def _generate_spatial_mask(self, batch_size: int) -> torch.Tensor:
-        """Generate masks that vary across time but are spatially structured."""
+        """Generate spatial masks that mask spatial regions across all frames."""
         masks = []
         for _ in range(batch_size):
             mask = torch.zeros(self.total_patches, dtype=torch.bool, device=self.device)
             
-            patches_per_frame = int(self.num_masked / self.num_patches_t)
+            # Randomly select spatial regions to mask
+            num_spatial_patches = self.num_patches_h * self.num_patches_w
+            num_spatial_to_mask = int(self.mask_ratio * num_spatial_patches)
+            masked_spatial = torch.randperm(num_spatial_patches, device=self.device)[:num_spatial_to_mask]
             
-            for t in range(self.num_patches_t):
-                # Random spatial patches for this frame
-                spatial_patches = self.num_patches_h * self.num_patches_w
-                spatial_indices = torch.randperm(spatial_patches, device=self.device)[:patches_per_frame]
+            for spatial_idx in masked_spatial:
+                h = spatial_idx // self.num_patches_w
+                w = spatial_idx % self.num_patches_w
                 
-                for spatial_idx in spatial_indices:
-                    h = spatial_idx // self.num_patches_w
-                    w = spatial_idx % self.num_patches_w
+                # Mask this spatial position across all frames
+                for t in range(self.num_patches_t):
                     patch_idx = self._get_patch_index(t, h, w)
                     mask[patch_idx] = True
             
@@ -251,59 +377,59 @@ class VideoMaskGenerator:
     
     def _generate_running_cell_mask(self, batch_size: int) -> torch.Tensor:
         """
-        Generate running cell masks inspired by VJEPA-2.
+        Generate running cell masks that create moving masked regions.
         
-        This creates moving blocks of masked patches across space and time.
+        This creates masks that move through time, simulating motion.
         """
         masks = []
         for _ in range(batch_size):
             mask = torch.zeros(self.total_patches, dtype=torch.bool, device=self.device)
             
-            # Parameters for running cell
-            cell_size = 3  # Size of the moving cell
-            num_cells = self.num_masked // (cell_size * cell_size * cell_size)
+            # Create a moving cell
+            cell_size = 3
+            start_h = torch.randint(0, self.num_patches_h - cell_size, (1,)).item()
+            start_w = torch.randint(0, self.num_patches_w - cell_size, (1,)).item()
             
-            for _ in range(num_cells):
-                # Random starting position
-                t_start = torch.randint(0, max(1, self.num_patches_t - cell_size), (1,)).item()
-                h_start = torch.randint(0, max(1, self.num_patches_h - cell_size), (1,)).item()
-                w_start = torch.randint(0, max(1, self.num_patches_w - cell_size), (1,)).item()
+            # Move the cell through time
+            for t in range(self.num_patches_t):
+                # Add some randomness to the movement
+                h_offset = torch.randint(-1, 2, (1,)).item()
+                w_offset = torch.randint(-1, 2, (1,)).item()
                 
-                # Create moving cell
-                for dt in range(cell_size):
-                    for dh in range(cell_size):
-                        for dw in range(cell_size):
-                            t = t_start + dt
-                            h = h_start + dh
-                            w = w_start + dw
-                            
-                            if (t < self.num_patches_t and 
-                                h < self.num_patches_h and 
-                                w < self.num_patches_w):
-                                patch_idx = self._get_patch_index(t, h, w)
-                                mask[patch_idx] = True
+                h = max(0, min(self.num_patches_h - cell_size, start_h + h_offset))
+                w = max(0, min(self.num_patches_w - cell_size, start_w + w_offset))
+                
+                # Mask the cell at this position
+                for dh in range(cell_size):
+                    for dw in range(cell_size):
+                        patch_idx = self._get_patch_index(t, h + dh, w + dw)
+                        mask[patch_idx] = True
+                
+                start_h, start_w = h, w
             
             masks.append(mask)
         
         return torch.stack(masks, dim=0)
     
     def _get_patch_index(self, t: int, h: int, w: int) -> int:
-        """Convert (t, h, w) coordinates to linear patch index."""
+        """Convert 3D patch coordinates to 1D index."""
         return t * (self.num_patches_h * self.num_patches_w) + h * self.num_patches_w + w
     
     def get_patch_coordinates(self, patch_idx: int) -> Tuple[int, int, int]:
-        """Convert linear patch index to (t, h, w) coordinates."""
-        spatial_size = self.num_patches_h * self.num_patches_w
-        t = patch_idx // spatial_size
-        spatial_idx = patch_idx % spatial_size
-        h = spatial_idx // self.num_patches_w
-        w = spatial_idx % self.num_patches_w
-        return t, h, w
+        """Convert 1D patch index to 3D coordinates."""
+        t = patch_idx // (self.num_patches_h * self.num_patches_w)
+        remainder = patch_idx % (self.num_patches_h * self.num_patches_w)
+        h = remainder // self.num_patches_w
+        w = remainder % self.num_patches_w
+        return (t, h, w)
 
 
 class AdaptiveMaskGenerator:
     """
-    Adaptive mask generator that can use different strategies for different stages of training.
+    Adaptive mask generator that can switch between different strategies.
+    
+    This class provides curriculum learning capabilities by changing
+    masking strategies over time.
     """
     
     def __init__(
@@ -318,14 +444,15 @@ class AdaptiveMaskGenerator:
         self.temporal_patch_size = temporal_patch_size
         self.device = device
         
-        # Initialize generators for different strategies
+        # Create mask generators for different strategies
         self.generators = {}
         for strategy in MaskingStrategy:
             self.generators[strategy] = VideoMaskGenerator(
-                input_size=input_size,
+                num_frames=input_size[0],
+                image_size=(input_size[1], input_size[2]),
                 patch_size=patch_size,
                 temporal_patch_size=temporal_patch_size,
-                strategy=strategy,
+                masking_strategy=strategy,
                 device=device,
             )
     
@@ -335,21 +462,9 @@ class AdaptiveMaskGenerator:
         strategy: MaskingStrategy = MaskingStrategy.BLOCK,
         mask_ratio: float = 0.75,
     ) -> torch.Tensor:
-        """
-        Generate masks using the specified strategy.
-        
-        Args:
-            batch_size: Size of the batch
-            strategy: Masking strategy to use
-            mask_ratio: Ratio of patches to mask
-            
-        Returns:
-            Boolean mask tensor
-        """
+        """Generate mask using specified strategy."""
         generator = self.generators[strategy]
         generator.mask_ratio = mask_ratio
-        generator.num_masked = int(mask_ratio * generator.total_patches)
-        
         return generator.generate_mask(batch_size)
     
     def generate_curriculum_mask(
@@ -359,28 +474,26 @@ class AdaptiveMaskGenerator:
         curriculum_schedule: List[Tuple[int, MaskingStrategy, float]],
     ) -> torch.Tensor:
         """
-        Generate masks using a curriculum schedule.
+        Generate mask using curriculum learning schedule.
         
         Args:
             batch_size: Size of the batch
             training_step: Current training step
-            curriculum_schedule: List of (step, strategy, mask_ratio) tuples
+            curriculum_schedule: List of (step, strategy, ratio) tuples
             
         Returns:
-            Boolean mask tensor
+            Generated mask tensor
         """
-        # Find the current curriculum stage
+        # Find the appropriate strategy for current step
         current_strategy = MaskingStrategy.BLOCK
-        current_mask_ratio = 0.75
+        current_ratio = 0.75
         
-        for step, strategy, mask_ratio in curriculum_schedule:
+        for step, strategy, ratio in curriculum_schedule:
             if training_step >= step:
                 current_strategy = strategy
-                current_mask_ratio = mask_ratio
-            else:
-                break
+                current_ratio = ratio
         
-        return self.generate_mask(batch_size, current_strategy, current_mask_ratio)
+        return self.generate_mask(batch_size, current_strategy, current_ratio)
 
 
 def create_video_mask(
@@ -390,33 +503,75 @@ def create_video_mask(
     mask_ratio: float = 0.75,
     strategy: MaskingStrategy = MaskingStrategy.BLOCK,
     device: str = "cpu",
+    multi_scale_config: Optional[MultiScaleMaskConfig] = None,
 ) -> torch.Tensor:
     """
-    Convenience function to create video masks.
+    Create video masks for a batch of videos.
     
     Args:
         video_shape: Shape of input video (B, T, H, W, C)
-        patch_size: Spatial patch size
-        temporal_patch_size: Temporal patch size
+        patch_size: Size of spatial patches (height, width)
+        temporal_patch_size: Size of temporal patches
         mask_ratio: Ratio of patches to mask
-        strategy: Masking strategy
+        strategy: Masking strategy to use
         device: Device to create masks on
+        multi_scale_config: Configuration for multi-scale masking
         
     Returns:
-        Boolean mask tensor of shape (B, num_patches)
+        Boolean mask tensor of shape (B, total_patches)
     """
-    B, T, H, W, C = video_shape
+    batch_size, num_frames, height, width, channels = video_shape
     
     generator = VideoMaskGenerator(
-        input_size=(T, H, W),
+        num_frames=num_frames,
+        image_size=(height, width),
         patch_size=patch_size,
         temporal_patch_size=temporal_patch_size,
         mask_ratio=mask_ratio,
-        strategy=strategy,
+        masking_strategy=strategy,
         device=device,
+        multi_scale_config=multi_scale_config,
     )
     
-    return generator.generate_mask(B)
+    return generator.generate_mask(batch_size)
+
+
+def create_multi_scale_mask_config(
+    spatial_scale: Tuple[float, float] = (0.15, 0.15),
+    temporal_scale: Tuple[float, float] = (1.0, 1.0),
+    aspect_ratio: Tuple[float, float] = (0.75, 1.5),
+    num_blocks: int = 8,
+    max_temporal_keep: float = 1.0,
+    max_keep: Optional[int] = None,
+    full_complement: bool = False,
+    inv_block: bool = False,
+) -> MultiScaleMaskConfig:
+    """
+    Create multi-scale mask configuration similar to official VJEPA2.
+    
+    Args:
+        spatial_scale: Range for spatial mask scale (min, max)
+        temporal_scale: Range for temporal mask scale (min, max)
+        aspect_ratio: Range for block aspect ratio (min, max)
+        num_blocks: Number of blocks to generate
+        max_temporal_keep: Maximum fraction of temporal frames to keep
+        max_keep: Maximum number of patches to keep (optional)
+        full_complement: Whether to use full complement masking
+        inv_block: Whether to use inverse block masking
+        
+    Returns:
+        MultiScaleMaskConfig instance
+    """
+    return MultiScaleMaskConfig(
+        spatial_scale=spatial_scale,
+        temporal_scale=temporal_scale,
+        aspect_ratio=aspect_ratio,
+        num_blocks=num_blocks,
+        max_temporal_keep=max_temporal_keep,
+        max_keep=max_keep,
+        full_complement=full_complement,
+        inv_block=inv_block,
+    )
 
 
 # Example usage and testing

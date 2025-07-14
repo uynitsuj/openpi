@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from transformers import AutoImageProcessor, AutoModel, AutoConfig
 from transformers.models.vit import ViTModel, ViTConfig
 import math
+from openpi.models.video_masking import create_multi_scale_mask_config, create_video_mask as create_video_mask_multi, MaskingStrategy
 
 logger = logging.getLogger("openpi")
 
@@ -44,53 +45,25 @@ def create_video_mask(
     Returns:
         Boolean mask tensor of shape (B, num_patches) where True = masked
     """
-    B, T, H, W, C = video_shape
+    # Create multi-scale mask configuration similar to official VJEPA2
+    multi_scale_config = create_multi_scale_mask_config(
+        spatial_scale=(0.15, 0.15),      # 15% spatial coverage
+        temporal_scale=(1.0, 1.0),       # Full temporal coverage
+        aspect_ratio=(0.75, 1.5),        # Variable aspect ratios
+        num_blocks=8,                     # Multiple blocks per sample
+        max_temporal_keep=1.0,           # Keep all temporal frames
+    )
     
-    # Calculate number of patches
-    num_patches_h = H // patch_size[0]
-    num_patches_w = W // patch_size[1]
-    num_patches_t = T // temporal_patch_size
-    total_patches = num_patches_t * num_patches_h * num_patches_w
-    
-    # Number of patches to mask
-    num_masked = int(mask_ratio * total_patches)
-    
-    masks = []
-    for b in range(B):
-        # Create mask for this batch element
-        mask = torch.zeros(total_patches, dtype=torch.bool, device=device)
-        
-        # Randomly select patches to mask in blocks
-        masked_patches = 0
-        while masked_patches < num_masked:
-            # Random starting position
-            t_start = torch.randint(0, num_patches_t, (1,)).item()
-            h_start = torch.randint(0, num_patches_h, (1,)).item()
-            w_start = torch.randint(0, num_patches_w, (1,)).item()
-            
-            # Block boundaries
-            t_end = min(t_start + block_size, num_patches_t)
-            h_end = min(h_start + block_size, num_patches_h)  
-            w_end = min(w_start + block_size, num_patches_w)
-            
-            # Mark patches in this block as masked
-            for t in range(t_start, t_end):
-                for h in range(h_start, h_end):
-                    for w in range(w_start, w_end):
-                        patch_idx = t * (num_patches_h * num_patches_w) + h * num_patches_w + w
-                        if not mask[patch_idx]:
-                            mask[patch_idx] = True
-                            masked_patches += 1
-                            if masked_patches >= num_masked:
-                                break
-                    if masked_patches >= num_masked:
-                        break
-                if masked_patches >= num_masked:
-                    break
-        
-        masks.append(mask)
-    
-    return torch.stack(masks, dim=0)
+    # Use the new multi-scale masking function
+    return create_video_mask_multi(
+        video_shape=video_shape,
+        patch_size=patch_size,
+        temporal_patch_size=temporal_patch_size,
+        mask_ratio=mask_ratio,
+        strategy=MaskingStrategy.MULTI_SCALE,
+        device=device,
+        multi_scale_config=multi_scale_config,
+    )
 
 
 class VideoTransformerEncoder(nn.Module):

@@ -50,8 +50,8 @@ class TestWorldModelComponents:
         config = VJEPA2WorldModelConfig(
             num_frames=4,
             image_size=112,
-            encoder_hidden_size=288,  # 288 = 12 * 24, divisible by 12 heads
-            predictor_hidden_size=144,  # 144 = 12 * 12, divisible by 12 heads
+            encoder_hidden_size=288,
+            predictor_hidden_size=144,
             encoder_num_layers=2,
             predictor_num_layers=1,
             use_pretrained_encoder=False,
@@ -70,8 +70,8 @@ class TestWorldModelComponents:
         config = VJEPA2WorldModelConfig(
             num_frames=4,
             image_size=112,
-            encoder_hidden_size=288,  # 288 = 12 * 24, divisible by 12 heads
-            predictor_hidden_size=144,  # 144 = 12 * 12, divisible by 12 heads
+            encoder_hidden_size=288,
+            predictor_hidden_size=144,
             encoder_num_layers=2,
             predictor_num_layers=1,
             use_pretrained_encoder=False,

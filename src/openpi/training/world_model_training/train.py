@@ -39,13 +39,13 @@ class WorldModelTrainState:
     
     step: int
     model: VJEPA2WorldModel
-    params: Any  # Model parameters in JAX format
+    params: Any
     optimizer: optax.OptState
     tx: optax.GradientTransformation
     ema_model: VJEPA2WorldModel | None = None
     ema_decay: float | None = None
-    progressive_masking_schedule: Any = None  # Progressive masking schedule
-    target_encoder_momentum: float = 0.99  # EMA momentum for target encoder
+    progressive_masking_schedule: Any = None
+    target_encoder_momentum: float = 0.99
 
 
 def init_logging():
@@ -103,17 +103,14 @@ def init_train_state(config: WorldModelTrainConfig, init_rng: jax.Array) -> Worl
     """Initialize the training state."""
     logger.info("Initializing world model...")
     
-    # Create model
     model = create_vjepa2_model(config.model_config)
     
-    # Create optimizer
     tx = _optimizer.create_optimizer(
         config.optimizer,
         config.lr_schedule,
         weight_decay_mask=None,
     )
     
-    # Initialize parameters with dummy data
     dummy_input = WorldModelInput(
         video_frames=jnp.zeros((
             config.batch_size,
@@ -125,35 +122,27 @@ def init_train_state(config: WorldModelTrainConfig, init_rng: jax.Array) -> Worl
         mask=jnp.zeros((
             config.batch_size,
             config.data_config.num_frames,
-            config.data_config.image_size[0] // 16,  # Assuming 16x16 patches
+            config.data_config.image_size[0] // 16,
             config.data_config.image_size[1] * len(config.data_config.image_keys) // 16,
         ), dtype=bool),
         camera_names=list(config.data_config.image_keys),
     )
     
-    # For PyTorch models, we need to get the parameters directly
-    # Convert the model to a JAX-compatible format by getting its parameters
     import torch
     
-    # Get model parameters as PyTorch tensors
     torch_params = dict(model.named_parameters())
     
-    # Convert PyTorch parameters to JAX arrays for compatibility with the training loop
     def torch_to_jax(tensor):
         return jnp.array(tensor.detach().cpu().numpy())
     
-    # Convert parameters to JAX format
     params = {name: torch_to_jax(param) for name, param in torch_params.items()}
     
-    # Initialize optimizer state
     opt_state = tx.init(params)
     
-    # Initialize EMA model if specified
     ema_model = None
     if hasattr(config, 'ema_decay') and config.ema_decay is not None:
         ema_model = create_vjepa2_model(config.model_config)
     
-    # Initialize progressive masking schedule if enabled
     progressive_masking_schedule = None
     if config.data_config.use_progressive_masking:
         from openpi.training.world_model_training.data_loader import ProgressiveMaskingSchedule
@@ -182,34 +171,26 @@ def compute_loss(
     """Compute the training loss."""
     model_input, model_output = batch
     
-    # Convert JAX arrays to PyTorch tensors for the model
     import torch
     
     def jax_to_torch(arr):
         return torch.from_numpy(np.array(arr)).float()
     
-    # Update model parameters from JAX arrays - only do this once before gradient computation
     def update_model_params(model, jax_params):
         for name, param in model.named_parameters():
             if name in jax_params:
                 param.data = jax_to_torch(jax_params[name])
     
-    # Set model to train/eval mode
     model.train(train)
     
-    # Convert inputs to PyTorch tensors
     video_frames = jax_to_torch(model_input.video_frames)
-    mask = jax_to_torch(model_input.mask).bool()  # Ensure boolean type
+    mask = jax_to_torch(model_input.mask).bool()
     
-    # Forward pass
     with torch.enable_grad() if train else torch.no_grad():
-        # Use the model's built-in loss computation which handles dimension alignment
         loss = model.compute_loss(video_frames, mask)
     
-    # Convert back to JAX array
     total_loss_jax = jnp.array(loss.detach().cpu().numpy())
     
-    # Additional metrics
     metrics = {
         'reconstruction_loss': total_loss_jax,
         'mask_ratio': mask.float().mean(),
@@ -226,13 +207,11 @@ def train_step(
 ) -> Tuple[WorldModelTrainState, dict]:
     """Execute a single training step using PyTorch native training."""
     
-    # Convert JAX arrays to PyTorch tensors for the model
     import torch
     
     def jax_to_torch(arr):
         return torch.from_numpy(np.array(arr)).float()
     
-    # Update model parameters from JAX arrays
     def update_model_params(model, jax_params):
         for name, param in model.named_parameters():
             if name in jax_params:
@@ -240,25 +219,17 @@ def train_step(
     
     update_model_params(state.model, state.params)
     
-    # Set model to training mode
     state.model.train()
     
-    # Convert inputs to PyTorch tensors
     video_frames = jax_to_torch(batch[0].video_frames)
     mask = jax_to_torch(batch[0].mask).bool()
     
-    # Zero gradients
     state.model.zero_grad()
     
-    # Enable mixed precision for better GPU utilization
     with torch.cuda.amp.autocast():
-        # Forward pass and compute loss
         loss = state.model.compute_loss(video_frames, mask)
     
-    # Apply gradients using PyTorch optimizer
-    # We need to create a PyTorch optimizer since we're using PyTorch training
     if not hasattr(state, 'torch_optimizer'):
-        # Create PyTorch optimizer
         state.torch_optimizer = torch.optim.AdamW(
             state.model.parameters(),
             lr=1e-4,
@@ -266,30 +237,23 @@ def train_step(
             betas=(0.9, 0.999),
             eps=1e-8,
         )
-        # Create gradient scaler for mixed precision
         state.grad_scaler = torch.cuda.amp.GradScaler()
     
-    # Scale loss and backward pass
     state.grad_scaler.scale(loss).backward()
     
-    # Unscale gradients and step optimizer
     state.grad_scaler.step(state.torch_optimizer)
     state.grad_scaler.update()
     
-    # Update target encoder with momentum (EMA update)
     if hasattr(state.model, 'update_target_encoder'):
-        # Get momentum from config if available, otherwise use default
         momentum = getattr(state, 'target_encoder_momentum', 0.99)
         state.model.update_target_encoder(momentum)
     
-    # Compute gradient norm before optimization
     grad_norm = 0.0
     for param in state.model.parameters():
         if param.grad is not None:
             grad_norm += param.grad.data.norm(2).item() ** 2
     grad_norm = grad_norm ** 0.5
     
-    # Update parameters back to JAX format for compatibility
     def torch_to_jax(tensor):
         return jnp.array(tensor.detach().cpu().numpy())
     
@@ -297,31 +261,26 @@ def train_step(
     for name, param in state.model.named_parameters():
         new_params[name] = torch_to_jax(param.data)
     
-    # Compute parameter norm
     param_norm = 0.0
     for param in new_params.values():
         param_norm += jnp.sum(param ** 2)
     param_norm = jnp.sqrt(param_norm)
     
-    # Update EMA model if enabled
     new_ema_model = state.ema_model
     if state.ema_model is not None and state.ema_decay is not None:
-        # For now, skip EMA updates for PyTorch models
-        # TODO: Implement proper EMA for PyTorch models
         pass
     
     new_state = WorldModelTrainState(
         step=state.step + 1,
         model=state.model,
         params=new_params,
-        optimizer=state.optimizer,  # Keep JAX optimizer state for compatibility
+        optimizer=state.optimizer,
         tx=state.tx,
         ema_model=new_ema_model,
         ema_decay=state.ema_decay,
         target_encoder_momentum=state.target_encoder_momentum,
     )
     
-    # Add metrics
     metrics = {
         'reconstruction_loss': jnp.array(loss.detach().cpu().numpy()),
         'mask_ratio': jnp.array(mask.float().mean().cpu().numpy()),
@@ -330,7 +289,6 @@ def train_step(
         'param_norm': jnp.array(param_norm),
     }
     
-    # Add progressive masking info if available
     if hasattr(state, 'progressive_masking_schedule') and state.progressive_masking_schedule is not None:
         masking_params = state.progressive_masking_schedule.get_masking_params(state.step)
         metrics.update({
@@ -338,7 +296,6 @@ def train_step(
             'target_mask_ratio': masking_params['mask_ratio'],
             'target_num_masked_patches': masking_params['num_masked_patches'],
         })
-        # Store phase as string separately (not in JAX metrics)
         metrics['_masking_phase'] = masking_params['phase']
     
     return new_state, metrics
@@ -350,16 +307,13 @@ def validation_step(
     rng: jax.Array,
 ) -> dict:
     """Execute a validation step."""
-    # Use the same model as training (not EMA model) for consistency
     model = state.model
     
-    # Convert JAX arrays to PyTorch tensors for the model
     import torch
     
     def jax_to_torch(arr):
         return torch.from_numpy(np.array(arr)).float()
     
-    # Update model parameters from JAX arrays to ensure consistency
     def update_model_params(model, jax_params):
         for name, param in model.named_parameters():
             if name in jax_params:
@@ -367,22 +321,17 @@ def validation_step(
     
     update_model_params(model, state.params)
     
-    # Set model to eval mode for validation
     model.eval()
     
-    # Convert inputs to PyTorch tensors
     video_frames = jax_to_torch(batch[0].video_frames)
     mask = jax_to_torch(batch[0].mask).bool()
     
-    # Forward pass with same precision as training
     with torch.no_grad():
-        with torch.cuda.amp.autocast():  # Use same mixed precision as training
+        with torch.cuda.amp.autocast():
             loss = model.compute_loss(video_frames, mask)
     
-    # Convert back to JAX array
     total_loss_jax = jnp.array(loss.detach().cpu().numpy())
     
-    # Additional metrics
     metrics = {
         'reconstruction_loss': total_loss_jax,
         'mask_ratio': jnp.array(mask.float().mean().cpu().numpy()),
@@ -401,25 +350,20 @@ def save_checkpoint(
     checkpoint_dir = config.checkpoint_dir / f"step_{step}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
-    # Save model parameters
     params_path = checkpoint_dir / "model_params.pkl"
     with open(params_path, 'wb') as f:
         import pickle
-        # Use state_dict for PyTorch models
         pickle.dump(state.model.state_dict(), f)
     
-    # Save EMA parameters if available and has state_dict
     if state.ema_model is not None and hasattr(state.ema_model, 'state_dict'):
         ema_params_path = checkpoint_dir / "ema_params.pkl"
         with open(ema_params_path, 'wb') as f:
             pickle.dump(state.ema_model.state_dict(), f)
     
-    # Save optimizer state
     opt_state_path = checkpoint_dir / "optimizer_state.pkl"
     with open(opt_state_path, 'wb') as f:
         pickle.dump(state.optimizer, f)
     
-    # Save step info
     step_info_path = checkpoint_dir / "step_info.txt"
     with open(step_info_path, 'w') as f:
         f.write(f"step: {step}\n")
@@ -434,15 +378,12 @@ def main(config: WorldModelTrainConfig):
     logger.info(f"Starting world model training on {platform.node()}")
     logger.info(f"Configuration: {config.name}")
     
-    # Set up random keys
     rng = jax.random.PRNGKey(config.seed)
     train_rng, init_rng, data_rng = jax.random.split(rng, 3)
     
-    # Initialize training state
     state = init_train_state(config, init_rng)
     logger.info(f"Initialized model with {sum(jnp.size(x) for x in jax.tree_leaves(state.params)):,} parameters")
     
-    # Initialize data loaders
     train_loader = create_world_model_data_loader(
         config.data_config,
         batch_size=config.batch_size,
@@ -451,7 +392,7 @@ def main(config: WorldModelTrainConfig):
         num_workers=config.num_workers,
         fake_data=(config.data_config.repo_id is None),
         current_step=state.step,
-        chunk_size=config.data_config.chunk_size,  # Use chunked loading for memory efficiency
+        chunk_size=config.data_config.chunk_size,
     )
     
     val_loader = create_world_model_data_loader(
@@ -462,16 +403,13 @@ def main(config: WorldModelTrainConfig):
         num_workers=config.num_workers,
         fake_data=(config.data_config.repo_id is None),
         current_step=state.step,
-        chunk_size=config.data_config.chunk_size,  # Use chunked loading for memory efficiency
+        chunk_size=config.data_config.chunk_size,
     )
     
-    # Initialize wandb
     init_wandb(config, resuming=config.resume)
     
-    # Create checkpoint directory
     config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
-    # Training loop
     train_iter = iter(train_loader)
     val_iter = iter(val_loader)
     
@@ -484,20 +422,16 @@ def main(config: WorldModelTrainConfig):
     )
     
     for step in pbar:
-        # Training step
         try:
             batch = next(train_iter)
         except StopIteration:
-            # Reset the data loader iterator
             train_iter = iter(train_loader)
             try:
                 batch = next(train_iter)
             except StopIteration:
-                # If still no data, skip this step
                 logger.warning(f"No data available at step {step}, skipping...")
                 continue
         
-        # Convert PyTorch tensors to JAX arrays if needed
         if isinstance(batch[0].video_frames, torch.Tensor):
             batch = (
                 WorldModelInput(
@@ -512,7 +446,6 @@ def main(config: WorldModelTrainConfig):
                 )
             )
         
-        # Update data loader with current step for progressive masking
         train_loader.update_step(step)
         
         step_rng = jax.random.fold_in(train_rng, step)
@@ -520,30 +453,23 @@ def main(config: WorldModelTrainConfig):
         
         metrics_history.append(metrics)
         
-        # Logging
         if step % config.log_interval == 0:
-            # Average metrics over the logging interval
             avg_metrics = {}
             for key in metrics_history[0].keys():
-                # Skip non-numeric metrics (like strings)
                 if key.startswith('_'):
                     continue
                 try:
                     avg_metrics[key] = jnp.mean(jnp.array([m[key] for m in metrics_history]))
                 except (TypeError, ValueError):
-                    # Skip non-numeric metrics
                     continue
             
-            # Log to wandb
             wandb.log(avg_metrics, step=step)
             
-            # Update progress bar
             metrics_str = ", ".join([f"{k}={v:.4f}" for k, v in avg_metrics.items()])
             pbar.set_postfix_str(metrics_str)
             
             metrics_history = []
         
-        # Validation
         if step % config.validation_interval == 0 and step > 0:
             val_metrics = []
             for _ in range(config.validation_steps):
@@ -557,7 +483,6 @@ def main(config: WorldModelTrainConfig):
                         logger.warning("No validation data available, skipping validation...")
                         break
                 
-                # Convert to JAX arrays if needed
                 if isinstance(val_batch[0].video_frames, torch.Tensor):
                     val_batch = (
                         WorldModelInput(
@@ -575,26 +500,21 @@ def main(config: WorldModelTrainConfig):
                 val_step_rng = jax.random.fold_in(train_rng, step * 1000 + len(val_metrics))
                 val_metrics.append(validation_step(state, val_batch, val_step_rng))
             
-            # Average validation metrics
             avg_val_metrics = {}
             for key in val_metrics[0].keys():
-                # Skip non-numeric metrics
                 if key.startswith('_'):
                     continue
                 try:
                     avg_val_metrics[key] = jnp.mean(jnp.array([m[key] for m in val_metrics]))
                 except (TypeError, ValueError):
-                    # Skip non-numeric metrics
                     continue
             
             wandb.log(avg_val_metrics, step=step)
             logger.info(f"Validation at step {step}: {avg_val_metrics}")
         
-        # Save checkpoint
         if step % config.save_interval == 0 and step > 0:
             save_checkpoint(state, config, step)
     
-    # Final checkpoint
     save_checkpoint(state, config, config.num_train_steps)
     
     logger.info("Training completed!")

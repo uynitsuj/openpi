@@ -23,12 +23,10 @@ logger = logging.getLogger("openpi")
 class WorldModelTrainConfig:
     """Configuration for world model training."""
     
-    # Experiment configuration
-    name: str  # Name of the config
+    name: str
     project_name: str = "openpi-worldmodel"
     exp_name: str = "debug"
     
-    # Model configuration
     model_config: VJEPA2WorldModelConfig = dataclasses.field(
         default_factory=lambda: VJEPA2WorldModelConfig(
             num_frames=8,
@@ -42,10 +40,9 @@ class WorldModelTrainConfig:
         )
     )
     
-    # Data configuration
     data_config: WorldModelDataConfig = dataclasses.field(
         default_factory=lambda: WorldModelDataConfig(
-            repo_id=None,  # Will be set to fake data if None
+            repo_id=None,
             num_frames=8,
             frame_skip=1,
             image_size=(224, 224),
@@ -55,7 +52,6 @@ class WorldModelTrainConfig:
         )
     )
     
-    # Training configuration
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(
         default_factory=lambda: _optimizer.CosineDecaySchedule(
             warmup_steps=1000,
@@ -74,42 +70,33 @@ class WorldModelTrainConfig:
         )
     )
     
-    # Weight loading
     weight_loader: weight_loaders.WeightLoader = dataclasses.field(
         default_factory=weight_loaders.NoOpWeightLoader
     )
     
-    # Training parameters
     seed: int = 42
     batch_size: int = 16
     num_workers: int = 2
     num_train_steps: int = 50000
     
-    # VJEPA-2 specific parameters
-    target_encoder_momentum: float = 0.99  # EMA momentum for target encoder
-    loss_exp: float = 2.0  # Loss exponent for L1 loss with exponentiation
+    target_encoder_momentum: float = 0.99
+    loss_exp: float = 2.0
     
-    # Logging and checkpointing
     log_interval: int = 100
     save_interval: int = 1000
     keep_period: Optional[int] = 5000
     
-    # Directories
     checkpoint_base_dir: str = "/home/justinyu/checkpoints"
     assets_base_dir: str = "./assets"
     
-    # Control flags
     overwrite: bool = False
     resume: bool = False
     wandb_enabled: bool = True
     
-    # Optional S3 backup
     s3_checkpoint_path: Optional[str] = None
     
-    # Device configuration
     fsdp_devices: int = 1
     
-    # Validation
     validation_interval: int = 100
     validation_steps: int = 100
     
@@ -135,7 +122,6 @@ class WorldModelTrainConfig:
             raise ValueError("Number of training steps must be positive.")
 
 
-# Predefined configurations
 _WORLD_MODEL_CONFIGS = [
 
     WorldModelTrainConfig(
@@ -149,17 +135,17 @@ _WORLD_MODEL_CONFIGS = [
             encoder_num_layers=6,
             predictor_num_layers=3,
             use_pretrained_encoder=False,
-            # pretrained_model="google/vit-base-patch16-224-in21k",
         ),
         data_config=WorldModelDataConfig(
             repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned2",
             num_frames=8,
             image_size=(224, 224),
             masking_strategy=MaskingStrategy.BLOCK,
-            # mask_ratio=0.5,
             multi_view_batch_mode=True,
+            use_progressive_masking=True,  
         ),
         batch_size=32,
+        num_workers=16,
         num_train_steps=100000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=2000,
@@ -173,27 +159,25 @@ _WORLD_MODEL_CONFIGS = [
         name="hummus_vjepa2_world_model_debug",
         exp_name="hummus_wm_training_debug",
         model_config=VJEPA2WorldModelConfig(
-            num_frames=4,  # Reduced for debugging
+            num_frames=4,  
             image_size=224,
-            encoder_hidden_size=288,  # Smaller for debugging
-            predictor_hidden_size=144,  # Smaller for debugging
-            encoder_num_layers=2,  # Fewer layers for debugging
-            predictor_num_layers=1,  # Fewer layers for debugging
-            use_pretrained_encoder=False,  # No pretrained model for debugging
+            encoder_hidden_size=288,  
+            predictor_hidden_size=144,  
+            encoder_num_layers=2,  
+            predictor_num_layers=1,  
+            use_pretrained_encoder=False,  
         ),
         data_config=WorldModelDataConfig(
             repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned2",
-            num_frames=4,  # Reduced for debugging
+            num_frames=4,  
             image_size=(224, 224),
             masking_strategy=MaskingStrategy.BLOCK,
-            # mask_ratio=0.5,
-            # max_episodes=10,  # Limit episodes for debugging
-            multi_view_batch_mode=True,  # Disable for faster debugging
-            use_progressive_masking=True,  # Enable progressive masking
+            multi_view_batch_mode=True,  
+            use_progressive_masking=True,  
         ),
-        batch_size=8,  # Reduced from 32 to 4 for faster debugging
-        num_workers=16,  # Increased from 2 to 8 for better data loading
-        num_train_steps=30000,  # Few steps for debugging
+        batch_size=8,  
+        num_workers=16,  
+        num_train_steps=30000,  
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10,
             peak_lr=1e-4,
@@ -203,22 +187,18 @@ _WORLD_MODEL_CONFIGS = [
     ),
 ]
 
-# Create lookup dictionary
-_CONFIG_DICT = {config.name: config for config in _WORLD_MODEL_CONFIGS}
-
 
 def get_world_model_config(name: str) -> WorldModelTrainConfig:
     """Get a world model configuration by name."""
-    if name not in _CONFIG_DICT:
-        available = list(_CONFIG_DICT.keys())
-        raise ValueError(f"Config '{name}' not found. Available configs: {available}")
-    
-    return _CONFIG_DICT[name]
+    for config in _WORLD_MODEL_CONFIGS:
+        if config.name == name:
+            return config
+    raise ValueError(f"Unknown world model config: {name}")
 
 
 def list_world_model_configs() -> List[str]:
-    """List all available world model configurations."""
-    return list(_CONFIG_DICT.keys())
+    """List available world model configurations."""
+    return [config.name for config in _WORLD_MODEL_CONFIGS]
 
 
 def create_custom_world_model_config(
@@ -228,38 +208,62 @@ def create_custom_world_model_config(
     **kwargs
 ) -> WorldModelTrainConfig:
     """Create a custom world model configuration."""
+    base_config = WorldModelTrainConfig()
     
-    # Start with default config
-    config = WorldModelTrainConfig(
+    # Override with custom values
+    custom_config = dataclasses.replace(
+        base_config,
         name=name,
         exp_name=exp_name,
-        data_config=WorldModelDataConfig(repo_id=repo_id),
+        data_config=dataclasses.replace(
+            base_config.data_config,
+            repo_id=repo_id,
+        ),
+        **kwargs
     )
     
-    # Apply custom parameters
-    for key, value in kwargs.items():
-        if hasattr(config, key):
-            setattr(config, key, value)
-        else:
-            logger.warning(f"Unknown config parameter: {key}")
+    return custom_config
+
+
+def create_world_model_config_cli():
+    """Create world model configuration from command line arguments."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="World Model Training Configuration")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="hummus_vjepa2_world_model_debug",
+        help="Name of the configuration to use",
+    )
+    parser.add_argument(
+        "--custom_repo_id",
+        type=str,
+        help="Custom repository ID to override config",
+    )
+    parser.add_argument(
+        "--custom_exp_name",
+        type=str,
+        help="Custom experiment name to override config",
+    )
+    
+    args = parser.parse_args()
+    
+    config = get_world_model_config(args.config)
+    
+    if args.custom_repo_id:
+        config = dataclasses.replace(
+            config,
+            data_config=dataclasses.replace(
+                config.data_config,
+                repo_id=args.custom_repo_id,
+            )
+        )
+    
+    if args.custom_exp_name:
+        config = dataclasses.replace(
+            config,
+            exp_name=args.custom_exp_name,
+        )
     
     return config
-
-
-# CLI support functions
-def create_world_model_config_cli():
-    """Create a CLI interface for world model configs."""
-    import tyro
-    
-    return tyro.extras.overridable_config_cli(
-        {name: (name, config) for name, config in _CONFIG_DICT.items()}
-    )
-
-
-if __name__ == "__main__":
-    # Example usage
-    config = get_world_model_config("debug_world_model")
-    print(f"Config: {config.name}")
-    print(f"Model: {config.model_config}")
-    print(f"Data: {config.data_config}")
-    print(f"Checkpoint dir: {config.checkpoint_dir}")

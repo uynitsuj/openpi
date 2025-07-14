@@ -105,40 +105,32 @@ class ProgressiveMaskingSchedule:
 class WorldModelDataConfig:
     """Configuration for world model data loading."""
     
-    # LeRobot dataset configuration
     repo_id: str | None = None
-    num_frames: int = 8  # Number of frames per video sequence
-    frame_skip: int = 1  # Skip frames for temporal sampling
+    num_frames: int = 8
+    frame_skip: int = 1
     image_size: Tuple[int, int] = (224, 224)
     
-    # Video masking configuration
     masking_strategy: MaskingStrategy = MaskingStrategy.BLOCK
-    mask_ratio: float = 0.5  # Ratio of patches to mask
+    mask_ratio: float = 0.5
     
-    # Image preprocessing
     image_keys: Sequence[str] = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
     normalize_images: bool = True
     
-    # Dataset filtering
-    min_episode_length: int = 10  # Minimum episode length to consider
-    max_episodes: Optional[int] = None  # Limit number of episodes for debugging
+    min_episode_length: int = 10
+    max_episodes: Optional[int] = None
 
-    # Multi-view batching
-    multi_view_batch_mode: bool = False  # If True, treat each camera view as a separate batch sample
-    num_masked_patches: int | None = None  # If None, use mask_ratio percentage; if int, use fixed number
+    multi_view_batch_mode: bool = False
+    num_masked_patches: int | None = None
     
-    # Progressive masking schedule
     use_progressive_masking: bool = True
-    progressive_masking_schedule: dict = None  # Will be set to default if None
+    progressive_masking_schedule: dict = None
     
-    # Memory management
-    chunk_size: int = 500  # Reduced from 1000 to 500 for better memory efficiency
+    chunk_size: int = 500
     
-    # Dataset splits
-    train_split_ratio: float = 0.8  # Ratio of episodes for training
-    val_split_ratio: float = 0.1    # Ratio of episodes for validation
-    test_split_ratio: float = 0.1   # Ratio of episodes for testing
-    split_seed: int = 42            # Seed for reproducible splits
+    train_split_ratio: float = 0.8
+    val_split_ratio: float = 0.1
+    test_split_ratio: float = 0.1
+    split_seed: int = 42
 
 
 class WorldModelDataset(Dataset):
@@ -149,8 +141,8 @@ class WorldModelDataset(Dataset):
         config: WorldModelDataConfig,
         split: str = "train",
         shuffle: bool = True,
-        current_step: int = 0,  # Add current_step parameter
-        chunk_size: int = 500,  # Reduced from 1000 to 500 for better memory efficiency
+        current_step: int = 0,
+        chunk_size: int = 500,
     ):
         self.config = config
         self.split = split
@@ -207,7 +199,7 @@ class WorldModelDataset(Dataset):
         self._frame_cache = {}
         self._cache_hits = 0
         self._cache_misses = 0
-        self._max_cache_size = 25  # Reduced from 50 to 25 for better memory management
+        self._max_cache_size = 25
         
         # Load first chunk
         self._load_chunk(0)
@@ -223,9 +215,8 @@ class WorldModelDataset(Dataset):
         # Sort by episode index for reproducible splits
         episode_list.sort(key=lambda x: x[0])
         
-        # Use a fixed seed for reproducible splits
         import random
-        random.seed(self.config.split_seed)  # Use config seed for reproducible splits
+        random.seed(self.config.split_seed)
         
         # Shuffle episodes for random split
         random.shuffle(episode_list)
@@ -245,7 +236,6 @@ class WorldModelDataset(Dataset):
         split_episode_info = dict(selected_episodes)
         print(f"[Split] {split}: {len(split_episode_info)} episodes out of {total_episodes} total")
         
-        # Fallback: If split is empty, use a small portion of the train set
         if len(split_episode_info) == 0 and split != "train":
             import warnings
             warnings.warn(f"Split '{split}' is empty! Using a small portion of the train set as fallback.")
@@ -285,12 +275,8 @@ class WorldModelDataset(Dataset):
         # Get list of episode indices from the split episode_info
         episode_indices = list(self.episode_info.keys())
         
-        # Calculate chunk boundaries - chunk_start is episode index
         chunk_end = min(chunk_start + self.chunk_size, len(episode_indices))
         
-        # logger.info(f"Loading chunk: episodes {chunk_start} to {chunk_end} (total episodes: {len(episode_indices)})")
-        
-        # Load episodes in this chunk
         for local_idx in range(chunk_start, chunk_end):
             if local_idx >= len(episode_indices):
                 break
@@ -308,7 +294,6 @@ class WorldModelDataset(Dataset):
                 if end_frame > episode_length:
                     break
                 
-                # Calculate frame indices for this sequence
                 frame_indices = [
                     start_frame + i * self.config.frame_skip
                     for i in range(self.config.num_frames)
@@ -323,9 +308,6 @@ class WorldModelDataset(Dataset):
                 })
                 self.episode_indices.append(episode_idx)
         
-        # logger.info(f"Loaded {len(self.episodes)} sequences from {chunk_end - chunk_start} episodes")
-        
-        # Shuffle if needed
         if self.shuffle:
             import random
             combined = list(zip(self.episodes, self.episode_indices))
@@ -335,7 +317,6 @@ class WorldModelDataset(Dataset):
         self.current_chunk_start = chunk_start
         self.current_chunk_end = chunk_end
         
-        # Clear frame cache when loading new chunk to prevent memory buildup
         self._frame_cache.clear()
         self._cache_hits = 0
         self._cache_misses = 0
@@ -348,16 +329,13 @@ class WorldModelDataset(Dataset):
         # Get dataset metadata
         dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(self.config.repo_id)
         
-        # Calculate timestamps for the number of frames we need
         timestamps = [i / dataset_meta.fps for i in range(self.config.num_frames)]
         
-        # Load dataset using LeRobot infrastructure (uses cached data)
         dataset = lerobot_dataset.LeRobotDataset(
             self.config.repo_id,
             delta_timestamps={
-                "state": timestamps  # Use 'state' which contains the video data
+                "state": timestamps
             },
-            # video_backend="pyav",  # Use pyav for video loading
         )
         
         return dataset
@@ -717,12 +695,12 @@ class WorldModelDataLoader:
         batch_size: int,
         split: str = "train",
         shuffle: bool = True,
-        num_workers: int = 0,  # Use 0 workers to avoid multiprocessing issues
+        num_workers: int = 0,
         fake_data: bool = False,
-        current_step: int = 0,  # Add current_step parameter
-        prefetch_factor: int = 2,  # Add prefetch_factor for better GPU utilization
-        chunk_size: int = 500,  # Reduced from 1000 to 500 for better memory efficiency
-        pin_memory: bool = False,  # Add pin_memory for benchmarking
+        current_step: int = 0,
+        prefetch_factor: int = 2,
+        chunk_size: int = 500,
+        pin_memory: bool = False,
     ):
         self.config = config
         self.batch_size = batch_size
@@ -853,7 +831,6 @@ class WorldModelDataLoader:
                     yield self._collate_fn(list(zip(batch_inputs, batch_outputs)))
     
     def __len__(self) -> int:
-        # In multi-view batch mode, count total number of multi-view samples
         if self.config.multi_view_batch_mode:
             total_samples = 0
             # Sample a few indices to estimate the total
@@ -887,12 +864,12 @@ def create_world_model_data_loader(
     batch_size: int,
     split: str = "train",
     shuffle: bool = True,
-    num_workers: int = 0,  # Force 0 workers to avoid multiprocessing issues
+    num_workers: int = 0,
     fake_data: bool = False,
-    current_step: int = 0,  # Add current_step parameter
-    chunk_size: int = 500,  # Reduced from 1000 to 500 for better memory efficiency
-    prefetch_factor: int = 2,  # Add prefetch_factor for benchmarking
-    pin_memory: bool = False,  # Add pin_memory for benchmarking
+    current_step: int = 0,
+    chunk_size: int = 500,
+    prefetch_factor: int = 2,
+    pin_memory: bool = False,
 ) -> WorldModelDataLoader:
     """Create a world model data loader."""
     return WorldModelDataLoader(

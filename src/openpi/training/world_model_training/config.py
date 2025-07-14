@@ -159,12 +159,12 @@ _WORLD_MODEL_CONFIGS = [
         name="hummus_vjepa2_world_model_debug",
         exp_name="hummus_wm_training_debug",
         model_config=VJEPA2WorldModelConfig(
-            num_frames=4,  
+            num_frames=8,  
             image_size=224,
             encoder_hidden_size=288,  
             predictor_hidden_size=144,  
-            encoder_num_layers=2,  
-            predictor_num_layers=1,  
+            encoder_num_layers=4,  
+            predictor_num_layers=4,  
             use_pretrained_encoder=False,  
         ),
         data_config=WorldModelDataConfig(
@@ -242,7 +242,7 @@ def create_world_model_config_cli():
         help="Custom repository ID to override config",
     )
     parser.add_argument(
-        "--custom_exp_name",
+        "--exp_name",
         type=str,
         help="Custom experiment name to override config",
     )
@@ -260,10 +260,10 @@ def create_world_model_config_cli():
             )
         )
     
-    if args.custom_exp_name:
+    if args.exp_name:
         config = dataclasses.replace(
             config,
-            exp_name=args.custom_exp_name,
+            exp_name=args.exp_name,
         )
     
     return config

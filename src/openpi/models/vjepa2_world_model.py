@@ -10,7 +10,7 @@ where visible patches are encoded and used to predict masked regions in represen
 
 import dataclasses
 import logging
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 
 import torch
 import torch.nn as nn
@@ -85,7 +85,7 @@ def create_video_mask(
                                 break
                     if masked_patches >= num_masked:
                         break
-                if masked_patches >= num_patches:
+                if masked_patches >= num_masked:
                     break
         
         masks.append(mask)
@@ -156,9 +156,6 @@ class VideoTransformerEncoder(nn.Module):
             torch.randn(1, 1000, hidden_size) * 0.02  # Support up to 1000 frames
         )
         
-        # Learnable mask tokens for masked regions
-        self.mask_token = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.02)
-        
     def forward(
         self,
         video_frames: torch.Tensor,  # (B, T, H, W, C)
@@ -199,47 +196,35 @@ class VideoTransformerEncoder(nn.Module):
             # Pad frames if needed
             pad_frames = self.temporal_patch_size - (T % self.temporal_patch_size)
             patch_embeddings = F.pad(patch_embeddings, (0, 0, 0, 0, 0, pad_frames))
-            T = T + pad_frames
-            
-        # Group temporal patches
-        num_temporal_patches = T // self.temporal_patch_size
-        patch_embeddings = patch_embeddings.view(
-            B, num_temporal_patches, self.temporal_patch_size, patches_per_frame, self.hidden_size
-        )
-        # Average over temporal dimension
-        patch_embeddings = patch_embeddings.mean(dim=2)  # (B, num_temporal_patches, patches_per_frame, hidden_size)
+            T += pad_frames
         
-        # Flatten spatial and temporal dimensions
-        total_patches = num_temporal_patches * patches_per_frame
-        patch_embeddings = patch_embeddings.view(B, total_patches, self.hidden_size)
+        # Group temporal patches
+        num_temporal_groups = T // self.temporal_patch_size
+        patch_embeddings = patch_embeddings.view(B, num_temporal_groups, self.temporal_patch_size, patches_per_frame, self.hidden_size)
+        patch_embeddings = patch_embeddings.mean(dim=2)  # Average over temporal patches
+        
+        # Flatten to (B, num_patches, hidden_size)
+        patch_embeddings = patch_embeddings.view(B, -1, self.hidden_size)
         
         # Add temporal positional embeddings
-        temporal_pos = self.temporal_pos_embedding[:, :total_patches, :]
-        patch_embeddings = patch_embeddings + temporal_pos
+        if patch_embeddings.size(1) <= self.temporal_pos_embedding.size(1):
+            pos_embed = self.temporal_pos_embedding[:, :patch_embeddings.size(1), :]
+            patch_embeddings = patch_embeddings + pos_embed
         
-        # Apply masking if provided
-        if mask is not None:
-            # Replace masked patches with mask tokens
-            mask_tokens = self.mask_token.expand(B, total_patches, self.hidden_size)
-            patch_embeddings = torch.where(
-                mask.unsqueeze(-1).expand(-1, -1, self.hidden_size),
-                mask_tokens,
-                patch_embeddings
-            )
-            
         return patch_embeddings
 
 
 class VideoTransformerPredictor(nn.Module):
     """
-    Transformer predictor for VJEPA-2 world model.
+    Vision Transformer predictor for masked video modeling.
     
-    Takes encoded visible patches and predicts features for masked regions.
+    Takes context features and predicts masked regions.
     """
     
     def __init__(
         self,
         hidden_size: int = 768,
+        predictor_hidden_size: int = 384,
         num_layers: int = 6,
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
@@ -249,24 +234,36 @@ class VideoTransformerPredictor(nn.Module):
         super().__init__()
         
         self.hidden_size = hidden_size
+        self.predictor_hidden_size = predictor_hidden_size
         self.num_mask_tokens = num_mask_tokens
         
-        # Learnable mask tokens for prediction
-        self.mask_tokens = nn.Parameter(torch.randn(1, num_mask_tokens, hidden_size) * 0.02)
+        # Project context features to predictor dimension
+        self.context_proj = nn.Linear(hidden_size, predictor_hidden_size)
         
-        # Transformer layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_size,
-            nhead=num_heads,
-            dim_feedforward=int(hidden_size * mlp_ratio),
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # Mask tokens for prediction
+        self.mask_tokens = nn.ParameterList([
+            nn.Parameter(torch.zeros(1, 1, predictor_hidden_size)) 
+            for _ in range(num_mask_tokens)
+        ])
         
-        # Layer norm
-        self.layer_norm = nn.LayerNorm(hidden_size)
+        # Transformer blocks for prediction
+        self.predictor_blocks = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=predictor_hidden_size,
+                nhead=num_heads,
+                dim_feedforward=int(predictor_hidden_size * mlp_ratio),
+                dropout=dropout,
+                activation='gelu',
+                batch_first=True,
+            )
+            for _ in range(num_layers)
+        ])
+        
+        # Final projection back to encoder dimension
+        self.output_proj = nn.Linear(predictor_hidden_size, hidden_size)
+        
+        # Layer normalization
+        self.norm = nn.LayerNorm(predictor_hidden_size)
         
     def forward(
         self,
@@ -274,58 +271,48 @@ class VideoTransformerPredictor(nn.Module):
         mask: torch.Tensor,  # (B, total_patches) boolean mask
     ) -> torch.Tensor:
         """
-        Predict features for masked regions.
+        Forward pass through the predictor.
         
         Args:
             context_features: Features from visible patches
-            mask: Boolean mask indicating which patches were masked
+            mask: Boolean mask indicating which patches to predict
             
         Returns:
-            Predicted features for masked regions (B, num_masked, hidden_size)
+            Predicted features for masked regions (B, num_masked_patches, hidden_size)
         """
-        B, num_context, hidden_size = context_features.shape
+        B, num_context_patches, _ = context_features.shape
         
-        # Get number of masked patches
-        num_masked = mask.sum(dim=1).max().item()
+        # Project context features
+        context_features = self.context_proj(context_features)
         
-        # Warn if we're exceeding the number of available mask tokens
-        if num_masked > self.num_mask_tokens:
-            import warnings
-            warnings.warn(f"Number of masked patches ({num_masked}) exceeds available mask tokens ({self.num_mask_tokens}). "
-                         f"Truncating to {self.num_mask_tokens} masked patches.")
+        # Create mask tokens for prediction
+        num_masked = mask.sum(dim=1)  # (B,)
+        max_masked = num_masked.max().item()
         
-        # Ensure we don't exceed the number of available mask tokens
-        num_masked = min(num_masked, self.num_mask_tokens)
-        
-        # Create mask tokens
-        mask_tokens = self.mask_tokens[:, :num_masked, :].expand(B, -1, -1)
+        # Use first mask token for simplicity
+        mask_token = self.mask_tokens[0]  # (1, 1, predictor_hidden_size)
+        mask_tokens = mask_token.expand(B, max_masked, -1)  # (B, max_masked, predictor_hidden_size)
         
         # Concatenate context and mask tokens
-        predictor_input = torch.cat([context_features, mask_tokens], dim=1)
+        combined_features = torch.cat([context_features, mask_tokens], dim=1)
         
-        # Create attention mask (context tokens can attend to each other, mask tokens attend to context)
-        seq_len = predictor_input.size(1)
-        attention_mask = torch.ones(seq_len, seq_len, device=predictor_input.device)
+        # Apply transformer blocks
+        for block in self.predictor_blocks:
+            combined_features = block(combined_features)
         
-        # Mask tokens can only attend to context (not to other mask tokens)
-        attention_mask[num_context:, num_context:] = 0
+        # Normalize
+        combined_features = self.norm(combined_features)
         
-        # Apply transformer
-        predicted_features = self.transformer(
-            predictor_input,
-            mask=attention_mask,
-        )
+        # Extract predicted features (mask tokens)
+        predicted_features = combined_features[:, num_context_patches:, :]
         
-        # Extract predictions for masked regions
-        predicted_masked = predicted_features[:, num_context:, :]
+        # Project back to encoder dimension
+        predicted_features = self.output_proj(predicted_features)
         
-        # Apply layer norm
-        predicted_masked = self.layer_norm(predicted_masked)
-        
-        return predicted_masked
+        return predicted_features
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass
 class VJEPA2WorldModelConfig:
     """Configuration for VJEPA-2 world model."""
     
@@ -351,7 +338,10 @@ class VJEPA2WorldModelConfig:
     predictor_num_heads: int = 6
     predictor_mlp_ratio: float = 4.0
     predictor_dropout: float = 0.0
-    predictor_num_mask_tokens: int = 800  # Increased to handle up to 90% masking of large videos
+    predictor_num_mask_tokens: int = 800
+    
+    # Loss parameters
+    loss_exp: float = 2.0  # L2 loss
     
     # Pretrained model
     use_pretrained_encoder: bool = True
@@ -360,20 +350,20 @@ class VJEPA2WorldModelConfig:
 
 class VJEPA2WorldModel(nn.Module):
     """
-    VJEPA-2 World Model for video understanding and prediction.
+    VJEPA-2 World Model with separate context and target encoders.
     
-    This model implements the Video Joint-Embedding Predictive Architecture (V-JEPA)
-    for self-supervised learning from video. It uses a vision encoder + predictor
-    architecture to predict masked regions in video sequences.
+    This implementation follows the official V-JEPA2 architecture:
+    - Context encoder: Processes masked video
+    - Target encoder: Processes unmasked video (frozen/EMA)
+    - Predictor: Predicts target features from context
     """
     
     def __init__(self, config: VJEPA2WorldModelConfig):
         super().__init__()
-        
         self.config = config
         
-        # Video encoder
-        self.encoder = VideoTransformerEncoder(
+        # Context encoder (for masked video)
+        self.context_encoder = VideoTransformerEncoder(
             image_size=config.image_size,
             patch_size=config.patch_size,
             temporal_patch_size=config.temporal_patch_size,
@@ -387,9 +377,32 @@ class VJEPA2WorldModel(nn.Module):
             pretrained_model=config.pretrained_model,
         )
         
+        # Target encoder (for unmasked video) - should be frozen/EMA
+        self.target_encoder = VideoTransformerEncoder(
+            image_size=config.image_size,
+            patch_size=config.patch_size,
+            temporal_patch_size=config.temporal_patch_size,
+            num_channels=config.num_channels,
+            hidden_size=config.encoder_hidden_size,
+            num_layers=config.encoder_num_layers,
+            num_heads=config.encoder_num_heads,
+            mlp_ratio=config.encoder_mlp_ratio,
+            dropout=config.encoder_dropout,
+            use_pretrained=config.use_pretrained_encoder,
+            pretrained_model=config.pretrained_model,
+        )
+        
+        # Initialize target encoder with same weights as context encoder
+        self.target_encoder.load_state_dict(self.context_encoder.state_dict())
+        
+        # Freeze target encoder
+        for param in self.target_encoder.parameters():
+            param.requires_grad = False
+        
         # Predictor
         self.predictor = VideoTransformerPredictor(
-            hidden_size=config.predictor_hidden_size,
+            hidden_size=config.encoder_hidden_size,
+            predictor_hidden_size=config.predictor_hidden_size,
             num_layers=config.predictor_num_layers,
             num_heads=config.predictor_num_heads,
             mlp_ratio=config.predictor_mlp_ratio,
@@ -397,70 +410,101 @@ class VJEPA2WorldModel(nn.Module):
             num_mask_tokens=config.predictor_num_mask_tokens,
         )
         
-        # Projection layers to align encoder and predictor dimensions
-        if config.encoder_hidden_size != config.predictor_hidden_size:
-            self.encoder_proj = nn.Linear(config.encoder_hidden_size, config.predictor_hidden_size)
-            self.target_proj = nn.Linear(config.encoder_hidden_size, config.predictor_hidden_size)
-        else:
-            self.encoder_proj = nn.Identity()
-            self.target_proj = nn.Identity()
-    
+        # Loss exponent
+        self.loss_exp = config.loss_exp
+        
     def forward(
         self,
         video_frames: torch.Tensor,  # (B, T, H, W, C)
         mask: Optional[torch.Tensor] = None,  # (B, num_patches) boolean mask
     ) -> dict:
         """
-        Forward pass through VJEPA-2 model.
+        Forward pass through the VJEPA-2 model.
         
         Args:
             video_frames: Input video frames (B, T, H, W, C)
-            mask: Optional mask for training (True = masked)
+            mask: Optional mask indicating which patches to mask (True = masked)
             
         Returns:
             Dictionary containing model outputs
         """
         B, T, H, W, C = video_frames.shape
         
-        # Create mask if not provided
+        # If no mask provided, create one
         if mask is None:
             mask = create_video_mask(
                 video_frames.shape,
                 patch_size=(self.config.patch_size, self.config.patch_size),
                 temporal_patch_size=self.config.temporal_patch_size,
-                mask_ratio=0.75, # This parameter is removed from config, so it's hardcoded here
-                block_size=4, # This parameter is removed from config, so it's hardcoded here
+                mask_ratio=0.75,
                 device=video_frames.device,
             )
         
-        # Encode full video (including masked regions for targets)
-        full_features = self.encoder(video_frames, mask=None)
+        # Encode full video with target encoder (no masking)
+        with torch.no_grad():
+            target_features = self.target_encoder(video_frames, mask=None)
         
-        # Encode visible regions only (using provided mask)
-        visible_features = self.encoder(video_frames, mask=mask)
+        # Apply layer normalization to target features
+        target_features = F.layer_norm(target_features, (target_features.size(-1),))
         
-        # Get context features (non-masked patches)
-        context_mask = ~mask  # Invert mask for context
-        context_features = visible_features[context_mask.unsqueeze(-1).expand(-1, -1, visible_features.size(-1))]
-        context_features = context_features.view(B, -1, visible_features.size(-1))
+        # Encode masked video with context encoder
+        context_features = self.context_encoder(video_frames, mask)
         
-        # Project to predictor dimension
-        context_features = self.encoder_proj(context_features)
+        # Extract visible features (unmasked regions)
+        visible_mask = ~mask  # Invert mask for visible regions
+        visible_features = []
+        for b in range(B):
+            visible_idx = visible_mask[b]
+            if visible_idx.any():
+                visible_feat = context_features[b][visible_idx]
+                visible_features.append(visible_feat)
+            else:
+                # If no visible patches, use all features
+                visible_features.append(context_features[b])
+        
+        # Pad to same length for batch processing
+        max_visible = max(feat.size(0) for feat in visible_features)
+        padded_visible_features = []
+        for feat in visible_features:
+            if feat.size(0) < max_visible:
+                padding = torch.zeros(max_visible - feat.size(0), feat.size(1), device=feat.device)
+                feat = torch.cat([feat, padding], dim=0)
+            padded_visible_features.append(feat)
+        
+        visible_features = torch.stack(padded_visible_features, dim=0)  # (B, max_visible, hidden_size)
         
         # Predict masked regions
-        predicted_features = self.predictor(context_features, mask)
+        predicted_features = self.predictor(visible_features, mask)
         
-        # Get target features for masked regions (using the same mask)
-        target_features = full_features[mask.unsqueeze(-1).expand(-1, -1, full_features.size(-1))]
-        target_features = target_features.view(B, -1, full_features.size(-1))
-        target_features = self.target_proj(target_features)
+        # Extract target features for masked regions
+        masked_target_features = []
+        for b in range(B):
+            masked_idx = mask[b]
+            if masked_idx.any():
+                target_feat = target_features[b][masked_idx]
+                masked_target_features.append(target_feat)
+            else:
+                # If no masked patches, use dummy features
+                dummy_feat = torch.zeros(1, target_features.size(-1), device=target_features.device)
+                masked_target_features.append(dummy_feat)
+        
+        # Pad target features
+        max_masked = max(feat.size(0) for feat in masked_target_features)
+        padded_target_features = []
+        for feat in masked_target_features:
+            if feat.size(0) < max_masked:
+                padding = torch.zeros(max_masked - feat.size(0), feat.size(1), device=feat.device)
+                feat = torch.cat([feat, padding], dim=0)
+            padded_target_features.append(feat)
+        
+        target_features_masked = torch.stack(padded_target_features, dim=0)
         
         return {
             'predicted_features': predicted_features,
-            'target_features': target_features,
-            'context_features': context_features,
+            'target_features': target_features_masked,
+            'context_features': visible_features,
             'mask': mask,
-            'full_features': full_features,
+            'full_features': target_features,
         }
     
     def compute_loss(
@@ -469,7 +513,7 @@ class VJEPA2WorldModel(nn.Module):
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute VJEPA-2 prediction loss.
+        Compute VJEPA-2 prediction loss following the official implementation.
         
         Args:
             video_frames: Input video frames (B, T, H, W, C)
@@ -480,13 +524,28 @@ class VJEPA2WorldModel(nn.Module):
         """
         outputs = self.forward(video_frames, mask)
         
-        predicted = outputs['predicted_features']
-        target = outputs['target_features']
+        predicted = outputs['predicted_features']  # (B, num_masked, hidden_size)
+        target = outputs['target_features']        # (B, num_masked, hidden_size)
         
-        # L2 loss between predicted and target features
-        loss = F.mse_loss(predicted, target, reduction='mean')
+        # Compute loss following official V-JEPA2 implementation
+        # Use L1 loss with exponentiation: |pred - target|^loss_exp
+        loss = torch.mean(torch.abs(predicted - target) ** self.loss_exp) / self.loss_exp
         
         return loss
+    
+    def update_target_encoder(self, momentum: float = 0.99):
+        """
+        Update target encoder with momentum from context encoder.
+        
+        Args:
+            momentum: Momentum coefficient for EMA update
+        """
+        with torch.no_grad():
+            for target_param, context_param in zip(
+                self.target_encoder.parameters(), 
+                self.context_encoder.parameters()
+            ):
+                target_param.data.mul_(momentum).add_(context_param.data, alpha=1 - momentum)
     
     def predict_masked_regions(
         self,
@@ -519,74 +578,7 @@ class VJEPA2WorldModel(nn.Module):
         Returns:
             Encoded video features (B, num_patches, hidden_size)
         """
-        return self.encoder(video_frames, mask=None)
-    
-    def predict_future_frames(
-        self,
-        past_frames: torch.Tensor,  # (B, T_past, H, W, C)
-        num_future_frames: int = 8,
-    ) -> torch.Tensor:
-        """
-        Predict future frames causally from past frames.
-        
-        Args:
-            past_frames: Input past frames (B, T_past, H, W, C)
-            num_future_frames: Number of future frames to predict
-            
-        Returns:
-            Predicted future frames (B, T_future, H, W, C)
-        """
-        B, T_past, H, W, C = past_frames.shape
-        
-        # Encode past frames
-        past_features = self.encoder(past_frames, mask=None)
-        
-        # Create future frame mask (all future patches are masked)
-        total_patches = (H // self.config.patch_size) * (W // self.config.patch_size) * (T_past // self.config.temporal_patch_size)
-        future_patches = (H // self.config.patch_size) * (W // self.config.patch_size) * (num_future_frames // self.config.temporal_patch_size)
-        
-        # Create mask where future patches are True (masked)
-        mask = torch.zeros(B, total_patches + future_patches, dtype=torch.bool, device=past_frames.device)
-        mask[:, total_patches:] = True  # Mask all future patches
-        
-        # Project past features to predictor dimension
-        past_features_proj = self.encoder_proj(past_features)
-        
-        # Predict future features
-        predicted_future_features = self.predictor(past_features_proj, mask)
-        
-        # Convert features back to image space (you'll need a decoder)
-        # This is a simplified version - you'll need to implement proper decoding
-        predicted_frames = self._features_to_frames(predicted_future_features, num_future_frames)
-        
-        return predicted_frames
-    
-    def _features_to_frames(self, features: torch.Tensor, num_frames: int) -> torch.Tensor:
-        """
-        Convert predicted features back to image frames.
-        This is a placeholder - you'll need to implement proper decoding.
-        """
-        # This is a simplified implementation
-        # In practice, you'd need a proper decoder network
-        B, num_patches, hidden_size = features.shape
-        
-        # Reshape to spatial dimensions
-        patches_per_frame = (self.config.image_size // self.config.patch_size) ** 2
-        num_temporal_patches = num_patches // patches_per_frame
-        
-        features = features.view(B, num_temporal_patches, patches_per_frame, hidden_size)
-        
-        # Simple linear projection to RGB values (simplified)
-        rgb_proj = nn.Linear(hidden_size, self.config.patch_size ** 2 * 3).to(features.device)
-        rgb_patches = rgb_proj(features)  # (B, T, patches_per_frame, patch_size^2 * 3)
-        
-        # Reshape to image format
-        rgb_patches = rgb_patches.view(B, num_temporal_patches, patches_per_frame, 
-                                     self.config.patch_size, self.config.patch_size, 3)
-        
-        # Reconstruct images (simplified)
-        # In practice, you'd use a proper decoder network
-        return rgb_patches.mean(dim=2)  # Average over patches (simplified)
+        return self.context_encoder(video_frames, mask=None)
 
 
 def create_vjepa2_model(

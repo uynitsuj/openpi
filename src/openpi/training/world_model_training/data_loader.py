@@ -178,7 +178,7 @@ class WorldModelDataset(Dataset):
             self.current_mask_ratio = config.mask_ratio
             self.current_num_masked_patches = config.num_masked_patches
         
-        # Load dataset metadata
+        # Load dataset metadata and cache dataset object
         if config.repo_id is None:
             raise ValueError("repo_id must be specified for world model training")
         
@@ -187,6 +187,9 @@ class WorldModelDataset(Dataset):
         
         # Apply train/validation split
         self.episode_info = self._apply_split(self.episode_info, split)
+        
+        # Cache the dataset object to avoid repeated file resolution
+        self.dataset = self._load_dataset()
         
         # Calculate total number of episodes and sequences
         self.total_episodes = len(self.episode_info)
@@ -285,7 +288,7 @@ class WorldModelDataset(Dataset):
         # Calculate chunk boundaries - chunk_start is episode index
         chunk_end = min(chunk_start + self.chunk_size, len(episode_indices))
         
-        logger.info(f"Loading chunk: episodes {chunk_start} to {chunk_end} (total episodes: {len(episode_indices)})")
+        # logger.info(f"Loading chunk: episodes {chunk_start} to {chunk_end} (total episodes: {len(episode_indices)})")
         
         # Load episodes in this chunk
         for local_idx in range(chunk_start, chunk_end):
@@ -320,7 +323,7 @@ class WorldModelDataset(Dataset):
                 })
                 self.episode_indices.append(episode_idx)
         
-        logger.info(f"Loaded {len(self.episodes)} sequences from {chunk_end - chunk_start} episodes")
+        # logger.info(f"Loaded {len(self.episodes)} sequences from {chunk_end - chunk_start} episodes")
         
         # Shuffle if needed
         if self.shuffle:
@@ -354,7 +357,7 @@ class WorldModelDataset(Dataset):
             delta_timestamps={
                 "state": timestamps  # Use 'state' which contains the video data
             },
-            video_backend="pyav",  # Use pyav for video loading
+            # video_backend="pyav",  # Use pyav for video loading
         )
         
         return dataset
@@ -409,9 +412,12 @@ class WorldModelDataset(Dataset):
         chunk_start = (target_episode_idx // self.chunk_size) * self.chunk_size
         chunk_end = min(chunk_start + self.chunk_size, len(episode_indices))
         
-        # 3. Calculate global sequence index of the first sequence in the chunk
-        # We need to calculate this by actually loading the chunk and seeing how many sequences
-        # are in the loaded episodes, not just by summing theoretical sequences
+        # 3. Load the chunk if needed
+        if (chunk_start != self.current_chunk_start or len(self.episodes) == 0):
+            self._load_chunk(chunk_start)
+        
+        # 4. Calculate global sequence index of the first sequence in the chunk
+        # We need to calculate this by summing sequences from episodes before the chunk
         chunk_global_start = 0
         for episode_idx in episode_indices[:chunk_start]:
             episode_data = self.episode_info[episode_idx]
@@ -422,10 +428,6 @@ class WorldModelDataset(Dataset):
             if self.config.frame_skip > 1:
                 num_sequences = num_sequences // self.config.frame_skip
             chunk_global_start += num_sequences
-        
-        # 4. Load the chunk if needed
-        if (chunk_start != self.current_chunk_start or len(self.episodes) == 0):
-            self._load_chunk(chunk_start)
         
         # 5. Calculate local index within the chunk
         local_idx = idx - chunk_global_start
@@ -446,13 +448,9 @@ class WorldModelDataset(Dataset):
             self._cache_misses += 1
             # Load video frames from the LeRobot dataset
             try:
-                # Load dataset on-demand for this episode
-                dataset = self._load_dataset()
-                
-                # Map episode index to dataset index
-                # The dataset index should correspond to the episode index
+                # Use cached dataset object
                 dataset_idx = episode_idx
-                frame_data = dataset[dataset_idx]
+                frame_data = self.dataset[dataset_idx]
             except Exception as e:
                 logger.warning(f"Failed to load frame data for episode {episode_idx}, index {idx}: {e}")
                 return self._create_dummy_sample()
@@ -530,12 +528,12 @@ class WorldModelDataset(Dataset):
                     )
                     samples.append((model_input, model_output))
             
-            # Log cache statistics periodically
-            if idx % 100 == 0 and idx > 0:
-                total_requests = self._cache_hits + self._cache_misses
-                if total_requests > 0:
-                    cache_hit_rate = self._cache_hits / total_requests
-                    logger.info(f"Cache stats: {self._cache_hits}/{total_requests} hits ({cache_hit_rate:.1%})")
+            # Log cache statistics periodically (disabled for cleaner output)
+            # if idx % 100 == 0 and idx > 0:
+            #     total_requests = self._cache_hits + self._cache_misses
+            #     if total_requests > 0:
+            #         cache_hit_rate = self._cache_hits / total_requests
+            #         logger.info(f"Cache stats: {self._cache_hits}/{total_requests} hits ({cache_hit_rate:.1%})")
         
             return samples  # List of (input, output) tuples
         else:
@@ -724,12 +722,16 @@ class WorldModelDataLoader:
         current_step: int = 0,  # Add current_step parameter
         prefetch_factor: int = 2,  # Add prefetch_factor for better GPU utilization
         chunk_size: int = 500,  # Reduced from 1000 to 500 for better memory efficiency
+        pin_memory: bool = False,  # Add pin_memory for benchmarking
     ):
         self.config = config
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.current_step = current_step
         self.chunk_size = chunk_size
+        self.num_workers = num_workers
+        self.prefetch_factor = prefetch_factor
+        self.pin_memory = pin_memory
         
         # Create dataset with chunked loading
         self.dataset = WorldModelDataset(
@@ -889,6 +891,8 @@ def create_world_model_data_loader(
     fake_data: bool = False,
     current_step: int = 0,  # Add current_step parameter
     chunk_size: int = 500,  # Reduced from 1000 to 500 for better memory efficiency
+    prefetch_factor: int = 2,  # Add prefetch_factor for benchmarking
+    pin_memory: bool = False,  # Add pin_memory for benchmarking
 ) -> WorldModelDataLoader:
     """Create a world model data loader."""
     return WorldModelDataLoader(
@@ -896,8 +900,10 @@ def create_world_model_data_loader(
         batch_size=batch_size,
         split=split,
         shuffle=shuffle,
-        num_workers=num_workers,  # Always use 0 workers
+        num_workers=num_workers,
         fake_data=fake_data,
         current_step=current_step,
         chunk_size=chunk_size,
+        prefetch_factor=prefetch_factor,
+        pin_memory=pin_memory,
     )

@@ -85,6 +85,10 @@ class WorldModelTrainConfig:
     num_workers: int = 2
     num_train_steps: int = 50000
     
+    # VJEPA-2 specific parameters
+    target_encoder_momentum: float = 0.99  # EMA momentum for target encoder
+    loss_exp: float = 2.0  # Loss exponent for L1 loss with exponentiation
+    
     # Logging and checkpointing
     log_interval: int = 100
     save_interval: int = 1000
@@ -106,7 +110,7 @@ class WorldModelTrainConfig:
     fsdp_devices: int = 1
     
     # Validation
-    validation_interval: int = 1000
+    validation_interval: int = 100
     validation_steps: int = 100
     
     @property
@@ -187,8 +191,8 @@ _WORLD_MODEL_CONFIGS = [
             multi_view_batch_mode=True,  # Disable for faster debugging
             use_progressive_masking=True,  # Enable progressive masking
         ),
-        batch_size=4,  # Reduced from 32 to 4 for faster debugging
-        num_workers=8,  # Increased from 2 to 8 for better data loading
+        batch_size=8,  # Reduced from 32 to 4 for faster debugging
+        num_workers=16,  # Increased from 2 to 8 for better data loading
         num_train_steps=30000,  # Few steps for debugging
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10,

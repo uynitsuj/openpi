@@ -45,6 +45,7 @@ class WorldModelTrainState:
     ema_model: VJEPA2WorldModel | None = None
     ema_decay: float | None = None
     progressive_masking_schedule: Any = None  # Progressive masking schedule
+    target_encoder_momentum: float = 0.99  # EMA momentum for target encoder
 
 
 def init_logging():
@@ -167,6 +168,7 @@ def init_train_state(config: WorldModelTrainConfig, init_rng: jax.Array) -> Worl
         ema_model=ema_model,
         ema_decay=getattr(config, 'ema_decay', None),
         progressive_masking_schedule=progressive_masking_schedule,
+        target_encoder_momentum=config.target_encoder_momentum,
     )
 
 
@@ -274,6 +276,12 @@ def train_step(
     state.grad_scaler.step(state.torch_optimizer)
     state.grad_scaler.update()
     
+    # Update target encoder with momentum (EMA update)
+    if hasattr(state.model, 'update_target_encoder'):
+        # Get momentum from config if available, otherwise use default
+        momentum = getattr(state, 'target_encoder_momentum', 0.99)
+        state.model.update_target_encoder(momentum)
+    
     # Compute gradient norm before optimization
     grad_norm = 0.0
     for param in state.model.parameters():
@@ -310,6 +318,7 @@ def train_step(
         tx=state.tx,
         ema_model=new_ema_model,
         ema_decay=state.ema_decay,
+        target_encoder_momentum=state.target_encoder_momentum,
     )
     
     # Add metrics
@@ -321,7 +330,7 @@ def train_step(
         'param_norm': jnp.array(param_norm),
     }
     
-        # Add progressive masking info if available
+    # Add progressive masking info if available
     if hasattr(state, 'progressive_masking_schedule') and state.progressive_masking_schedule is not None:
         masking_params = state.progressive_masking_schedule.get_masking_params(state.step)
         metrics.update({

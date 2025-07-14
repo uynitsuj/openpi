@@ -14,9 +14,9 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def debug_chunk_mapping():
-    """Debug the chunk mapping logic."""
-    
+def debug_chunk_mapping(split_name):
+    """Debug the chunk mapping logic for a given split."""
+    print(f"\n===== SPLIT: {split_name.upper()} =====")
     # Create config
     config = WorldModelDataConfig(
         repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned2",
@@ -24,11 +24,11 @@ def debug_chunk_mapping():
         frame_skip=2,
         min_episode_length=10,
         max_episodes=1000,
-        chunk_size=10,  # Small chunk size for debugging
+        chunk_size=500,  # Use actual training chunk size
     )
     
     # Create dataset
-    dataset = WorldModelDataset(config, split="train", shuffle=False)
+    dataset = WorldModelDataset(config, split=split_name, shuffle=False)
     
     print(f"Total dataset size: {len(dataset)}")
     print(f"Total episodes in split: {len(dataset.episode_info)}")
@@ -38,8 +38,14 @@ def debug_chunk_mapping():
     
     # Test specific problematic sequences
     test_sequences = [914, 1000, 9790, 23967, 24999, 26176, 28467, 31800, 41431, 51863, 53569, 57032, 63598, 63599]
+    max_idx = len(dataset) - 1
+    # Also test the last index in the split
+    if max_idx not in test_sequences:
+        test_sequences.append(max_idx)
     
     for seq_idx in test_sequences:
+        if seq_idx > max_idx:
+            continue
         print(f"\n--- Testing sequence {seq_idx} ---")
         
         # Find which episode this sequence belongs to
@@ -114,4 +120,5 @@ def debug_chunk_mapping():
             print(f"Successfully accessed sequence {seq_idx}: episode={episode['episode_index']}, frames={episode['frame_indices']}")
 
 if __name__ == "__main__":
-    debug_chunk_mapping() 
+    for split in ["train", "validation"]:
+        debug_chunk_mapping(split) 

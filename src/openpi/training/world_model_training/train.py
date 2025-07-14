@@ -535,6 +535,7 @@ def main(config: WorldModelTrainConfig):
         range(config.num_train_steps),
         desc="Training",
         dynamic_ncols=True,
+        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
     )
     
     for step in pbar:
@@ -577,8 +578,16 @@ def main(config: WorldModelTrainConfig):
         metrics['smoothed_loss'] = smoothed_loss
         metrics_history.append(metrics)
         
-        # Update progress bar every step with current metrics
-        current_metrics_str = ", ".join([f"{k}={v:.4f}" for k, v in metrics.items() if isinstance(v, (int, float))])
+        # Update progress bar every step to prevent line clearing
+        current_loss = metrics['reconstruction_loss']
+        current_mask_ratio = metrics['mask_ratio']
+        current_grad_norm = metrics['grad_norm']
+        
+        # Always update to prevent tqdm from clearing the line
+        if hasattr(config, 'progress_bar_verbose') and config.progress_bar_verbose:
+            current_metrics_str = f"loss={current_loss:.4f}, mask={current_mask_ratio:.3f}, grad={current_grad_norm:.3f}"
+        else:
+            current_metrics_str = f"loss={current_loss:.4f}"
         pbar.set_postfix_str(current_metrics_str)
         
         if step % config.log_interval == 0:
@@ -595,9 +604,9 @@ def main(config: WorldModelTrainConfig):
             
             wandb.log(avg_metrics, step=step)
             
-            # Update progress bar with averaged metrics for logging
-            metrics_str = ", ".join([f"{k}={v:.4f}" for k, v in avg_metrics.items()])
-            pbar.set_postfix_str(f"avg: {metrics_str}")
+            # Don't override the current metrics display with averaged ones
+            # The current metrics are more useful for real-time monitoring
+            # pbar.set_postfix_str(metrics_str)  # Removed this line
             
             metrics_history = []
         

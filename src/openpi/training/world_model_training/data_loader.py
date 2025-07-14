@@ -433,14 +433,14 @@ class WorldModelDataset(Dataset):
         cache_key = f"{episode_idx}_{frame_indices[0]}_{frame_indices[-1]}"
         if cache_key in self._frame_cache:
             self._cache_hits += 1
-            frame_images = self._frame_cache[cache_key]
+            frame_sequences = self._frame_cache[cache_key]
         else:
             self._cache_misses += 1
-            # Load video frames from the LeRobot dataset
+            # Load video frames from the LeRobot dataset for all frame indices
             try:
                 # Use cached dataset object
                 dataset_idx = episode_idx
-                frame_data = self.dataset[dataset_idx]
+                episode_data = self.dataset[dataset_idx]
             except Exception as e:
                 logger.warning(f"Failed to load frame data for episode {episode_idx}, index {idx}: {e}")
                 return self._create_dummy_sample()
@@ -452,45 +452,83 @@ class WorldModelDataset(Dataset):
                 "right_wrist_0_rgb": "right_camera-images-rgb",
             }
             
-            # Extract images for all cameras
-            frame_images = {}
-            found_cameras = []
-            for expected_key, actual_key in camera_mapping.items():
-                if actual_key in frame_data:
-                    found_cameras.append(expected_key)
-                    images = frame_data[actual_key]
+            # Load all frames in the sequence
+            frame_sequences = []
+            for frame_idx in frame_indices:
+                frame_images = {}
+                found_cameras = []
+                
+                # Get frame data for this specific frame index
+                try:
+                    # For LeRobot dataset, we need to access the dataset with the specific timestamp
+                    # Convert frame index to timestamp (assuming 15 FPS)
+                    fps = 15.0
+                    timestamp = frame_idx / fps
                     
-                    # Handle different image formats
-                    if isinstance(images, torch.Tensor):
-                        # Direct torch tensor
-                        image = images.numpy()
-                    elif isinstance(images, dict) and "bytes" in images:
-                        # Handle PIL images from bytes
-                        from PIL import Image
-                        import io
-                        image = Image.open(io.BytesIO(images["bytes"]))
-                        image = np.array(image)
-                    elif hasattr(images, 'convert'):
-                        # Handle PIL images directly
-                        image = np.array(images)
-                    elif isinstance(images, np.ndarray):
-                        # Already numpy array
-                        image = images
-                    else:
-                        logger.warning(f"Unknown image format for {actual_key}: {type(images)}")
-                        continue
+                    # Create a dataset access for this specific timestamp
+                    frame_dataset = lerobot_dataset.LeRobotDataset(
+                        self.config.repo_id,
+                        delta_timestamps={"state": [timestamp]},
+                    )
+                    frame_data = frame_dataset[episode_idx]
                     
-                    # Resize and normalize
-                    if image.shape[:2] != self.config.image_size:
-                        image = self._resize_image(image, self.config.image_size)
-                    
-                    if self.config.normalize_images:
-                        image = self._normalize_image(image)
-                    
-                    frame_images[expected_key] = image
+                    # Debug: Log the frame loading attempt
+                    if idx < 5:  # Only log for first few samples to avoid spam
+                        logger.info(f"Loading frame {frame_idx} (timestamp {timestamp:.3f}) from episode {episode_idx}, frame_data type: {type(frame_data)}")
+                        
+                except Exception as e:
+                    logger.warning(f"Failed to load frame {frame_idx} from episode {episode_idx}: {e}")
+                    # Create a dummy frame
+                    height, width = self.config.image_size
+                    dummy_frame = np.zeros((height, width, 3), dtype=np.float32)
+                    frame_images = {"base_0_rgb": dummy_frame}
+                    frame_sequences.append(frame_images)
+                    continue
+                
+                for expected_key, actual_key in camera_mapping.items():
+                    if actual_key in frame_data:
+                        found_cameras.append(expected_key)
+                        images = frame_data[actual_key]
+                        
+                        # Handle different image formats
+                        if isinstance(images, torch.Tensor):
+                            # Direct torch tensor
+                            image = images.numpy()
+                        elif isinstance(images, dict) and "bytes" in images:
+                            # Handle PIL images from bytes
+                            from PIL import Image
+                            import io
+                            image = Image.open(io.BytesIO(images["bytes"]))
+                            image = np.array(image)
+                        elif hasattr(images, 'convert'):
+                            # Handle PIL images directly
+                            image = np.array(images)
+                        elif isinstance(images, np.ndarray):
+                            # Already numpy array
+                            image = images
+                        else:
+                            logger.warning(f"Unknown image format for {actual_key}: {type(images)}")
+                            continue
+                        
+                        # Resize and normalize
+                        if image.shape[:2] != self.config.image_size:
+                            image = self._resize_image(image, self.config.image_size)
+                        
+                        if self.config.normalize_images:
+                            image = self._normalize_image(image)
+                        
+                        frame_images[expected_key] = image
+                
+                # If no cameras found, create a dummy frame
+                if not frame_images:
+                    height, width = self.config.image_size
+                    dummy_frame = np.zeros((height, width, 3), dtype=np.float32)
+                    frame_images = {"base_0_rgb": dummy_frame}
+                
+                frame_sequences.append(frame_images)
             
-            # Cache the processed frames
-            self._frame_cache[cache_key] = frame_images
+            # Cache the processed frame sequences
+            self._frame_cache[cache_key] = frame_sequences
             
             # Limit cache size to prevent memory issues
             if len(self._frame_cache) > self._max_cache_size:
@@ -502,8 +540,8 @@ class WorldModelDataset(Dataset):
         if self.config.multi_view_batch_mode:
             samples = []
             for cam_key in self.config.image_keys:
-                if cam_key in frame_images:
-                    video_tensor = self._frames_to_tensor([ {cam_key: frame_images[cam_key]} ], force_camera_key=cam_key )
+                if cam_key in frame_sequences[0]:  # Check first frame for camera availability
+                    video_tensor = self._frames_to_tensor(frame_sequences, force_camera_key=cam_key)
                     mask = self.mask_generator.generate_mask(batch_size=1)
                     mask = mask.view(mask.size(0), -1)
                     model_input = WorldModelInput(
@@ -528,7 +566,7 @@ class WorldModelDataset(Dataset):
             return samples  # List of (input, output) tuples
         else:
             # Single-view mode: use only the first available camera
-            video_tensor = self._frames_to_tensor([frame_images])
+            video_tensor = self._frames_to_tensor(frame_sequences)
             mask = self.mask_generator.generate_mask(batch_size=1)
             mask = mask.view(mask.size(0), -1)
             model_input = WorldModelInput(
@@ -645,9 +683,25 @@ class WorldModelDataset(Dataset):
                 height, width = self.config.image_size
                 image = np.zeros((height, width, 3), dtype=np.float32)
                 frame_tensors.append(image)
+        
+        # Stack all frames into a video tensor
         video_tensor = np.stack(frame_tensors, axis=0)
-        if video_tensor.shape[0] == 1 and self.config.num_frames > 1:
-            video_tensor = np.repeat(video_tensor, self.config.num_frames, axis=0)
+        
+        # Ensure we have the correct number of frames
+        if video_tensor.shape[0] != self.config.num_frames:
+            if video_tensor.shape[0] == 1 and self.config.num_frames > 1:
+                # If we only have one frame, repeat it (fallback behavior)
+                video_tensor = np.repeat(video_tensor, self.config.num_frames, axis=0)
+            elif video_tensor.shape[0] > self.config.num_frames:
+                # If we have too many frames, take the first num_frames
+                video_tensor = video_tensor[:self.config.num_frames]
+            else:
+                # If we have fewer frames than expected, pad with zeros
+                height, width = self.config.image_size
+                padding_frames = self.config.num_frames - video_tensor.shape[0]
+                padding = np.zeros((padding_frames, height, width, 3), dtype=np.float32)
+                video_tensor = np.concatenate([video_tensor, padding], axis=0)
+        
         return jnp.array(video_tensor)
 
 

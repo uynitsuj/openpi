@@ -84,6 +84,7 @@ class WorldModelTrainConfig:
     loss_exp: float = 1.0  # Changed from 2.0 to 1.0 to match official VJEPA2
     gradient_clip_norm: float = 1.0  # Gradient clipping for stability
     loss_smoothing_factor: float = 0.9  # Exponential moving average for loss
+    progress_bar_verbose: bool = True  # Show detailed metrics in progress bar
     
     log_interval: int = 10
     save_interval: int = 1000
@@ -164,10 +165,10 @@ _WORLD_MODEL_CONFIGS = [
         model_config=VJEPA2WorldModelConfig(
             num_frames=8,  
             image_size=224,
-            encoder_hidden_size=288,  # Increased from 288 to 768
-            predictor_hidden_size=144,  # Increased from 144 to 384
-            encoder_num_layers=4,  # Increased from 4 to 6
-            predictor_num_layers=4,  # Increased from 4 to 6
+            encoder_hidden_size=768,  # Increased from 288 to 768
+            predictor_hidden_size=384,  # Increased from 144 to 384
+            encoder_num_layers=8,  # Increased from 4 to 6
+            predictor_num_layers=8,  # Increased from 4 to 6
             use_pretrained_encoder=False,  
         ),
         data_config=WorldModelDataConfig(
@@ -178,7 +179,7 @@ _WORLD_MODEL_CONFIGS = [
             multi_view_batch_mode=True,  
             use_progressive_masking=True,  
         ),
-        batch_size=32,  
+        batch_size=64,  
         num_workers=128,  
         num_train_steps=30000,  
         lr_schedule=_optimizer.CosineDecaySchedule(

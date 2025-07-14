@@ -7,6 +7,7 @@ rather than action prediction. It handles video sequence loading, masking, and p
 
 import dataclasses
 import logging
+import os
 from typing import Optional, Tuple, Dict, Any, Iterator, Sequence
 import pathlib
 
@@ -22,6 +23,7 @@ from openpi.models.video_masking import VideoMaskGenerator, MaskingStrategy, cre
 from openpi.shared import array_typing as at
 from openpi.training import data_loader as base_data_loader
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+from .video_loader import VideoFrameLoader
 
 logger = logging.getLogger("openpi")
 
@@ -194,6 +196,10 @@ class WorldModelDataset(Dataset):
         
         # Cache the dataset object to avoid repeated file resolution
         self.dataset = self._load_dataset()
+        
+        # Initialize video frame loader for direct MP4 access
+        dataset_cache_path = os.path.expanduser("~/.cache/huggingface/lerobot/uynitsuj/hummus_xmi_full_subsample_2_cleaned2")
+        self.video_loader = VideoFrameLoader(dataset_cache_path)
         
         # Calculate total number of episodes and sequences
         self.total_episodes = len(self.episode_info)
@@ -460,21 +466,26 @@ class WorldModelDataset(Dataset):
                 
                 # Get frame data for this specific frame index
                 try:
-                    # For LeRobot dataset, we need to access the dataset with the specific timestamp
-                    # Convert frame index to timestamp (assuming 15 FPS)
-                    fps = 15.0
-                    timestamp = frame_idx / fps
-                    
-                    # Create a dataset access for this specific timestamp
-                    frame_dataset = lerobot_dataset.LeRobotDataset(
-                        self.config.repo_id,
-                        delta_timestamps={"state": [timestamp]},
+                    # Use the video loader to get frames directly from MP4 files
+                    frames = self.video_loader.load_frames(
+                        episode_idx=episode_idx,
+                        frame_indices=[frame_idx],
+                        camera="top_camera-images-rgb",
+                        target_size=self.config.image_size
                     )
-                    frame_data = frame_dataset[episode_idx]
+                    
+                    if frames and len(frames) > 0:
+                        frame_image = frames[0]  # Get the first (and only) frame
+                        frame_images = {"base_0_rgb": frame_image}
+                    else:
+                        # Create a dummy frame if loading failed
+                        height, width = self.config.image_size
+                        dummy_frame = np.zeros((height, width, 3), dtype=np.float32)
+                        frame_images = {"base_0_rgb": dummy_frame}
                     
                     # Debug: Log the frame loading attempt
                     if idx < 5:  # Only log for first few samples to avoid spam
-                        logger.info(f"Loading frame {frame_idx} (timestamp {timestamp:.3f}) from episode {episode_idx}, frame_data type: {type(frame_data)}")
+                        logger.info(f"Loading frame {frame_idx} from episode {episode_idx} using video loader")
                         
                 except Exception as e:
                     logger.warning(f"Failed to load frame {frame_idx} from episode {episode_idx}: {e}")
@@ -486,9 +497,9 @@ class WorldModelDataset(Dataset):
                     continue
                 
                 for expected_key, actual_key in camera_mapping.items():
-                    if actual_key in frame_data:
+                    if actual_key in frame_images:
                         found_cameras.append(expected_key)
-                        images = frame_data[actual_key]
+                        images = frame_images[actual_key]
                         
                         # Handle different image formats
                         if isinstance(images, torch.Tensor):

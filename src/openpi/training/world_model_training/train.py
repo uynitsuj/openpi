@@ -407,6 +407,7 @@ def main(config: WorldModelTrainConfig):
         num_workers=config.num_workers,
         fake_data=(config.data_config.repo_id is None),
         current_step=state.step,
+        chunk_size=config.data_config.chunk_size,  # Use chunked loading for memory efficiency
     )
     
     val_loader = create_world_model_data_loader(
@@ -417,6 +418,7 @@ def main(config: WorldModelTrainConfig):
         num_workers=config.num_workers,
         fake_data=(config.data_config.repo_id is None),
         current_step=state.step,
+        chunk_size=config.data_config.chunk_size,  # Use chunked loading for memory efficiency
     )
     
     # Initialize wandb

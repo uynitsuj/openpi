@@ -130,10 +130,19 @@ class WorldModelDataConfig:
     # Progressive masking schedule
     use_progressive_masking: bool = True
     progressive_masking_schedule: dict = None  # Will be set to default if None
+    
+    # Memory management
+    chunk_size: int = 500  # Reduced from 1000 to 500 for better memory efficiency
+    
+    # Dataset splits
+    train_split_ratio: float = 0.8  # Ratio of episodes for training
+    val_split_ratio: float = 0.1    # Ratio of episodes for validation
+    test_split_ratio: float = 0.1   # Ratio of episodes for testing
+    split_seed: int = 42            # Seed for reproducible splits
 
 
 class WorldModelDataset(Dataset):
-    """Dataset for loading video sequences for world model training."""
+    """Dataset for world model training with chunked episode loading."""
     
     def __init__(
         self,
@@ -141,75 +150,192 @@ class WorldModelDataset(Dataset):
         split: str = "train",
         shuffle: bool = True,
         current_step: int = 0,  # Add current_step parameter
+        chunk_size: int = 500,  # Reduced from 1000 to 500 for better memory efficiency
     ):
         self.config = config
         self.split = split
         self.shuffle = shuffle
         self.current_step = current_step
+        self.chunk_size = chunk_size
         
-        # Add simple caching for video frames
+        # Initialize mask generator
+        self.mask_generator = VideoMaskGenerator(
+            num_frames=config.num_frames,
+            image_size=config.image_size,
+            masking_strategy=config.masking_strategy,
+            mask_ratio=config.mask_ratio,
+            num_masked_patches=config.num_masked_patches,
+        )
+        
+        # Progressive masking schedule
+        if config.use_progressive_masking:
+            if config.progressive_masking_schedule is None:
+                config.progressive_masking_schedule = ProgressiveMaskingSchedule().get_masking_params(current_step)
+            self.progressive_schedule = ProgressiveMaskingSchedule()
+            self.current_mask_ratio = config.progressive_masking_schedule.get("mask_ratio", config.mask_ratio)
+            self.current_num_masked_patches = config.progressive_masking_schedule.get("num_masked_patches", config.num_masked_patches)
+        else:
+            self.current_mask_ratio = config.mask_ratio
+            self.current_num_masked_patches = config.num_masked_patches
+        
+        # Load dataset metadata
+        if config.repo_id is None:
+            raise ValueError("repo_id must be specified for world model training")
+        
+        self.dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(config.repo_id)
+        self.episode_info = self.dataset_meta.episodes
+        
+        # Apply train/validation split
+        self.episode_info = self._apply_split(self.episode_info, split)
+        
+        # Calculate total number of episodes and sequences
+        self.total_episodes = len(self.episode_info)
+        self.total_sequences = self._calculate_total_sequences()
+        
+        logger.info(f"Loaded {self.total_episodes} episodes for {split} split")
+        
+        # Initialize chunked loading
+        self.current_chunk_start = 0
+        self.current_chunk_end = 0
+        self.episodes = []
+        self.episode_indices = []
+        
+        # Frame cache for memory optimization
         self._frame_cache = {}
         self._cache_hits = 0
         self._cache_misses = 0
+        self._max_cache_size = 25  # Reduced from 50 to 25 for better memory management
         
-        # Initialize progressive masking schedule if enabled
-        if config.use_progressive_masking:
-            if config.progressive_masking_schedule is None:
-                # Use default schedule
-                self.progressive_schedule = ProgressiveMaskingSchedule(total_steps=50000)
-            else:
-                # Use custom schedule
-                self.progressive_schedule = ProgressiveMaskingSchedule(**config.progressive_masking_schedule)
-        else:
-            self.progressive_schedule = None
-        
-        # Initialize video mask generator with current parameters
-        self._update_mask_generator()
-        
-        # Load dataset
-        self.dataset = self._load_dataset()
-        self.episodes = self._prepare_episodes()
-        
-        logger.info(f"Loaded {len(self.episodes)} valid episodes from {config.repo_id}")
-        
-        # Debug: check what keys are available in the first dataset item
-        if len(self.episodes) > 0:
-            first_item = self.dataset[0]
-            logger.info(f"First dataset item keys: {list(first_item.keys())}")
-            logger.info(f"First dataset item types: {[(k, type(v)) for k, v in first_item.items()]}")
+        # Load first chunk
+        self._load_chunk(0)
     
-    def _update_mask_generator(self):
-        """Update the mask generator with current masking parameters."""
-        if self.progressive_schedule is not None:
-            # Get current masking parameters from progressive schedule
-            masking_params = self.progressive_schedule.get_masking_params(self.current_step)
-            mask_ratio = masking_params['mask_ratio']
-            block_size = masking_params['block_size']
-            num_masked_patches = masking_params['num_masked_patches']
-        else:
-            # Use fixed parameters from config
-            mask_ratio = self.config.mask_ratio
-            block_size = 4  # Default block size
-            num_masked_patches = self.config.num_masked_patches
+    def _apply_split(self, episode_info: dict, split: str) -> dict:
+        """Apply train/validation split to episode information."""
+        if split not in ["train", "validation", "test"]:
+            raise ValueError(f"Invalid split: {split}. Must be one of ['train', 'validation', 'test']")
         
-        # Initialize video mask generator with current parameters
-        self.mask_generator = VideoMaskGenerator(
-            num_frames=self.config.num_frames,
-            image_size=self.config.image_size,
-            masking_strategy=self.config.masking_strategy,
-            mask_ratio=mask_ratio,
-            num_masked_patches=num_masked_patches,
-        )
+        # Convert episode_info to list for easier manipulation
+        episode_list = list(episode_info.items())
         
-        # Store current parameters for logging
-        self.current_mask_ratio = mask_ratio
-        self.current_block_size = block_size
-        self.current_num_masked_patches = num_masked_patches
+        # Sort by episode index for reproducible splits
+        episode_list.sort(key=lambda x: x[0])
+        
+        # Use a fixed seed for reproducible splits
+        import random
+        random.seed(self.config.split_seed)  # Use config seed for reproducible splits
+        
+        # Shuffle episodes for random split
+        random.shuffle(episode_list)
+        
+        # Calculate split boundaries
+        total_episodes = len(episode_list)
+        train_end = int(self.config.train_split_ratio * total_episodes)
+        val_end = int((self.config.train_split_ratio + self.config.val_split_ratio) * total_episodes)
+        
+        if split == "train":
+            selected_episodes = episode_list[:train_end]
+        elif split == "validation":
+            selected_episodes = episode_list[train_end:val_end]
+        elif split == "test":
+            selected_episodes = episode_list[val_end:]
+        
+        split_episode_info = dict(selected_episodes)
+        print(f"[Split] {split}: {len(split_episode_info)} episodes out of {total_episodes} total")
+        
+        # Fallback: If split is empty, use a small portion of the train set
+        if len(split_episode_info) == 0 and split != "train":
+            import warnings
+            warnings.warn(f"Split '{split}' is empty! Using a small portion of the train set as fallback.")
+            fallback_episodes = episode_list[:max(1, int(0.05 * total_episodes))]
+            split_episode_info = dict(fallback_episodes)
+        
+        return split_episode_info
     
-    def update_step(self, current_step: int):
-        """Update the current training step and regenerate mask generator."""
-        self.current_step = current_step
-        self._update_mask_generator()
+    def _calculate_total_sequences(self) -> int:
+        """Calculate total number of sequences across all episodes."""
+        total = 0
+        episode_count = 0
+        for episode_idx, episode_data in self.episode_info.items():
+            if self.config.max_episodes is not None and episode_count >= self.config.max_episodes:
+                break
+                
+            episode_length = episode_data["length"]
+            
+            if episode_length < self.config.min_episode_length:
+                continue
+            
+            # Calculate number of sliding windows
+            num_windows = max(0, episode_length - self.config.num_frames + 1)
+            if self.config.frame_skip > 1:
+                num_windows = num_windows // self.config.frame_skip
+            total += num_windows
+            episode_count += 1
+        
+        return total
+    
+    def _load_chunk(self, chunk_start: int):
+        """Load a chunk of episodes starting from chunk_start."""
+        # Clear previous chunk
+        self.episodes = []
+        self.episode_indices = []
+        
+        # Get list of episode indices from the split episode_info
+        episode_indices = list(self.episode_info.keys())
+        
+        # Calculate chunk boundaries - chunk_start is episode index
+        chunk_end = min(chunk_start + self.chunk_size, len(episode_indices))
+        
+        logger.info(f"Loading chunk: episodes {chunk_start} to {chunk_end} (total episodes: {len(episode_indices)})")
+        
+        # Load episodes in this chunk
+        for local_idx in range(chunk_start, chunk_end):
+            if local_idx >= len(episode_indices):
+                break
+                
+            episode_idx = episode_indices[local_idx]
+            episode_data = self.episode_info[episode_idx]
+            episode_length = episode_data["length"]
+            
+            if episode_length < self.config.min_episode_length:
+                continue
+            
+            # Create sliding windows for this episode
+            for start_frame in range(0, episode_length - self.config.num_frames + 1, self.config.frame_skip):
+                end_frame = start_frame + self.config.num_frames * self.config.frame_skip
+                if end_frame > episode_length:
+                    break
+                
+                # Calculate frame indices for this sequence
+                frame_indices = [
+                    start_frame + i * self.config.frame_skip
+                    for i in range(self.config.num_frames)
+                ]
+                
+                self.episodes.append({
+                    "episode_index": episode_idx,
+                    "frame_indices": frame_indices,
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "episode_length": episode_length,
+                })
+                self.episode_indices.append(episode_idx)
+        
+        logger.info(f"Loaded {len(self.episodes)} sequences from {chunk_end - chunk_start} episodes")
+        
+        # Shuffle if needed
+        if self.shuffle:
+            import random
+            combined = list(zip(self.episodes, self.episode_indices))
+            random.shuffle(combined)
+            self.episodes, self.episode_indices = zip(*combined) if combined else ([], [])
+        
+        self.current_chunk_start = chunk_start
+        self.current_chunk_end = chunk_end
+        
+        # Clear frame cache when loading new chunk to prevent memory buildup
+        self._frame_cache.clear()
+        self._cache_hits = 0
+        self._cache_misses = 0
     
     def _load_dataset(self) -> lerobot_dataset.LeRobotDataset:
         """Load the LeRobot dataset using the proper infrastructure."""
@@ -233,54 +359,81 @@ class WorldModelDataset(Dataset):
         
         return dataset
     
-    def _prepare_episodes(self) -> list[dict]:
-        """Prepare episodes by grouping sequential frames."""
-        episodes = []
+    def _update_mask_generator(self):
+        """Update mask generator with current parameters."""
+        self.mask_generator = VideoMaskGenerator(
+            num_frames=self.config.num_frames,
+            image_size=self.config.image_size,
+            masking_strategy=self.config.masking_strategy,
+            mask_ratio=self.current_mask_ratio,
+            num_masked_patches=self.current_num_masked_patches,
+        )
+    
+    def update_step(self, current_step: int):
+        """Update the current training step and progressive masking parameters."""
+        self.current_step = current_step
         
-        # Get dataset metadata for episode information
-        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(self.config.repo_id)
-        
-        # Get episode information from the dataset
-        episode_info = dataset_meta.episodes
-        
-        # Process each episode
-        for episode_idx, episode_data in episode_info.items():
-            if self.config.max_episodes is not None and episode_idx >= self.config.max_episodes:
-                break
-                
-            episode_length = episode_data["length"]
-            
-            if episode_length < self.config.min_episode_length:
-                continue
-            
-            # Create sliding windows of video sequences
-            for start_frame in range(0, episode_length - self.config.num_frames + 1, self.config.frame_skip):
-                end_frame = start_frame + self.config.num_frames * self.config.frame_skip
-                if end_frame > episode_length:
-                    break
-                
-                # Calculate frame indices for this sequence
-                frame_indices = [
-                    start_frame + i * self.config.frame_skip
-                    for i in range(self.config.num_frames)
-                ]
-                
-                episodes.append({
-                    "episode_index": episode_idx,
-                    "frame_indices": frame_indices,
-                    "start_frame": start_frame,
-                    "end_frame": end_frame,
-                    "episode_length": episode_length,
-                })
-        
-        return episodes
+        if self.config.use_progressive_masking:
+            masking_params = self.progressive_schedule.get_masking_params(current_step)
+            self.current_mask_ratio = masking_params.get("mask_ratio", self.config.mask_ratio)
+            self.current_num_masked_patches = masking_params.get("num_masked_patches", self.config.num_masked_patches)
+            self._update_mask_generator()
     
     def __len__(self) -> int:
-        return len(self.episodes)
+        return self.total_sequences
     
     def __getitem__(self, idx: int) -> Tuple[WorldModelInput, WorldModelOutput]:
         """Get a video sequence and its masked version."""
-        episode = self.episodes[idx]
+        episode_indices = list(self.episode_info.keys())
+        sequence_count = 0
+        target_episode_idx = 0
+        
+        # 1. Find which episode this sequence belongs to
+        for episode_idx in episode_indices:
+            episode_data = self.episode_info[episode_idx]
+            episode_length = episode_data["length"]
+            if episode_length < self.config.min_episode_length:
+                continue
+            num_sequences = max(0, episode_length - self.config.num_frames + 1)
+            if self.config.frame_skip > 1:
+                num_sequences = num_sequences // self.config.frame_skip
+            if sequence_count + num_sequences > idx:
+                target_episode_idx = episode_indices.index(episode_idx)
+                break
+            sequence_count += num_sequences
+        else:
+            logger.warning(f"Index {idx} out of bounds, returning dummy sample")
+            return self._create_dummy_sample()
+        
+        # 2. Calculate chunk boundaries based on episode index
+        chunk_start = (target_episode_idx // self.chunk_size) * self.chunk_size
+        chunk_end = min(chunk_start + self.chunk_size, len(episode_indices))
+        
+        # 3. Calculate global sequence index of the first sequence in the chunk
+        # We need to calculate this by actually loading the chunk and seeing how many sequences
+        # are in the loaded episodes, not just by summing theoretical sequences
+        chunk_global_start = 0
+        for episode_idx in episode_indices[:chunk_start]:
+            episode_data = self.episode_info[episode_idx]
+            episode_length = episode_data["length"]
+            if episode_length < self.config.min_episode_length:
+                continue
+            num_sequences = max(0, episode_length - self.config.num_frames + 1)
+            if self.config.frame_skip > 1:
+                num_sequences = num_sequences // self.config.frame_skip
+            chunk_global_start += num_sequences
+        
+        # 4. Load the chunk if needed
+        if (chunk_start != self.current_chunk_start or len(self.episodes) == 0):
+            self._load_chunk(chunk_start)
+        
+        # 5. Calculate local index within the chunk
+        local_idx = idx - chunk_global_start
+        if local_idx < 0 or local_idx >= len(self.episodes):
+            logger.warning(f"Index {idx} (local: {local_idx}) out of bounds for chunk (len: {len(self.episodes)}), returning dummy sample")
+            return self._create_dummy_sample()
+        
+        episode = self.episodes[local_idx]
         episode_idx = episode["episode_index"]
         frame_indices = episode["frame_indices"]
         
@@ -292,11 +445,17 @@ class WorldModelDataset(Dataset):
         else:
             self._cache_misses += 1
             # Load video frames from the LeRobot dataset
-            frame_data = self.dataset[idx]
-            
-            # Debug: show what keys are available in the dataset
-            # if idx < 5:  # Only debug first few items
-            #     logger.info(f"Dataset item {idx} keys: {list(frame_data.keys())}")
+            try:
+                # Load dataset on-demand for this episode
+                dataset = self._load_dataset()
+                
+                # Map episode index to dataset index
+                # The dataset index should correspond to the episode index
+                dataset_idx = episode_idx
+                frame_data = dataset[dataset_idx]
+            except Exception as e:
+                logger.warning(f"Failed to load frame data for episode {episode_idx}, index {idx}: {e}")
+                return self._create_dummy_sample()
             
             # Map our expected camera names to the actual dataset column names
             camera_mapping = {
@@ -346,7 +505,7 @@ class WorldModelDataset(Dataset):
             self._frame_cache[cache_key] = frame_images
             
             # Limit cache size to prevent memory issues
-            if len(self._frame_cache) > 100:
+            if len(self._frame_cache) > self._max_cache_size:
                 # Remove oldest entries
                 oldest_key = next(iter(self._frame_cache))
                 del self._frame_cache[oldest_key]
@@ -370,8 +529,6 @@ class WorldModelDataset(Dataset):
                         mask_ratio=jnp.array(self.current_mask_ratio),
                     )
                     samples.append((model_input, model_output))
-            
-            # Debug logging removed for cleaner output
             
             # Log cache statistics periodically
             if idx % 100 == 0 and idx > 0:
@@ -397,6 +554,25 @@ class WorldModelDataset(Dataset):
                 mask_ratio=jnp.array(self.current_mask_ratio),
             )
             return model_input, model_output
+    
+    def _create_dummy_sample(self) -> Tuple[WorldModelInput, WorldModelOutput]:
+        """Create a dummy sample when loading fails."""
+        height, width = self.config.image_size
+        video_frames = np.zeros((self.config.num_frames, height, width, 3), dtype=np.float32)
+        mask = self.mask_generator.generate_mask(batch_size=1)
+        mask = mask.view(mask.size(0), -1)
+        
+        model_input = WorldModelInput(
+            video_frames=jnp.array(video_frames),
+            mask=mask,
+            camera_names=list(self.config.image_keys),
+        )
+        model_output = WorldModelOutput(
+            predicted_features=jnp.array(video_frames),
+            reconstruction_loss=jnp.array(0.0),
+            mask_ratio=jnp.array(self.current_mask_ratio),
+        )
+        return model_input, model_output
     
     def _resize_image(self, image: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
         """Resize image to target size with optimized processing."""
@@ -535,7 +711,7 @@ class FakeWorldModelDataset(Dataset):
 
 
 class WorldModelDataLoader:
-    """Data loader for world model training."""
+    """Data loader for world model training with improved memory management."""
     
     def __init__(
         self,
@@ -547,14 +723,22 @@ class WorldModelDataLoader:
         fake_data: bool = False,
         current_step: int = 0,  # Add current_step parameter
         prefetch_factor: int = 2,  # Add prefetch_factor for better GPU utilization
+        chunk_size: int = 500,  # Reduced from 1000 to 500 for better memory efficiency
     ):
         self.config = config
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.current_step = current_step
+        self.chunk_size = chunk_size
         
-        # Create dataset
-        self.dataset = WorldModelDataset(config, split=split, shuffle=shuffle, current_step=current_step)
+        # Create dataset with chunked loading
+        self.dataset = WorldModelDataset(
+            config, 
+            split=split, 
+            shuffle=shuffle, 
+            current_step=current_step,
+            chunk_size=chunk_size
+        )
         
         # Create indices for batching
         self.indices = list(range(len(self.dataset)))
@@ -593,8 +777,6 @@ class WorldModelDataLoader:
             else:
                 numpy_array = np.array(tensor)
             
-            # Debug logging removed for cleaner output
-            
             return jnp.array(numpy_array)
         
         # Stack inputs
@@ -603,8 +785,6 @@ class WorldModelDataLoader:
             mask=jnp.stack([torch_to_jax(inp.mask) for inp in inputs]).squeeze(1),  # Remove extra dimension from stacking
             camera_names=[inp.camera_names[0] for inp in inputs],
         )
-        
-        # Debug logging removed for cleaner output
         
         # Stack outputs
         batched_output = WorldModelOutput(
@@ -616,24 +796,48 @@ class WorldModelDataLoader:
         return batched_input, batched_output
     
     def __iter__(self) -> Iterator[Tuple[WorldModelInput, WorldModelOutput]]:
-        """Iterate over batches."""
+        """Iterate over batches with improved memory management."""
         if self.config.multi_view_batch_mode:
-            # Flatten all multi-view samples up front
-            flat_samples = []
-            for idx in range(len(self.dataset)):
+            # Process batches in smaller chunks to prevent memory issues
+            batch_inputs = []
+            batch_outputs = []
+            
+            while self.current_idx < len(self.indices):
+                idx = self.indices[self.current_idx]
                 item = self.dataset[idx]
+                self.current_idx += 1
+                
                 if isinstance(item, list):
-                    flat_samples.extend(item)
+                    # Multi-view item - add each view as a separate sample
+                    for input_sample, output_sample in item:
+                        batch_inputs.append(input_sample)
+                        batch_outputs.append(output_sample)
+                        
+                        # Yield batch when we have enough samples
+                        if len(batch_inputs) >= self.batch_size:
+                            yield self._collate_fn(list(zip(batch_inputs, batch_outputs)))
+                            batch_inputs = []
+                            batch_outputs = []
                 else:
-                    flat_samples.append(item)
-            total = len(flat_samples)
-            for i in range(0, total, self.batch_size):
-                batch = flat_samples[i:i+self.batch_size]
-                yield self._collate_fn(batch)
+                    # Single-view item
+                    batch_inputs.append(item[0])
+                    batch_outputs.append(item[1])
+                    
+                    # Yield batch when we have enough samples
+                    if len(batch_inputs) >= self.batch_size:
+                        yield self._collate_fn(list(zip(batch_inputs, batch_outputs)))
+                        batch_inputs = []
+                        batch_outputs = []
+            
+            # Yield remaining samples
+            if batch_inputs:
+                yield self._collate_fn(list(zip(batch_inputs, batch_outputs)))
         else:
+            # Single-view mode - simpler batching
             while self.current_idx < len(self.indices):
                 batch_inputs = []
                 batch_outputs = []
+                
                 for _ in range(self.batch_size):
                     if self.current_idx >= len(self.indices):
                         break
@@ -642,6 +846,7 @@ class WorldModelDataLoader:
                     batch_inputs.append(item[0])
                     batch_outputs.append(item[1])
                     self.current_idx += 1
+                
                 if batch_inputs:
                     yield self._collate_fn(list(zip(batch_inputs, batch_outputs)))
     
@@ -649,13 +854,25 @@ class WorldModelDataLoader:
         # In multi-view batch mode, count total number of multi-view samples
         if self.config.multi_view_batch_mode:
             total_samples = 0
-            for idx in range(len(self.dataset)):
-                item = self.dataset[idx]
-                if isinstance(item, list):
-                    total_samples += len(item)
-                else:
-                    total_samples += 1
-            return (total_samples + self.batch_size - 1) // self.batch_size
+            # Sample a few indices to estimate the total
+            sample_indices = list(range(min(100, len(self.dataset))))
+            for idx in sample_indices:
+                try:
+                    item = self.dataset[idx]
+                    if isinstance(item, list):
+                        total_samples += len(item)
+                    else:
+                        total_samples += 1
+                except:
+                    continue
+            
+            # Estimate total based on sample
+            if sample_indices:
+                avg_samples_per_item = total_samples / len(sample_indices)
+                estimated_total = int(avg_samples_per_item * len(self.dataset))
+                return (estimated_total + self.batch_size - 1) // self.batch_size
+            else:
+                return (len(self.dataset) + self.batch_size - 1) // self.batch_size
         else:
             return (len(self.dataset) + self.batch_size - 1) // self.batch_size
     
@@ -671,6 +888,7 @@ def create_world_model_data_loader(
     num_workers: int = 0,  # Force 0 workers to avoid multiprocessing issues
     fake_data: bool = False,
     current_step: int = 0,  # Add current_step parameter
+    chunk_size: int = 500,  # Reduced from 1000 to 500 for better memory efficiency
 ) -> WorldModelDataLoader:
     """Create a world model data loader."""
     return WorldModelDataLoader(
@@ -681,4 +899,5 @@ def create_world_model_data_loader(
         num_workers=num_workers,  # Always use 0 workers
         fake_data=fake_data,
         current_step=current_step,
+        chunk_size=chunk_size,
     )

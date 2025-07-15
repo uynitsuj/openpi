@@ -1,6 +1,7 @@
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import re
+from copy import deepcopy
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
 import flax.traverse_util as traverse_util
@@ -11,6 +12,8 @@ from openpi_client import image_tools
 from openpi.models import tokenizer as _tokenizer
 from openpi.shared import array_typing as at
 from openpi.shared import normalize as _normalize
+from openpi.utils.matrix_utils import rot_6d_to_quat, quat_to_rot_6d
+import viser.transforms as vtf
 
 DataDict: TypeAlias = at.PyTree
 NormStats: TypeAlias = _normalize.NormStats
@@ -242,6 +245,78 @@ class AbsoluteActions(DataTransformFn):
 
         return data
 
+
+@dataclasses.dataclass(frozen=True)
+class Bimanual20D_DeltaActions(DataTransformFn):
+    """Repacks absolute actions into delta actions and inter-gripper relative for bimanual XMI RBY, transforms right gripper into delta space, left gripper references right gripper."""
+    # NOTE: SPECIFIC TO BIMANUAL 20D ACTION FORMAT (bimanual 6D rot, 3D position, 1D gripper)
+
+    # Boolean mask for the action dimensions to be repacked into delta action space. Length
+    # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
+    # See `make_bool_mask` for more details.
+    mask: Sequence[bool] | None
+    use_actions_as_state: bool = False # Used when proprio state may contain partial delta rather than absolute states
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or self.mask is None:
+            return data
+        # action format is [left_6d_rot, left_ee_ik_target_handle_position, left_gripper_pos, right_6d_rot, right_ee_ik_target_handle_position, right_gripper_pos]
+        actions = data["actions"]
+        if self.use_actions_as_state:
+            state = deepcopy(actions[0])
+        else:
+            state = data["state"]
+
+        for i in range(actions.shape[0]):
+            left_in_world = vtf.SE3.from_rotation_and_translation(
+                vtf.SO3(wxyz=rot_6d_to_quat(actions[i, :6])[0]), actions[i, 6:9]
+            )
+            right_in_world = vtf.SE3.from_rotation_and_translation(
+                vtf.SO3(wxyz=rot_6d_to_quat(actions[i, 9:15])[0]), actions[i, 15:18]
+            )
+            left_in_right = right_in_world.inverse() @ left_in_world
+            left_in_right_6d_rot = quat_to_rot_6d(left_in_right.wxyz_xyz[..., :4][None, ...])[0]
+            actions[i, :6] = left_in_right_6d_rot
+            actions[i, 6:9] = left_in_right.wxyz_xyz[..., -3:]
+        mask = np.asarray(self.mask)
+        dims = mask.shape[-1]
+        actions[..., dims//2:dims] -= np.expand_dims(np.where(mask[dims//2:], state[..., dims//2:dims], 0), axis=-2)
+        data["actions"] = actions        
+
+        return data
+
+@dataclasses.dataclass(frozen=True)
+class Bimanual20D_AbsoluteActions(DataTransformFn):
+    """Repacks delta actions into absolute action space and inter-gripper relative for bimanual XMI RBY, transforms right gripper into delta space, left gripper references right gripper."""
+    # NOTE: SPECIFIC TO BIMANUAL 20D ACTION FORMAT (bimanual 6D rot, 3D position, 1D gripper)
+    
+    # Boolean mask for the action dimensions to be repacked into absolute action space. Length
+    # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
+    # See `make_bool_mask` for more details.
+    mask: Sequence[bool] | None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or self.mask is None:
+            return data
+
+        # Do the inverse transform to get the absolute actions
+        state, actions = data["state"], data["actions"]
+        mask = np.asarray(self.mask)
+        dims = mask.shape[-1]
+        actions[..., dims//2:dims] += np.expand_dims(np.where(mask[dims//2:], state[..., dims//2:dims], 0), axis=-2)
+        for i in range(actions.shape[0]):
+            left_in_right = vtf.SE3.from_rotation_and_translation(
+                vtf.SO3(wxyz=rot_6d_to_quat(actions[i, :6])[0]), actions[i, 6:9]
+            )
+            right_in_world = vtf.SE3.from_rotation_and_translation(
+                vtf.SO3(wxyz=rot_6d_to_quat(actions[i, 9:15])[0]), actions[i, 15:18]
+            )
+            left_in_world = right_in_world @ left_in_right
+            actions[i, :6] = quat_to_rot_6d(left_in_world.wxyz_xyz[..., :4][None, ...])[0]
+            actions[i, 6:9] = left_in_world.wxyz_xyz[..., -3:]
+            actions[i, 9:15] = quat_to_rot_6d(right_in_world.wxyz_xyz[..., :4][None, ...])[0]
+            actions[i, 15:18] = right_in_world.wxyz_xyz[..., -3:]
+        data["actions"] = actions
 
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):

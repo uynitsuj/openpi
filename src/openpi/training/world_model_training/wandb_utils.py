@@ -191,9 +191,9 @@ def create_mask_visualization(
                 # Apply mask visualization (spatiotemporal masking)
                 if mask is not None and len(mask.shape) >= 2:
                     # Convert spatiotemporal patch mask to spatial mask for this time step
-                    patch_size = 16  # Assume 16x16 patches
+                    patch_size = 16  # Default 16x16 patches (matches VJEPA2WorldModelConfig default)
                     patches_per_dim = H // patch_size
-                    temporal_patch_size = 2  # Assume temporal patch size of 2
+                    temporal_patch_size = 2  # Default temporal patch size (matches VJEPA2WorldModelConfig default)
                     
                     # Calculate temporal patch index for this frame
                     temporal_patch_idx = t // temporal_patch_size

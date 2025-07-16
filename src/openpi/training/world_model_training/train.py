@@ -758,8 +758,24 @@ def main(config: WorldModelTrainConfig):
                 momentum=getattr(state.model.config, 'momentum', None) if hasattr(state.model, 'config') else None,
             )
             
+            # Log progressive masking metrics separately
+            masking_metrics = {}
+            if 'target_mask_ratio' in avg_metrics:
+                masking_metrics['train/target_mask_ratio'] = avg_metrics['target_mask_ratio']
+            if 'mask_ratio' in avg_metrics:
+                masking_metrics['train/actual_mask_ratio'] = avg_metrics['mask_ratio']
+            if 'masking_progress' in avg_metrics:
+                masking_metrics['train/masking_progress'] = avg_metrics['masking_progress']
+            if '_masking_phase' in metrics_history[-1]:  # Get the latest phase
+                masking_metrics['train/masking_phase'] = {
+                    'phase1': 1, 'phase2': 2, 'phase3': 3
+                }.get(metrics_history[-1]['_masking_phase'], 0)
+            
+            if masking_metrics:
+                wandb.log(masking_metrics, step=step)
+            
             # Log debug visualization every 100 steps
-            if step % 100 == 0 and step > 0:
+            if step % 10 == 0 and step > 0:
                 try:
                     # Get a fresh batch for visualization by consuming a few samples
                     # This ensures we don't always get the same first sample

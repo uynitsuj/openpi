@@ -32,7 +32,7 @@ class MultiScaleMaskConfig:
     def __init__(
         self,
         spatial_scale: Tuple[float, float] = (0.15, 0.15),
-        temporal_scale: Tuple[float, float] = (1.0, 1.0),
+        temporal_scale: Tuple[float, float] = (0.1, 0.8),
         aspect_ratio: Tuple[float, float] = (0.75, 1.5),
         num_blocks: int = 8,
         max_temporal_keep: float = 1.0,
@@ -202,6 +202,7 @@ class VideoMaskGenerator:
         Generate multi-scale masks similar to official VJEPA2.
         
         This creates multiple blocks with variable sizes, aspect ratios, and scales.
+        Now respects the mask_ratio parameter by generating blocks until target ratio is achieved.
         """
         if self.multi_scale_config is None:
             # Fallback to default multi-scale config
@@ -213,8 +214,15 @@ class VideoMaskGenerator:
             mask = torch.ones((self.num_patches_t, self.num_patches_h, self.num_patches_w), 
                             dtype=torch.int32, device=self.device)
             
-            # Generate multiple blocks
-            for _ in range(self.multi_scale_config.num_blocks):
+            # Generate blocks until we reach the desired mask ratio
+            target_masked_patches = int(self.mask_ratio * self.total_patches)
+            current_masked_patches = 0
+            max_attempts = self.multi_scale_config.num_blocks * 2  # Limit attempts to avoid infinite loop
+            
+            for attempt in range(max_attempts):
+                if current_masked_patches >= target_masked_patches:
+                    break
+                    
                 # Sample block size using multi-scale parameters
                 block_size = self._sample_block_size()
                 
@@ -222,7 +230,18 @@ class VideoMaskGenerator:
                 block_mask = self._sample_block_mask(block_size)
                 
                 # Apply block mask (multiply to combine blocks)
-                mask *= block_mask
+                new_mask = mask * block_mask
+                
+                # Count how many new patches would be masked
+                new_masked_patches = (new_mask == 0).sum().item()
+                
+                # If this doesn't exceed our target, apply the mask
+                if new_masked_patches <= target_masked_patches:
+                    mask = new_mask
+                    current_masked_patches = new_masked_patches
+                else:
+                    # If we would exceed target, stop here
+                    break
             
             # Convert to boolean mask and flatten
             mask = (mask == 0).flatten()  # 0 = masked, 1 = visible

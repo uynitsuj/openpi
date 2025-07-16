@@ -23,6 +23,81 @@ from openpi.models.video_masking import create_multi_scale_mask_config, create_v
 logger = logging.getLogger("openpi")
 
 
+class StochasticDepth(nn.Module):
+    """
+    Stochastic Depth implementation for transformer layers.
+    Based on official VJEPA-2 implementation with layer-wise decay.
+    """
+    
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+    
+    def forward(self, x: torch.Tensor, training: bool = True) -> torch.Tensor:
+        if not training or self.drop_prob == 0.0:
+            return x
+            
+        # Sample keep probability
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # Work with arbitrary tensor shapes
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # Binarize
+        
+        # Scale output to maintain expected value
+        output = x.div(keep_prob) * random_tensor
+        return output
+
+
+class RotaryPositionalEmbedding(nn.Module):
+    """
+    Rotary Position Embedding (RoPE) implementation for video transformers.
+    Based on official VJEPA-2 implementation.
+    """
+    
+    def __init__(self, dim: int, max_seq_len: int = 1000):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        
+        # Compute frequency scales
+        freqs = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('freqs', freqs)
+        
+        # Precompute sin/cos values
+        t = torch.arange(max_seq_len).type_as(freqs)
+        freqs = torch.outer(t, freqs)
+        self.register_buffer('cos_cached', freqs.cos())
+        self.register_buffer('sin_cached', freqs.sin())
+    
+    def forward(self, x: torch.Tensor, seq_len: int = None) -> torch.Tensor:
+        """
+        Apply rotary position embedding.
+        
+        Args:
+            x: Input tensor (B, seq_len, dim)
+            seq_len: Sequence length
+            
+        Returns:
+            Tensor with RoPE applied
+        """
+        if seq_len is None:
+            seq_len = x.shape[1]
+            
+        cos = self.cos_cached[:seq_len].view(1, seq_len, 1, -1)
+        sin = self.sin_cached[:seq_len].view(1, seq_len, 1, -1)
+        
+        # Split x into pairs for rotation
+        x1, x2 = x[..., 0::2], x[..., 1::2]
+        
+        # Apply rotation
+        x_rope = torch.stack([
+            x1 * cos - x2 * sin,
+            x1 * sin + x2 * cos
+        ], dim=-1).flatten(-2)
+        
+        return x_rope
+
+
 def create_video_mask(
     video_shape: Tuple[int, int, int, int, int],  # (B, T, H, W, C)
     patch_size: Tuple[int, int] = (16, 16),
@@ -48,7 +123,7 @@ def create_video_mask(
     # Create multi-scale mask configuration similar to official VJEPA2
     multi_scale_config = create_multi_scale_mask_config(
         spatial_scale=(0.15, 0.15),      # 15% spatial coverage
-        temporal_scale=(1.0, 1.0),       # Full temporal coverage
+        temporal_scale=(0.1, 0.8),       # Variable temporal coverage (10% to 80% of frames)
         aspect_ratio=(0.75, 1.5),        # Variable aspect ratios
         num_blocks=8,                     # Multiple blocks per sample
         max_temporal_keep=1.0,           # Keep all temporal frames
@@ -109,6 +184,8 @@ class VideoTransformerEncoder(nn.Module):
             self.vit_config.attention_probs_dropout_prob = dropout
             
             self.vit_model = ViTModel(self.vit_config)
+            # Enable gradient checkpointing to save memory
+            self.vit_model.gradient_checkpointing_enable()
         else:
             # Create ViT from scratch
             self.vit_config = ViTConfig(
@@ -123,6 +200,8 @@ class VideoTransformerEncoder(nn.Module):
                 attention_probs_dropout_prob=dropout,
             )
             self.vit_model = ViTModel(self.vit_config)
+            # Enable gradient checkpointing to save memory
+            self.vit_model.gradient_checkpointing_enable()
         
         # Temporal positional embeddings
         self.temporal_pos_embedding = nn.Parameter(
@@ -213,13 +292,11 @@ class VideoTransformerPredictor(nn.Module):
         # Project context features to predictor dimension
         self.context_proj = nn.Linear(hidden_size, predictor_hidden_size)
         
-        # Mask tokens for prediction
-        self.mask_tokens = nn.ParameterList([
-            nn.Parameter(torch.zeros(1, 1, predictor_hidden_size)) 
-            for _ in range(num_mask_tokens)
-        ])
+        # Mask token for prediction (single learnable token like official VJEPA-2)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_hidden_size))
         
-        # Transformer blocks for prediction
+        # Transformer blocks for prediction with stochastic depth
+        stoch_depth_probs = [0.0] + [dropout * (i / (num_layers - 1)) for i in range(1, num_layers)]
         self.predictor_blocks = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=predictor_hidden_size,
@@ -230,6 +307,11 @@ class VideoTransformerPredictor(nn.Module):
                 batch_first=True,
             )
             for _ in range(num_layers)
+        ])
+        
+        # Stochastic depth for each layer
+        self.stochastic_depths = nn.ModuleList([
+            StochasticDepth(prob) for prob in stoch_depth_probs
         ])
         
         # Final projection back to encoder dimension
@@ -262,16 +344,18 @@ class VideoTransformerPredictor(nn.Module):
         num_masked = mask.sum(dim=1)  # (B,)
         max_masked = num_masked.max().item()
         
-        # Use first mask token for simplicity
-        mask_token = self.mask_tokens[0]  # (1, 1, predictor_hidden_size)
-        mask_tokens = mask_token.expand(B, max_masked, -1)  # (B, max_masked, predictor_hidden_size)
+        # Use the single mask token (like official VJEPA-2)
+        mask_tokens = self.mask_token.expand(B, max_masked, -1)  # (B, max_masked, predictor_hidden_size)
         
         # Concatenate context and mask tokens
         combined_features = torch.cat([context_features, mask_tokens], dim=1)
         
-        # Apply transformer blocks
-        for block in self.predictor_blocks:
-            combined_features = block(combined_features)
+        # Apply transformer blocks with stochastic depth
+        for block, stoch_depth in zip(self.predictor_blocks, self.stochastic_depths):
+            residual = combined_features
+            x = block(combined_features)
+            # Apply stochastic depth to the residual connection
+            combined_features = residual + stoch_depth(x - residual, training=self.training)
         
         # Normalize
         combined_features = self.norm(combined_features)
@@ -304,6 +388,7 @@ class VJEPA2WorldModelConfig:
     encoder_num_heads: int = 12
     encoder_mlp_ratio: float = 4.0
     encoder_dropout: float = 0.0
+    encoder_stochastic_depth: float = 0.1  # Stochastic depth for encoder layers
     
     # Predictor parameters
     predictor_hidden_size: int = 384
@@ -311,10 +396,14 @@ class VJEPA2WorldModelConfig:
     predictor_num_heads: int = 6
     predictor_mlp_ratio: float = 4.0
     predictor_dropout: float = 0.0
+    predictor_stochastic_depth: float = 0.1  # Stochastic depth for predictor layers
     predictor_num_mask_tokens: int = 800
     
     # Loss parameters
     loss_exp: float = 2.0  # L2 loss
+    
+    # EMA parameters (like official VJEPA-2)
+    momentum: float = 0.996  # EMA momentum for target encoder
     
     # Pretrained model
     use_pretrained_encoder: bool = True
@@ -385,6 +474,9 @@ class VJEPA2WorldModel(nn.Module):
         
         # Loss exponent
         self.loss_exp = config.loss_exp
+        
+        # EMA momentum for target encoder updates
+        self.momentum = config.momentum
         
     def forward(
         self,
@@ -506,19 +598,22 @@ class VJEPA2WorldModel(nn.Module):
         
         return loss
     
-    def update_target_encoder(self, momentum: float = 0.99):
+    def update_target_encoder(self, momentum: Optional[float] = None):
         """
-        Update target encoder with momentum from context encoder.
+        Update target encoder with EMA from context encoder (like official VJEPA-2).
         
         Args:
-            momentum: Momentum coefficient for EMA update
+            momentum: Momentum coefficient for EMA update (uses self.momentum if None)
         """
+        if momentum is None:
+            momentum = self.momentum
+            
         with torch.no_grad():
             for target_param, context_param in zip(
                 self.target_encoder.parameters(), 
                 self.context_encoder.parameters()
             ):
-                # Update target parameter: target = momentum * target + (1 - momentum) * context
+                # EMA update: target = momentum * target + (1 - momentum) * context
                 target_param.data.mul_(momentum).add_(context_param.data, alpha=1 - momentum)
     
     def predict_masked_regions(

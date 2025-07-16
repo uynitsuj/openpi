@@ -5,6 +5,17 @@ This script provides the training infrastructure for world models, specifically
 adapted for VJEPA-2 style video understanding and prediction tasks.
 """
 
+# Set multiprocessing start method immediately to avoid JAX fork warnings
+import multiprocessing
+import os
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
+
+# Set PyTorch CUDA memory allocation for better memory management
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 import dataclasses
 import functools
 import logging
@@ -29,9 +40,18 @@ from openpi.training import optimizer as _optimizer
 from openpi.training import checkpoints as _checkpoints
 from openpi.training.world_model_training.config import WorldModelTrainConfig
 from openpi.training.world_model_training.data_loader import create_world_model_data_loader
+from openpi.training.world_model_training.wandb_utils import log_training_metrics, log_model_info, log_debug_visualization
 from openpi.training import sharding
 
 logger = logging.getLogger("openpi")
+
+try:
+    from openpi.training.world_model_training.optimized_data_loader import create_optimized_world_model_data_loader
+    OPTIMIZED_DATALOADER_AVAILABLE = True
+    logger.info("Optimized dataloader available")
+except ImportError as e:
+    OPTIMIZED_DATALOADER_AVAILABLE = False
+    logger.warning(f"Optimized dataloader not available, using original: {e}")
 
 # Check for matplotlib availability
 try:
@@ -212,6 +232,12 @@ def init_train_state(config: WorldModelTrainConfig, init_rng: jax.Array) -> Worl
     
     model = create_vjepa2_model(config.model_config)
     
+    # Move model to GPU if available
+    import torch
+    if torch.cuda.is_available():
+        model = model.cuda()
+        logger.info("Model moved to GPU")
+    
     tx = _optimizer.create_optimizer(
         config.optimizer,
         config.lr_schedule,
@@ -282,7 +308,10 @@ def compute_loss(
     import torch
     
     def jax_to_torch(arr):
-        return torch.from_numpy(np.array(arr)).float()
+        tensor = torch.from_numpy(np.array(arr)).float()
+        if torch.cuda.is_available():
+            tensor = tensor.cuda()
+        return tensor
     
     def update_model_params(model, jax_params):
         for name, param in model.named_parameters():
@@ -318,7 +347,10 @@ def train_step(
     import torch
     
     def jax_to_torch(arr):
-        return torch.from_numpy(np.array(arr)).float()
+        tensor = torch.from_numpy(np.array(arr)).float()
+        if torch.cuda.is_available():
+            tensor = tensor.cuda()
+        return tensor
     
     def update_model_params(model, jax_params):
         for name, param in model.named_parameters():
@@ -340,7 +372,7 @@ def train_step(
     if not hasattr(state, 'torch_optimizer'):
         state.torch_optimizer = torch.optim.AdamW(
             state.model.parameters(),
-            lr=1e-4,
+            lr=1e-5,  # Reduced from 1e-4 to slow down learning
             weight_decay=0.01,
             betas=(0.9, 0.999),
             eps=1e-8,
@@ -426,7 +458,10 @@ def validation_step(
     import torch
     
     def jax_to_torch(arr):
-        return torch.from_numpy(np.array(arr)).float()
+        tensor = torch.from_numpy(np.array(arr)).float()
+        if torch.cuda.is_available():
+            tensor = tensor.cuda()
+        return tensor
     
     def update_model_params(model, jax_params):
         for name, param in model.named_parameters():
@@ -486,11 +521,111 @@ def save_checkpoint(
     logger.info(f"Saved checkpoint at step {step} to {checkpoint_dir}")
 
 
+def create_data_loader_with_fallback(
+    data_config,
+    batch_size: int,
+    split: str,
+    shuffle: bool,
+    num_workers: int,
+    fake_data: bool,
+    current_step: int,
+    chunk_size: int,
+    use_optimized: bool = True,
+    train_config: WorldModelTrainConfig = None,
+):
+    """Create dataloader with fallback to original if optimized fails."""
+    
+    # Try optimized dataloader first if available and requested
+    # if use_optimized and OPTIMIZED_DATALOADER_AVAILABLE:
+    #     try:
+    logger.info(f"Creating optimized dataloader for {split} split...")
+    
+    # Use config optimization parameters or calculate defaults
+    if train_config:
+        cache_size = getattr(train_config, 'dataloader_cache_size', max(100, batch_size * 4))
+        max_workers = getattr(train_config, 'dataloader_max_workers', min(2, num_workers // 4))
+        prefetch_factor = getattr(train_config, 'dataloader_prefetch_factor', 4)
+    else:
+        cache_size = max(100, batch_size * 4)  # Dynamic cache size
+        max_workers = min(2, num_workers // 4)  # Parallel loading workers
+        prefetch_factor = 4  # Enhanced prefetching
+    
+    # Disable DataLoader multiprocessing to avoid pickle errors with spawn
+    optimized_num_workers = 0  # Use single-threaded DataLoader
+    
+    # Adjust prefetch_factor for single-threaded mode
+    actual_prefetch_factor = prefetch_factor if optimized_num_workers > 0 else None
+    
+    loader = create_world_model_data_loader(
+        config=data_config,
+        batch_size=batch_size,
+        split=split,
+        shuffle=shuffle,
+        num_workers=optimized_num_workers,
+        chunk_size=chunk_size,
+        cache_size=cache_size,
+        max_workers=max_workers,
+        prefetch_factor=actual_prefetch_factor,
+        pin_memory=False,  # Disable for stability
+    )
+    
+    logger.info(f"✅ Successfully created optimized {split} dataloader "
+                f"(workers: {optimized_num_workers}, cache: {cache_size}, "
+                f"parallel_workers: {max_workers})")
+    
+    return loader
+    
+    # except Exception as e:
+    #     logger.warning(f"Failed to create optimized dataloader for {split}: {e}")
+        # logger.info("Falling back to original dataloader...")
+    
+    # Fallback to original dataloader
+    # logger.info(f"Creating original dataloader for {split} split...")
+    # loader = create_world_model_data_loader(
+    #     data_config,
+    #     batch_size=batch_size,
+    #     split=split,
+    #     shuffle=shuffle,
+    #     num_workers=min(num_workers, 8),  # Match optimized worker count
+    #     # fake_data=fake_data,
+    #     current_step=current_step,
+    #     chunk_size=chunk_size,
+    # )
+    
+    # logger.info(f"✅ Successfully created original {split} dataloader")
+    # return loader
+
+
 def main(config: WorldModelTrainConfig):
     """Main training loop."""
     init_logging()
     logger.info(f"Starting world model training on {platform.node()}")
     logger.info(f"Configuration: {config.name}")
+    
+    # Always use optimized dataloader (superior performance)
+    use_optimized = True
+    logger.info("Using optimized dataloader with smart image resizing")
+    
+    # Multiprocessing start method already set at module import
+    
+    # Initialize JAX (will use GPU if available)
+    logger.info("Initializing JAX...")
+    import jax
+    import jax.numpy as jnp
+    
+    # Check JAX GPU availability
+    logger.info(f"JAX devices: {jax.devices()}")
+    logger.info(f"JAX default backend: {jax.default_backend()}")
+    
+    # Force GPU usage if available
+    if jax.devices('gpu'):
+        logger.info("GPU detected, forcing JAX to use GPU")
+        # Test GPU with a simple operation
+        test_array = jnp.ones((1000, 1000))
+        test_result = jnp.sum(test_array)
+        logger.info(f"GPU test successful: {test_result}")
+    else:
+        logger.warning("No GPU detected by JAX - running on CPU")
     
     rng = jax.random.PRNGKey(config.seed)
     train_rng, init_rng, data_rng = jax.random.split(rng, 3)
@@ -498,29 +633,37 @@ def main(config: WorldModelTrainConfig):
     state = init_train_state(config, init_rng)
     logger.info(f"Initialized model with {sum(jnp.size(x) for x in jax.tree_leaves(state.params)):,} parameters")
     
-    train_loader = create_world_model_data_loader(
-        config.data_config,
+    # Create data loaders with fallback
+    train_loader = create_data_loader_with_fallback(
+        data_config=config.data_config,
         batch_size=config.batch_size,
         split="train",
         shuffle=True,
         num_workers=config.num_workers,
         fake_data=(config.data_config.repo_id is None),
         current_step=state.step,
-        chunk_size=config.data_config.chunk_size,
+        chunk_size=getattr(config.data_config, 'chunk_size', 500),
+        use_optimized=use_optimized,
+        train_config=config,
     )
     
-    val_loader = create_world_model_data_loader(
-        config.data_config,
+    val_loader = create_data_loader_with_fallback(
+        data_config=config.data_config,
         batch_size=config.batch_size,
-        split="validation",
+        split="validation", 
         shuffle=False,
         num_workers=config.num_workers,
         fake_data=(config.data_config.repo_id is None),
         current_step=state.step,
-        chunk_size=config.data_config.chunk_size,
+        chunk_size=getattr(config.data_config, 'chunk_size', 500),
+        use_optimized=use_optimized,
+        train_config=config,
     )
     
     init_wandb(config, resuming=config.resume)
+    
+    # Log model architecture info to wandb
+    log_model_info(state.model, state.model.config if hasattr(state.model, 'config') else config.model_config)
     
     config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
@@ -563,7 +706,11 @@ def main(config: WorldModelTrainConfig):
                 )
             )
         
-        train_loader.update_step(step)
+        # Update step if the loader supports it
+        if hasattr(train_loader, 'update_step'):
+            train_loader.update_step(step)
+        elif hasattr(train_loader, 'dataset') and hasattr(train_loader.dataset, 'update_step'):
+            train_loader.dataset.update_step(step)
         
         step_rng = jax.random.fold_in(train_rng, step)
         state, metrics = train_step(state, batch, step_rng)
@@ -602,7 +749,67 @@ def main(config: WorldModelTrainConfig):
                 except (TypeError, ValueError):
                     continue
             
-            wandb.log(avg_metrics, step=step)
+            # Use improved wandb logging with better organization
+            log_training_metrics(
+                step=step,
+                train_loss=avg_metrics.get('reconstruction_loss', 0.0),
+                learning_rate=getattr(state.torch_optimizer.param_groups[0], 'lr', None) if hasattr(state, 'torch_optimizer') else None,
+                grad_norm=avg_metrics.get('grad_norm', 0.0),
+                momentum=getattr(state.model.config, 'momentum', None) if hasattr(state.model, 'config') else None,
+            )
+            
+            # Log progressive masking metrics separately
+            masking_metrics = {}
+            if 'target_mask_ratio' in avg_metrics:
+                masking_metrics['train/target_mask_ratio'] = avg_metrics['target_mask_ratio']
+            if 'mask_ratio' in avg_metrics:
+                masking_metrics['train/actual_mask_ratio'] = avg_metrics['mask_ratio']
+            if 'masking_progress' in avg_metrics:
+                masking_metrics['train/masking_progress'] = avg_metrics['masking_progress']
+            if '_masking_phase' in metrics_history[-1]:  # Get the latest phase
+                masking_metrics['train/masking_phase'] = {
+                    'phase1': 1, 'phase2': 2, 'phase3': 3
+                }.get(metrics_history[-1]['_masking_phase'], 0)
+            
+            if masking_metrics:
+                wandb.log(masking_metrics, step=step)
+            
+            # Log debug visualization every 100 steps
+            if step % 10 == 0 and step > 0:
+                try:
+                    # Get a fresh batch for visualization by consuming a few samples
+                    # This ensures we don't always get the same first sample
+                    viz_iter = iter(train_loader)
+                    # Skip a random number of samples to get variety
+                    import random
+                    skip_samples = random.randint(0, 5)
+                    for _ in range(skip_samples):
+                        try:
+                            next(viz_iter)
+                        except StopIteration:
+                            viz_iter = iter(train_loader)
+                            break
+                    
+                    viz_batch = next(viz_iter)
+                    if isinstance(viz_batch, tuple) and len(viz_batch) >= 2:
+                        video_frames = viz_batch[0].video_frames
+                        mask = viz_batch[0].mask
+                        
+                        # Get model outputs for visualization
+                        # with torch.no_grad():
+                        #     outputs = state.model.forward(video_frames, mask)
+                        
+                        log_debug_visualization(
+                            video_frames=video_frames,
+                            mask=mask,
+                            # outputs=outputs,
+                            step=step,
+                            prefix="train"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to log debug visualization at step {step}: {e}")
+                # except Exception as e:
+                #     logger.warning(f"Failed to create debug visualization at step {step}: {e}")
             
             # Don't override the current metrics display with averaged ones
             # The current metrics are more useful for real-time monitoring
@@ -651,7 +858,12 @@ def main(config: WorldModelTrainConfig):
                 except (TypeError, ValueError):
                     continue
             
-            wandb.log(avg_val_metrics, step=step)
+            # Use improved validation logging
+            log_training_metrics(
+                step=step,
+                train_loss=None,  # No train loss for validation step
+                val_metrics=avg_val_metrics,
+            )
             logger.info(f"Validation at step {step}: {avg_val_metrics}")
         
         if step % config.save_interval == 0 and step > 0:

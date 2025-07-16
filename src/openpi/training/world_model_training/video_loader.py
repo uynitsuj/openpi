@@ -71,7 +71,7 @@ class VideoFrameLoader:
         video_path = self.get_video_path(episode_idx, camera)
         
         if not os.path.exists(video_path):
-            logger.warning(f"Video file not found: {video_path}")
+            logger.warning(f"Video file not found: {video_path} (episode {episode_idx}, camera {camera})")
             # Return dummy frames
             dummy_frames = []
             for _ in frame_indices:
@@ -82,7 +82,7 @@ class VideoFrameLoader:
         # Open video file
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            logger.warning(f"Could not open video file: {video_path}")
+            logger.warning(f"Could not open video file: {video_path} (episode {episode_idx}, camera {camera})")
             cap.release()
             # Return dummy frames
             dummy_frames = []
@@ -109,9 +109,20 @@ class VideoFrameLoader:
                 # Convert BGR to RGB
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 
-                # Resize frame
+                # Resize frame with proper interpolation
                 if frame.shape[:2] != target_size:
-                    frame = cv2.resize(frame, target_size)
+                    current_h, current_w = frame.shape[:2]
+                    target_h, target_w = target_size
+                    
+                    # Choose interpolation method based on scaling direction
+                    if current_h * current_w < target_h * target_w:
+                        # Upscaling: use cubic interpolation for better quality
+                        interpolation = cv2.INTER_CUBIC
+                    else:
+                        # Downscaling: use area interpolation for better anti-aliasing
+                        interpolation = cv2.INTER_AREA
+                    
+                    frame = cv2.resize(frame, (target_w, target_h), interpolation=interpolation)
                 
                 # Normalize to [0, 1]
                 frame = frame.astype(np.float32) / 255.0

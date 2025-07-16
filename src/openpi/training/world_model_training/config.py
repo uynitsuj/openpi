@@ -27,6 +27,12 @@ class WorldModelTrainConfig:
     project_name: str = "openpi-worldmodel"
     exp_name: str = "debug"
     
+    # Dataloader optimization settings
+    use_optimized_dataloader: bool = True
+    dataloader_cache_size: int = 200
+    dataloader_max_workers: int = 8
+    dataloader_prefetch_factor: int = 4
+    
     model_config: VJEPA2WorldModelConfig = dataclasses.field(
         default_factory=lambda: VJEPA2WorldModelConfig(
             num_frames=8,
@@ -47,7 +53,7 @@ class WorldModelTrainConfig:
             frame_skip=1,
             image_size=(224, 224),
             masking_strategy=MaskingStrategy.MULTI_SCALE,
-            mask_ratio=0.5,
+            mask_ratio=0.75,  # Increased from 0.5 to make task harder
             multi_view_batch_mode=True,
         )
     )
@@ -55,7 +61,7 @@ class WorldModelTrainConfig:
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(
         default_factory=lambda: _optimizer.CosineDecaySchedule(
             warmup_steps=1000,
-            peak_lr=1e-4,
+            peak_lr=1e-5,  # Reduced from 1e-4
             decay_steps=50000,
             decay_lr=1e-6,
         )
@@ -75,7 +81,7 @@ class WorldModelTrainConfig:
     )
     
     seed: int = 42
-    batch_size: int = 16
+    batch_size: int = 8  # Increased for better gradient estimates
     num_workers: int = 2
     num_train_steps: int = 50000
     
@@ -90,7 +96,7 @@ class WorldModelTrainConfig:
     save_interval: int = 1000
     keep_period: Optional[int] = 5000
     
-    checkpoint_base_dir: str = "/home/justinyu/checkpoints"
+    checkpoint_base_dir: str = "/home/yujustin/checkpoints"
     assets_base_dir: str = "./assets"
     
     overwrite: bool = False
@@ -129,63 +135,76 @@ class WorldModelTrainConfig:
 _WORLD_MODEL_CONFIGS = [
 
     WorldModelTrainConfig(
-    name="hummus_vjepa2_world_model",
-        exp_name="hummus_wm_training",
+        name="yam_dishrack_vjepa2_world_model_debug",
+        exp_name="hummus_wm_training_debug",
         model_config=VJEPA2WorldModelConfig(
-            num_frames=10,
+            num_frames=16,  # Match official (16 frames)
+            image_size=224,  # Match official (256px)
+            encoder_hidden_size=768,  
+            predictor_hidden_size=512,  # Half of encoder size
+            encoder_num_layers=16,  # ViT-Large depth
+            predictor_num_layers=8,  # Deeper predictor
+            encoder_num_heads=16,  # ViT-Large heads
+            predictor_num_heads=8,  # Half of encoder heads
+            encoder_stochastic_depth=0.2,  # Match official
+            predictor_stochastic_depth=0.1,  # Lower for predictor
+            momentum=0.996,  # Official EMA momentum
+            use_pretrained_encoder=False,  
+        ),
+        data_config=WorldModelDataConfig(
+            repo_id="uynitsuj/yam_bimanual_load_dishes_full_absolute",
+            num_frames=10,  # Match model config
+            image_size=(224, 224),  # Match model config  
+            masking_strategy=MaskingStrategy.MULTI_SCALE,
+            # mask_ratio=0.85,  # Higher like official (very challenging)
+            frame_skip=3,  # Skip frames for more temporal diversity (every 3rd frame)
+            multi_view_batch_mode=True,  
+            use_progressive_masking=True,  
+        ),
+        batch_size=8,   # Good balance of performance and memory
+        num_workers=8,    # Optimal worker count
+        num_train_steps=30000,  
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2000,  # Longer warmup like official
+            peak_lr=1.5e-4,  # Higher peak LR with larger batch accumulation
+            decay_steps=30000,  
+            decay_lr=1e-6,
+        ),
+    ),
+    
+    # Optimized version of the debug config  
+    WorldModelTrainConfig(
+        name="yam_dishrack_vjepa2_world_model_optimized",
+        exp_name="yam_wm_training_optimized",
+        use_optimized_dataloader=True,
+        dataloader_cache_size=200,      # Good cache size
+        dataloader_max_workers=8,       # More parallel workers
+        dataloader_prefetch_factor=4,   # Better prefetching
+        model_config=VJEPA2WorldModelConfig(
+            num_frames=8,  
             image_size=224,
             encoder_hidden_size=768,
             predictor_hidden_size=384,
             encoder_num_layers=6,
             predictor_num_layers=6,
-            use_pretrained_encoder=False,
-        ),
-        data_config=WorldModelDataConfig(
-            repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned2",
-            num_frames=10,
-            image_size=(224, 224),
-            masking_strategy=MaskingStrategy.MULTI_SCALE,
-            multi_view_batch_mode=True,
-            use_progressive_masking=True,  
-        ),
-        batch_size=32,
-        num_workers=16,
-        num_train_steps=100000,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=2000,
-            peak_lr=1e-4,
-            decay_steps=100000,
-            decay_lr=1e-6,
-        ),
-    ),
-    
-    WorldModelTrainConfig(
-        name="hummus_vjepa2_world_model_debug",
-        exp_name="hummus_wm_training_debug",
-        model_config=VJEPA2WorldModelConfig(
-            num_frames=8,  
-            image_size=224,
-            encoder_hidden_size=768,  # Increased from 288 to 768
-            predictor_hidden_size=384,  # Increased from 144 to 384
-            encoder_num_layers=8,  # Increased from 4 to 6
-            predictor_num_layers=8,  # Increased from 4 to 6
             use_pretrained_encoder=False,  
         ),
         data_config=WorldModelDataConfig(
-            repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned2",
+            repo_id="uynitsuj/yam_bimanual_load_dishes_full_absolute",
             num_frames=8,  
             image_size=(224, 224),
             masking_strategy=MaskingStrategy.MULTI_SCALE,
             multi_view_batch_mode=True,  
-            use_progressive_masking=True,  
+            use_progressive_masking=True,
+            chunk_size=1500,  # Larger chunks for optimized version
         ),
-        batch_size=64,  
-        num_workers=128,  
+        batch_size=8,  
+        num_workers=16,   # Base workers, will be scaled up by optimized loader
         num_train_steps=30000,  
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,  # Increased from 10
-            peak_lr=5e-5,  # Reduced from 1e-4
-            decay_steps=30000,  # Increased from 100
+            warmup_steps=1000,
+            peak_lr=5e-5,
+            decay_steps=30000,
             decay_lr=1e-6,
         ),
     ),
@@ -235,32 +254,32 @@ def create_world_model_config_cli():
     
     parser = argparse.ArgumentParser(description="World Model Training Configuration")
     parser.add_argument(
-        "--config",
+        "--config-name",
         type=str,
         default="hummus_vjepa2_world_model_debug",
         help="Name of the configuration to use",
     )
     parser.add_argument(
-        "--custom_repo_id",
+        "--repo_id",
         type=str,
         help="Custom repository ID to override config",
     )
     parser.add_argument(
-        "--exp_name",
+        "--exp-name",
         type=str,
         help="Custom experiment name to override config",
     )
     
     args = parser.parse_args()
     
-    config = get_world_model_config(args.config)
+    config = get_world_model_config(args.config_name)
     
-    if args.custom_repo_id:
+    if args.repo_id:
         config = dataclasses.replace(
             config,
             data_config=dataclasses.replace(
                 config.data_config,
-                repo_id=args.custom_repo_id,
+                repo_id=args.repo_id,
             )
         )
     

@@ -760,24 +760,38 @@ def main(config: WorldModelTrainConfig):
             
             # Log debug visualization every 100 steps
             if step % 100 == 0 and step > 0:
-                # try:
-                # Get a fresh batch for visualization
-                viz_batch = next(iter(train_loader))
-                if isinstance(viz_batch, tuple) and len(viz_batch) >= 2:
-                    video_frames = viz_batch[0].video_frames
-                    mask = viz_batch[0].mask
+                try:
+                    # Get a fresh batch for visualization by consuming a few samples
+                    # This ensures we don't always get the same first sample
+                    viz_iter = iter(train_loader)
+                    # Skip a random number of samples to get variety
+                    import random
+                    skip_samples = random.randint(0, 5)
+                    for _ in range(skip_samples):
+                        try:
+                            next(viz_iter)
+                        except StopIteration:
+                            viz_iter = iter(train_loader)
+                            break
                     
-                    # Get model outputs for visualization
-                    # with torch.no_grad():
-                    #     outputs = state.model.forward(video_frames, mask)
-                    
-                    log_debug_visualization(
-                        video_frames=video_frames,
-                        mask=mask,
-                        # outputs=outputs,
-                        step=step,
-                        prefix="train"
-                    )
+                    viz_batch = next(viz_iter)
+                    if isinstance(viz_batch, tuple) and len(viz_batch) >= 2:
+                        video_frames = viz_batch[0].video_frames
+                        mask = viz_batch[0].mask
+                        
+                        # Get model outputs for visualization
+                        # with torch.no_grad():
+                        #     outputs = state.model.forward(video_frames, mask)
+                        
+                        log_debug_visualization(
+                            video_frames=video_frames,
+                            mask=mask,
+                            # outputs=outputs,
+                            step=step,
+                            prefix="train"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to log debug visualization at step {step}: {e}")
                 # except Exception as e:
                 #     logger.warning(f"Failed to create debug visualization at step {step}: {e}")
             

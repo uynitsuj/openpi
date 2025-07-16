@@ -123,7 +123,7 @@ def create_video_mask(
     # Create multi-scale mask configuration similar to official VJEPA2
     multi_scale_config = create_multi_scale_mask_config(
         spatial_scale=(0.15, 0.15),      # 15% spatial coverage
-        temporal_scale=(1.0, 1.0),       # Full temporal coverage
+        temporal_scale=(0.1, 0.8),       # Variable temporal coverage (10% to 80% of frames)
         aspect_ratio=(0.75, 1.5),        # Variable aspect ratios
         num_blocks=8,                     # Multiple blocks per sample
         max_temporal_keep=1.0,           # Keep all temporal frames

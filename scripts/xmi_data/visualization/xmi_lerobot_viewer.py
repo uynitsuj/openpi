@@ -23,7 +23,7 @@ from typing import Literal
 import jsonlines
 from openpi.utils.matrix_utils import rot_6d_to_quat
 
-DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/hummus_xmi_full"
+DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/test_soup_can_xmi_subsample_2"
 
 class XMILeRobotViewer:
     def __init__(self, dataset_path: str, action_horizon: int = 15):

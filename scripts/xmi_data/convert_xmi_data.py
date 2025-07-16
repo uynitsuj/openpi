@@ -14,24 +14,20 @@ uv run openpi/scripts/xmi_data/convert_xmi_data_fast.py --push_to_hub
 """
 
 import json
-import multiprocessing
 import os
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from PIL import Image
 from tqdm import tqdm
-from typing import List, Optional, Literal
+from typing import List, Optional
 import numpy as np
 import tyro
 import gc
-import h5py
 import shutil
 import viser.transforms as vtf
 from openpi.utils.xmi_dataloader_utils import load_episode_data, validate_episode_data, validate_array_data, validate_records, validate_images
 from openpi.utils.matrix_utils import *
-from openpi_client.image_tools import resize_with_pad
 
 # Set environment variable for dataset storage
 
@@ -49,38 +45,74 @@ except ImportError:
 class XMIConfig:
     # Input data paths
     raw_dataset_folders: List[str] = field(default_factory=lambda: [
-        "/nfs_us/hummus_xmi_data/pick_place_beverage",
-        "/nfs_us/hummus_xmi_data/pick_place_chips_bag",
-        "/nfs_us/hummus_xmi_data/pick_place_candy_bag",
-        "/nfs_us/hummus_xmi_data/pick_place_cleaning_sponge",
-        "/nfs_us/hummus_xmi_data/pick_place_dish_detergent",
-        "/nfs_us/hummus_xmi_data/pick_place_paper_towel",
-        "/nfs_us/hummus_xmi_data/pick_place_shaving_razor",
-        "/nfs_us/hummus_xmi_data/pick_place_soup_can",
-        "/nfs_us/hummus_xmi_data/pick_place_toothpaste",
-        "/nfs_us/hummus_xmi_data/pick_place_yoghurt",
-        "/home/justinyu/Downloads/20250630",
-        "/home/justinyu/Downloads/data_20250708",
+        # "/nfs_us/hummus_xmi_data/pick_place_beverage",
+        # "/nfs_us/hummus_xmi_data/pick_place_chips_bag",
+        # "/nfs_us/hummus_xmi_data/pick_place_candy_bag",
+        # "/nfs_us/hummus_xmi_data/pick_place_cleaning_sponge",
+        # "/nfs_us/hummus_xmi_data/pick_place_dish_detergent",
+        # "/nfs_us/hummus_xmi_data/pick_place_paper_towel",
+        # "/nfs_us/hummus_xmi_data/pick_place_shaving_razor",
+        # "/nfs_us/hummus_xmi_data/pick_place_soup_can",
+        # "/nfs_us/hummus_xmi_data/pick_place_toothpaste",
+        # "/nfs_us/hummus_xmi_data/pick_place_yoghurt",
+        # "/home/justinyu/Downloads/20250630",
+        # "/home/justinyu/Downloads/data_20250708",
+        "/nfs_us/data/us_xmi_01/20250714",
+        "/nfs_us/data/us_xmi_01/20250715",
+        "/nfs_us/data/oreo_xmi/clean_whiteboard",
+        "/nfs_us/data/oreo_xmi/fold_napkin_place_utensils_inside_and_roll_it_up",
+        "/nfs_us/data/oreo_xmi/folding_skirt_pile_and_stacking",
+        "/nfs_us/data/oreo_xmi/folding_trousers_pile_and_stacking",
+        "/nfs_us/data/oreo_xmi/folding_tshirt_pile_and_stacking",
+        "/nfs_us/data/oreo_xmi/insert_the_plug",
+        "/nfs_us/data/oreo_xmi/packing_luggage",
+        "/nfs_us/data/oreo_xmi/painting_nails",
+        "/nfs_us/data/oreo_xmi/place_fake_bread",
+        "/nfs_us/data/oreo_xmi/place_trousers_on_hanger",
+        "/nfs_us/data/oreo_xmi/place_tshirt_on_hanger",
+        "/nfs_us/data/oreo_xmi/put_pillow_into_pillowcase",
+        "/nfs_us/data/oreo_xmi/serve_a_lunch_box",
+        "/nfs_us/data/oreo_xmi/sorting_stationery_into_containers",
+        "/nfs_us/data/oreo_xmi/untangling_cables",
+        "/nfs_us/data/oreo_xmi/zip_up_a_jacket",
     ])
     
     # Language instructions corresponding to each dataset folder (ANNOTATION OVERRIDES)
     language_instructions: List[str] = field(default_factory=lambda: [
-        "pick up the beverage and place it in the bin",
-        "pick up the chips bag and place it in the bin",
-        "pick up the candy bag and place it in the bin",
-        "pick up the cleaning sponge and place it in the bin",
-        "pick up the dish detergent and place it in the bin",
-        "pick up the paper towel and place it in the bin",
-        "pick up the shaving razor and place it in the bin",
+        # "pick up the beverage and place it in the bin",
+        # "pick up the chips bag and place it in the bin",
+        # "pick up the candy bag and place it in the bin",
+        # "pick up the cleaning sponge and place it in the bin",
+        # "pick up the dish detergent and place it in the bin",
+        # "pick up the paper towel and place it in the bin",
+        # "pick up the shaving razor and place it in the bin",
+        # "pick up the soup can and place it in the bin",
+        # "pick up the toothpaste and place it in the bin",
+        # "pick up the yoghurt and place it in the bin",
+        # "place the coffee cup on the dish",
+        # "place the coffee cup on the dish"
         "pick up the soup can and place it in the bin",
-        "pick up the toothpaste and place it in the bin",
-        "pick up the yoghurt and place it in the bin",
-        "place the coffee cup on the dish",
-        "place the coffee cup on the dish"
+        "pick up the soup can and place it in the bin",
+        "clean the whiteboard with the eraser",
+        "place the utensils inside the napkin and roll it up",
+        "fold the skirt and stack it in a neat pile",
+        "fold the trousers and stack it in a neat pile",
+        "fold the tshirt and stack it in a neat pile",
+        "insert the plug into the socket",
+        "pack the luggage",
+        "paint the nails",
+        "place the bread on the plate",
+        "place the trousers on the hanger",
+        "place the tshirt on the hanger",
+        "put the pillow into the pillowcase",
+        "serve the lunch box",
+        "sort the stationery into the containers",
+        "untangle the cables and put them in the bin",
+        "zip up the jacket",
     ])
     
     # Repository name for output dataset
-    repo_name: str = "uynitsuj/hummus_xmi_full_subsample_2_cleaned2"
+    repo_name: str = "uynitsuj/oreo_xmi_subsample_2"
     
     # Camera settings
     camera_keys: List[str] = field(default_factory=lambda: [
@@ -104,7 +136,7 @@ class XMIConfig:
     fps: int = 30 # Framerate of original video
     temporal_subsample_factor: int = 2 # Subsample every N frames (1 = no subsampling)
     chunk_size: int = 1000
-    max_workers: int = 10
+    max_workers: int = 8
     max_episodes: Optional[int] = None
     skip_videos: bool = False
     first_frame_head_reorient: bool = False
@@ -651,7 +683,7 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
         rby1_base_frame_wxyz = vtf.SO3.from_rpy_radians(0.0, 0.0, head_z_axis_angle).wxyz
         # print(f"Head z axis angle: {head_z_axis_angle}")
     else:
-        # Default to the direction of left gripper z axis (worried that world frame proprio input messing up normalization statistics)
+        # Default to the direction of left gripper z axis (worried that randomly oriented world frame proprio input could mess up normalization statistics)
         # Make the current hand z axis point toward world negative x axis
 
         left_hand_matrix = action_data["action-left-hand_in_quest_world_frame"][0]
@@ -906,30 +938,28 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     return states, actions
 
 
-def process_episode_in_chunks(episode_data: dict, cfg: XMIConfig, max_chunk_frames: int = 1000, episode_path: Path = None, episode_idx: int = None) -> tuple[list, dict]:
+def process_episode_in_chunks(episode_data: dict, cfg: XMIConfig, max_chunk_frames: int = 1000, episode_path: Path = None, episode_idx: int = None) -> list:
     """Process episode data in memory-efficient chunks to handle long episodes."""
     
     # Process XMI transforms first
     states, actions = process_xmi_transforms(episode_data, cfg, episode_path, episode_idx)
     if states is None or actions is None:
-        return [], {}
+        return []
     
     original_total_length = len(states)
     if original_total_length <= 0:
-        return [], {}
+        return []
     
     # Calculate global subsampling indices for consistency
     if cfg.temporal_subsample_factor > 1:
         global_subsample_indices = list(range(0, original_total_length, cfg.temporal_subsample_factor))
         states = states[global_subsample_indices]
         actions = actions[global_subsample_indices]
-        # print(f"Applied temporal subsampling factor {cfg.temporal_subsample_factor}: {len(states)} frames after subsampling")
     else:
         global_subsample_indices = list(range(original_total_length))
     
     total_length = len(states)
     all_records = []
-    all_image_data = {}
     
     # Process in chunks to avoid OOM
     for chunk_start in range(0, total_length, max_chunk_frames):
@@ -939,50 +969,6 @@ def process_episode_in_chunks(episode_data: dict, cfg: XMIConfig, max_chunk_fram
         # Process joint data for this chunk
         chunk_states = states[chunk_start:chunk_end]
         chunk_actions = actions[chunk_start:chunk_end]
-        
-        # Process images for this chunk if not skipping videos
-        chunk_image_data = {}
-        if not cfg.skip_videos and 'images' in episode_data:
-            for cam_key in cfg.camera_keys:
-                if cam_key in episode_data['images']:
-                    available_images = episode_data['images'][cam_key]
-                    
-                    # Get the corresponding original image indices for this chunk
-                    chunk_global_indices = global_subsample_indices[chunk_start:chunk_end]
-                    
-                    # Extract images at the exact same indices as the subsampled states/actions
-                    images = []
-                    for orig_idx in chunk_global_indices:
-                        if orig_idx < len(available_images):
-                            images.append(available_images[orig_idx])
-                    
-                    if images:
-                        # VALIDATION: Check images before processing
-                        is_valid, error_msg = validate_images(images, cam_key)
-                        if not is_valid:
-                            print(f"❌ Image validation failed for {cam_key}: {error_msg}")
-                            if episode_path is not None:
-                                move_problematic_episode(episode_path, f"Image validation failed for {cam_key}: {error_msg}", cfg, episode_idx)
-                            return [], {}  # Return empty to skip episode
-                        
-                        # Resize images for this chunk
-                        resized_images = []
-                        for img in images:
-                            if isinstance(img, np.ndarray):
-                                # Handle stereo images for top camera
-                                if "top" in cam_key:
-                                    # Take half width left of the image since it's stereo appended
-                                    img = img[:, :img.shape[1]//2, :]
-                                
-                                resized_img = resize_with_pad(img, cfg.resize_size, cfg.resize_size)
-                                resized_images.append(convert_to_uint8(resized_img))
-                        
-                        if cam_key not in all_image_data:
-                            all_image_data[cam_key] = []
-                        all_image_data[cam_key].extend(resized_images)
-                        
-                        # Clear chunk data to free memory
-                        del resized_images
         
         # Create records for this chunk
         for step in range(chunk_length):
@@ -1010,9 +996,9 @@ def process_episode_in_chunks(episode_data: dict, cfg: XMIConfig, max_chunk_fram
         print(f"❌ Records validation failed: {error_msg}")
         if episode_path is not None:
             move_problematic_episode(episode_path, f"Records validation failed: {error_msg}", cfg, episode_idx)
-        return [], {}
+        return []
     
-    return all_records, all_image_data
+    return all_records
 
 
 def compute_basic_episode_stats(episode_idx: int, episode_info: dict, cfg: XMIConfig, base_dir: Path) -> dict:
@@ -1146,14 +1132,14 @@ def write_episode_metadata_immediately(episode_data: dict, tasks: list[str], bas
 
 def process_xmi_episode(
     idx: int, episode_path: Path, language_instruction: str, cfg: XMIConfig, episode_base: Path,
-    base_dir: Path, encoder_name: str = None, encoding_quality: str = 'fast'
+    base_dir: Path
 ):
     """Process a single XMI episode and save it directly to LeRobot format."""
     
     # print(f"Processing episode {idx}: {episode_path.name}")
     
     # Load episode data
-    episode_data = load_episode_data(episode_path)
+    episode_data = load_episode_data(episode_path, cfg, base_dir, idx)
     if not episode_data:
         print(f"  ❌ Failed to load episode {idx}")
         move_problematic_episode(episode_path, "Failed to load episode data", cfg, idx)
@@ -1161,7 +1147,7 @@ def process_xmi_episode(
     
     # Process episode in memory-efficient chunks
     try:
-        records, image_data = process_episode_in_chunks(episode_data, cfg, max_chunk_frames=cfg.max_frames_per_chunk, episode_path=episode_path, episode_idx=idx)
+        records = process_episode_in_chunks(episode_data, cfg, max_chunk_frames=cfg.max_frames_per_chunk, episode_path=episode_path, episode_idx=idx)
         if not records:
             print(f"  ❌ No valid data in episode {idx}")
             # Episode already moved by process_episode_in_chunks if it was a validation failure
@@ -1200,32 +1186,32 @@ def process_xmi_episode(
         return None
     
     # Save videos if not skipping
-    if not cfg.skip_videos and image_data:
-        chunk_id = idx // cfg.chunk_size
-        for cam_key in cfg.camera_keys:
-            if cam_key in image_data and cam_key in cfg.camera_key_mapping:
-                video_dir = base_dir / "videos" / f"chunk-{chunk_id:03d}" / cam_key
-                video_dir.mkdir(parents=True, exist_ok=True)
-                save_path = video_dir / f"episode_{idx:06d}.mp4"
+    # if not cfg.skip_videos and image_data:
+    #     chunk_id = idx // cfg.chunk_size
+    #     for cam_key in cfg.camera_keys:
+    #         if cam_key in image_data and cam_key in cfg.camera_key_mapping:
+    #             video_dir = base_dir / "videos" / f"chunk-{chunk_id:03d}" / cam_key
+    #             video_dir.mkdir(parents=True, exist_ok=True)
+    #             save_path = video_dir / f"episode_{idx:06d}.mp4"
                 
-                frames = image_data[cam_key]
-                if frames:
-                    # VALIDATION: Final check on video frames
-                    is_valid, error_msg = validate_images(frames, cam_key)
-                    if not is_valid:
-                        print(f"  ⚠️  Video validation failed for {cam_key} in episode {idx}: {error_msg}")
-                        move_problematic_episode(episode_path, f"Video validation failed for {cam_key} in episode {idx}: {error_msg}", cfg, idx)
-                        continue
+    #             frames = image_data[cam_key]
+    #             if frames:
+    #                 # VALIDATION: Final check on video frames
+    #                 is_valid, error_msg = validate_images(frames, cam_key)
+    #                 if not is_valid:
+    #                     print(f"  ⚠️  Video validation failed for {cam_key} in episode {idx}: {error_msg}")
+    #                     move_problematic_episode(episode_path, f"Video validation failed for {cam_key} in episode {idx}: {error_msg}", cfg, idx)
+    #                     continue
                     
-                    # print(f"  Encoding video {cam_key}: {len(frames)} frames")
-                    try:
-                        if encoder_name:
-                            encode_video_optimized(frames, save_path, cfg.fps, cfg.temporal_subsample_factor, encoder_name, encoding_quality)
-                        else:
-                            encode_video_simple(frames, save_path, cfg.fps, cfg.temporal_subsample_factor)
-                    except Exception as e:
-                        print(f"  ⚠️  Video encoding failed for {cam_key} in episode {idx}: {e}")
-                        move_problematic_episode(episode_path, f"Video encoding failed for {cam_key} in episode {idx}: {e}", cfg, idx)
+    #                 # print(f"  Encoding video {cam_key}: {len(frames)} frames")
+    #                 try:
+    #                     if encoder_name:
+    #                         encode_video_optimized(frames, save_path, cfg.fps, cfg.temporal_subsample_factor, encoder_name, encoding_quality)
+    #                     else:
+    #                         encode_video_simple(frames, save_path, cfg.fps, cfg.temporal_subsample_factor)
+    #                 except Exception as e:
+    #                     print(f"  ⚠️  Video encoding failed for {cam_key} in episode {idx}: {e}")
+    #                     move_problematic_episode(episode_path, f"Video encoding failed for {cam_key} in episode {idx}: {e}", cfg, idx)
     
     # Compute and write episode stats immediately
     episode_stats = compute_basic_episode_stats(idx, {"length": seq_length}, cfg, base_dir)
@@ -1246,7 +1232,7 @@ def process_xmi_episode(
     episode_metadata["task_index"] = task_index
     
     # Clean up memory
-    del episode_data, records, image_data
+    del episode_data, records
     gc.collect()
     
     # print(f"  ✅ Completed episode {idx}: {seq_length} frames, task '{language_instruction}'")
@@ -1535,46 +1521,6 @@ def main(cfg: XMIConfig):
     for i in range(num_chunks):
         (episode_base / f"chunk-{i:03d}").mkdir(parents=True, exist_ok=True)
     
-    # Select best encoder for video encoding
-    best_encoder = None
-    encoding_quality = cfg.encoding_quality
-    
-    if not cfg.skip_videos:
-        print(f"\n=== Video Encoder Setup ===")
-        if cfg.encoder_name:
-            best_encoder = cfg.encoder_name
-            print(f"Using forced encoder: {best_encoder}")
-        else:
-            # Auto-detect best encoder
-            if cfg.benchmark_encoders and len(episode_dirs) > 0:
-                print("Loading first episode for encoder benchmarking...")
-                # Load first episode to get sample frames for benchmarking
-                first_episode_data = load_episode_data(episode_dirs[0])
-                if first_episode_data and 'images' in first_episode_data:
-                    sample_frames = []
-                    for cam_key in cfg.camera_keys:
-                        if cam_key in first_episode_data['images']:
-                            images = first_episode_data['images'][cam_key][:10]  # First 10 frames
-                            for img in images:
-                                if isinstance(img, np.ndarray):
-                                    # Handle stereo images for top camera
-                                    if "top" in cam_key:
-                                        img = img[:, :img.shape[1]//2, :]
-                                    resized_img = resize_with_pad(img, cfg.resize_size, cfg.resize_size)
-                                    sample_frames.append(convert_to_uint8(resized_img))
-                            break  # Use first available camera for benchmarking
-                    
-                    if sample_frames:
-                        best_encoder, encoding_quality = select_best_encoder(sample_frames, cfg.fps, cfg.temporal_subsample_factor)
-                    else:
-                        best_encoder, encoding_quality = select_best_encoder()
-                else:
-                    best_encoder, encoding_quality = select_best_encoder()
-            else:
-                best_encoder, encoding_quality = select_best_encoder()
-        
-        print(f"Using encoder: {best_encoder} with {encoding_quality} quality")
-    
     # Process episodes
     all_episodes = []
     
@@ -1608,9 +1554,7 @@ def main(cfg: XMIConfig):
                         language_instruction,
                         cfg,
                         episode_base / f"chunk-{chunk_id:03d}",
-                        base_dir,
-                        best_encoder,
-                        encoding_quality
+                        base_dir
                     )
                 )
             
@@ -1629,9 +1573,7 @@ def main(cfg: XMIConfig):
                 language_instruction,
                 cfg,
                 episode_base / f"chunk-{chunk_id:03d}",
-                base_dir,
-                best_encoder,
-                encoding_quality
+                base_dir
             )
             if result is not None:
                 all_episodes.append(result)

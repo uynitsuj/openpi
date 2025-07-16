@@ -6,17 +6,109 @@ import torch
 import numpy as np
 import wandb
 import matplotlib.pyplot as plt
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, Union
 import logging
 
 logger = logging.getLogger("openpi")
+
+# Compatibility functions for JAX/PyTorch interop
+def safe_detach(tensor):
+    """Safely detach tensor, handling both PyTorch and JAX arrays."""
+    if hasattr(tensor, 'detach'):
+        return tensor.detach()
+    elif hasattr(tensor, '__array__'):
+        # JAX array - already detached by nature
+        return tensor
+    else:
+        return tensor
+
+def safe_float(tensor):
+    """Safely convert to float, handling both PyTorch and JAX arrays."""
+    if hasattr(tensor, 'float'):
+        return tensor.float()
+    elif hasattr(tensor, 'astype'):
+        # JAX array
+        import jax.numpy as jnp
+        return tensor.astype(jnp.float32)
+    else:
+        return tensor
+
+def safe_cpu(tensor):
+    """Safely move to CPU, handling both PyTorch and JAX arrays."""
+    if hasattr(tensor, 'cpu'):
+        return tensor.cpu()
+    else:
+        # JAX arrays are already on CPU by default
+        return tensor
+
+def safe_numpy(tensor):
+    """Safely convert to numpy, handling both PyTorch and JAX arrays."""
+    if hasattr(tensor, 'detach'):
+        # PyTorch tensor
+        return tensor.detach().cpu().numpy()
+    elif hasattr(tensor, '__array__'):
+        # JAX array
+        return np.array(tensor)
+    else:
+        return np.array(tensor)
+
+def safe_mean(tensor):
+    """Safely compute mean, handling both PyTorch and JAX arrays."""
+    if hasattr(tensor, 'mean'):
+        return tensor.mean()
+    else:
+        import jax.numpy as jnp
+        return jnp.mean(tensor)
+
+def safe_sum(tensor):
+    """Safely compute sum, handling both PyTorch and JAX arrays."""
+    if hasattr(tensor, 'sum'):
+        return tensor.sum()
+    else:
+        import jax.numpy as jnp
+        return jnp.sum(tensor)
+
+def safe_item(tensor):
+    """Safely extract scalar value, handling both PyTorch and JAX arrays."""
+    if hasattr(tensor, 'item'):
+        return tensor.item()
+    else:
+        # JAX array
+        return float(tensor)
+
+def denormalize_minus_one_to_one(tensor):
+    """
+    Denormalize images from [-1, 1] range back to [0, 1] range.
+    
+    This matches the normalization used in the data loader:
+    - Original: [0, 1] (after dividing by 255)
+    - Normalized: image * 2.0 - 1.0 → [-1, 1]
+    - Denormalized: (image + 1.0) / 2.0 → [0, 1]
+    
+    Args:
+        tensor: Normalized tensor in [-1, 1] range
+        
+    Returns:
+        Denormalized tensor in [0, 1] range
+    """
+    # Convert to numpy if needed
+    if not isinstance(tensor, np.ndarray):
+        tensor = safe_numpy(tensor)
+    
+    # Denormalize: x = (x_normalized + 1.0) / 2.0
+    denormalized = (tensor + 1.0) / 2.0
+    
+    # Clip to [0, 1] range to handle any numerical errors
+    denormalized = np.clip(denormalized, 0, 1)
+    
+    return denormalized
 
 
 def create_mask_visualization(
     video_frames: torch.Tensor,
     mask: torch.Tensor,
-    predicted_features: Optional[torch.Tensor] = None,
-    max_frames_to_show: int = 4,
+    # predicted_features: Optional[torch.Tensor] = None,
+    max_frames_to_show: int = 10,
     max_batch_items: int = 2,
 ) -> wandb.Image:
     """
@@ -39,51 +131,89 @@ def create_mask_visualization(
         B = min(B, max_batch_items)
         T = min(T, max_frames_to_show)
         
-        # Convert to numpy and normalize to [0, 1]
-        frames = video_frames[:B, :T].detach().cpu().numpy()
-        if frames.max() <= 1.0:
-            frames = np.clip(frames, 0, 1)
-        else:
-            frames = np.clip(frames / 255.0, 0, 1)
+        # Convert to numpy and denormalize from [-1, 1] to [0, 1] range
+        frames = denormalize_minus_one_to_one(video_frames[:B, :T])
+        # Frames should already be in [0, 1] range after denormalization
+        frames = np.clip(frames, 0, 1)
         
-        # Create figure
-        fig, axes = plt.subplots(B, T * 2, figsize=(T * 4, B * 2))
-        if B == 1:
+        # Calculate grid layout - 8 elements per row (4 original + 4 masked frames)
+        frames_per_row = 4  # 4 pairs of (original, masked) per row
+        total_pairs = T  # Total number of frame pairs
+        
+        # Calculate rows needed for each batch
+        rows_per_batch = (total_pairs + frames_per_row - 1) // frames_per_row
+        total_rows = B * rows_per_batch
+        
+        # Create figure with dynamic size
+        fig, axes = plt.subplots(total_rows, frames_per_row * 2, figsize=(frames_per_row * 4, total_rows * 2))
+        
+        # Ensure axes is always 2D
+        if total_rows == 1:
             axes = axes.reshape(1, -1)
-        if T == 1:
-            axes = axes.reshape(B, 2)
+        elif frames_per_row * 2 == 1:
+            axes = axes.reshape(-1, 1)
+        
+        # Handle single subplot case
+        if not hasattr(axes, 'shape'):
+            axes = np.array([[axes]])
+        elif len(axes.shape) == 1:
+            if total_rows == 1:
+                axes = axes.reshape(1, -1)
+            else:
+                axes = axes.reshape(-1, 1)
+        
+        # Turn off all axes first
+        for i in range(total_rows):
+            for j in range(frames_per_row * 2):
+                axes[i, j].axis('off')
             
         for b in range(B):
             for t in range(T):
+                # Calculate which row and column this frame should go in
+                row_in_batch = t // frames_per_row
+                col_in_row = t % frames_per_row
+                
+                # Calculate absolute row position
+                abs_row = b * rows_per_batch + row_in_batch
+                
                 # Original frame
-                ax_orig = axes[b, t * 2]
+                ax_orig = axes[abs_row, col_in_row * 2]
                 ax_orig.imshow(frames[b, t])
-                ax_orig.set_title(f"Batch {b}, Frame {t}")
+                ax_orig.set_title(f"Batch {b}, Frame {t}", fontsize=8)
                 ax_orig.axis('off')
                 
                 # Masked frame
-                ax_masked = axes[b, t * 2 + 1]
+                ax_masked = axes[abs_row, col_in_row * 2 + 1]
                 masked_frame = frames[b, t].copy()
                 
-                # Apply mask visualization (simplified - assumes patch-based masking)
+                # Apply mask visualization (spatiotemporal masking)
                 if mask is not None and len(mask.shape) >= 2:
-                    # Convert patch mask to spatial mask (simplified)
+                    # Convert spatiotemporal patch mask to spatial mask for this time step
                     patch_size = 16  # Assume 16x16 patches
                     patches_per_dim = H // patch_size
+                    temporal_patch_size = 2  # Assume temporal patch size of 2
                     
-                    if mask.shape[1] >= patches_per_dim ** 2:
-                        mask_2d = mask[b].detach().cpu().numpy()
-                        for i in range(patches_per_dim):
-                            for j in range(patches_per_dim):
-                                patch_idx = i * patches_per_dim + j
-                                if patch_idx < len(mask_2d) and mask_2d[patch_idx]:
-                                    # Mask this patch (make it gray)
-                                    y_start, y_end = i * patch_size, (i + 1) * patch_size
-                                    x_start, x_end = j * patch_size, (j + 1) * patch_size
-                                    masked_frame[y_start:y_end, x_start:x_end] = 0.5
+                    # Calculate temporal patch index for this frame
+                    temporal_patch_idx = t // temporal_patch_size
+                    
+                    # Get the full mask for this batch item
+                    full_mask = safe_numpy(mask[b])
+                    
+                    # Extract mask for this time step
+                    for i in range(patches_per_dim):
+                        for j in range(patches_per_dim):
+                            # Calculate the 3D patch index (t, h, w)
+                            # The mask is flattened as: t * (H_patches * W_patches) + h * W_patches + w
+                            patch_3d_idx = temporal_patch_idx * (patches_per_dim * patches_per_dim) + i * patches_per_dim + j
+                            
+                            if patch_3d_idx < len(full_mask) and full_mask[patch_3d_idx]:
+                                # Mask this patch (make it gray)
+                                y_start, y_end = i * patch_size, (i + 1) * patch_size
+                                x_start, x_end = j * patch_size, (j + 1) * patch_size
+                                masked_frame[y_start:y_end, x_start:x_end] = 0.5
                 
                 ax_masked.imshow(masked_frame)
-                ax_masked.set_title(f"Masked Frame {t}")
+                ax_masked.set_title(f"Masked Frame {t}", fontsize=8)
                 ax_masked.axis('off')
         
         plt.tight_layout()
@@ -182,7 +312,7 @@ def log_model_info(
 def log_debug_visualization(
     video_frames: torch.Tensor,
     mask: torch.Tensor,
-    outputs: Dict[str, torch.Tensor],
+    # outputs: Dict[str, torch.Tensor],
     step: int,
     prefix: str = "debug",
 ) -> None:
@@ -201,14 +331,16 @@ def log_debug_visualization(
         viz_image = create_mask_visualization(
             video_frames=video_frames,
             mask=mask,
-            predicted_features=outputs.get('predicted_features')
+            # predicted_features=outputs.get('predicted_features'),
+            max_frames_to_show=10,
+            max_batch_items=2
         )
         
         # Log to wandb
         wandb.log({
             f"{prefix}/mask_visualization": viz_image,
-            f"{prefix}/mask_ratio": mask.float().mean().item() if mask is not None else 0.0,
-            f"{prefix}/num_masked_patches": mask.sum().item() if mask is not None else 0,
+            f"{prefix}/mask_ratio": safe_item(safe_mean(safe_float(mask))) if mask is not None else 0.0,
+            f"{prefix}/num_masked_patches": safe_item(safe_sum(mask)) if mask is not None else 0,
         }, step=step)
         
         logger.info(f"Debug visualization logged at step {step}")

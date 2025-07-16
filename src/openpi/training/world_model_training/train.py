@@ -760,26 +760,26 @@ def main(config: WorldModelTrainConfig):
             
             # Log debug visualization every 100 steps
             if step % 100 == 0 and step > 0:
-                try:
-                    # Get a fresh batch for visualization
-                    viz_batch = next(iter(train_loader))
-                    if isinstance(viz_batch, tuple) and len(viz_batch) >= 2:
-                        video_frames = viz_batch[0].video_frames
-                        mask = viz_batch[0].mask
-                        
-                        # Get model outputs for visualization
-                        with torch.no_grad():
-                            outputs = state.model.forward(video_frames, mask)
-                        
-                        log_debug_visualization(
-                            video_frames=video_frames,
-                            mask=mask,
-                            outputs=outputs,
-                            step=step,
-                            prefix="train"
-                        )
-                except Exception as e:
-                    logger.warning(f"Failed to create debug visualization at step {step}: {e}")
+                # try:
+                # Get a fresh batch for visualization
+                viz_batch = next(iter(train_loader))
+                if isinstance(viz_batch, tuple) and len(viz_batch) >= 2:
+                    video_frames = viz_batch[0].video_frames
+                    mask = viz_batch[0].mask
+                    
+                    # Get model outputs for visualization
+                    # with torch.no_grad():
+                    #     outputs = state.model.forward(video_frames, mask)
+                    
+                    log_debug_visualization(
+                        video_frames=video_frames,
+                        mask=mask,
+                        # outputs=outputs,
+                        step=step,
+                        prefix="train"
+                    )
+                # except Exception as e:
+                #     logger.warning(f"Failed to create debug visualization at step {step}: {e}")
             
             # Don't override the current metrics display with averaged ones
             # The current metrics are more useful for real-time monitoring

@@ -71,7 +71,7 @@ class VideoFrameLoader:
         video_path = self.get_video_path(episode_idx, camera)
         
         if not os.path.exists(video_path):
-            logger.warning(f"Video file not found: {video_path}")
+            logger.warning(f"Video file not found: {video_path} (episode {episode_idx}, camera {camera})")
             # Return dummy frames
             dummy_frames = []
             for _ in frame_indices:
@@ -82,7 +82,7 @@ class VideoFrameLoader:
         # Open video file
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            logger.warning(f"Could not open video file: {video_path}")
+            logger.warning(f"Could not open video file: {video_path} (episode {episode_idx}, camera {camera})")
             cap.release()
             # Return dummy frames
             dummy_frames = []

@@ -5,6 +5,17 @@ This script provides the training infrastructure for world models, specifically
 adapted for VJEPA-2 style video understanding and prediction tasks.
 """
 
+# Set multiprocessing start method immediately to avoid JAX fork warnings
+import multiprocessing
+import os
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
+
+# Set PyTorch CUDA memory allocation for better memory management
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 import dataclasses
 import functools
 import logging
@@ -32,6 +43,14 @@ from openpi.training.world_model_training.data_loader import create_world_model_
 from openpi.training import sharding
 
 logger = logging.getLogger("openpi")
+
+try:
+    from openpi.training.world_model_training.optimized_data_loader import create_optimized_world_model_data_loader
+    OPTIMIZED_DATALOADER_AVAILABLE = True
+    logger.info("Optimized dataloader available")
+except ImportError as e:
+    OPTIMIZED_DATALOADER_AVAILABLE = False
+    logger.warning(f"Optimized dataloader not available, using original: {e}")
 
 # Check for matplotlib availability
 try:
@@ -212,6 +231,12 @@ def init_train_state(config: WorldModelTrainConfig, init_rng: jax.Array) -> Worl
     
     model = create_vjepa2_model(config.model_config)
     
+    # Move model to GPU if available
+    import torch
+    if torch.cuda.is_available():
+        model = model.cuda()
+        logger.info("Model moved to GPU")
+    
     tx = _optimizer.create_optimizer(
         config.optimizer,
         config.lr_schedule,
@@ -282,7 +307,10 @@ def compute_loss(
     import torch
     
     def jax_to_torch(arr):
-        return torch.from_numpy(np.array(arr)).float()
+        tensor = torch.from_numpy(np.array(arr)).float()
+        if torch.cuda.is_available():
+            tensor = tensor.cuda()
+        return tensor
     
     def update_model_params(model, jax_params):
         for name, param in model.named_parameters():
@@ -318,7 +346,10 @@ def train_step(
     import torch
     
     def jax_to_torch(arr):
-        return torch.from_numpy(np.array(arr)).float()
+        tensor = torch.from_numpy(np.array(arr)).float()
+        if torch.cuda.is_available():
+            tensor = tensor.cuda()
+        return tensor
     
     def update_model_params(model, jax_params):
         for name, param in model.named_parameters():
@@ -426,7 +457,10 @@ def validation_step(
     import torch
     
     def jax_to_torch(arr):
-        return torch.from_numpy(np.array(arr)).float()
+        tensor = torch.from_numpy(np.array(arr)).float()
+        if torch.cuda.is_available():
+            tensor = tensor.cuda()
+        return tensor
     
     def update_model_params(model, jax_params):
         for name, param in model.named_parameters():
@@ -486,11 +520,114 @@ def save_checkpoint(
     logger.info(f"Saved checkpoint at step {step} to {checkpoint_dir}")
 
 
+def create_data_loader_with_fallback(
+    data_config,
+    batch_size: int,
+    split: str,
+    shuffle: bool,
+    num_workers: int,
+    fake_data: bool,
+    current_step: int,
+    chunk_size: int,
+    use_optimized: bool = True,
+    train_config: WorldModelTrainConfig = None,
+):
+    """Create dataloader with fallback to original if optimized fails."""
+    
+    # Try optimized dataloader first if available and requested
+    if use_optimized and OPTIMIZED_DATALOADER_AVAILABLE:
+        try:
+            logger.info(f"Creating optimized dataloader for {split} split...")
+            
+            # Use config optimization parameters or calculate defaults
+            if train_config:
+                cache_size = getattr(train_config, 'dataloader_cache_size', max(100, batch_size * 4))
+                max_workers = getattr(train_config, 'dataloader_max_workers', min(2, num_workers // 4))
+                prefetch_factor = getattr(train_config, 'dataloader_prefetch_factor', 4)
+            else:
+                cache_size = max(100, batch_size * 4)  # Dynamic cache size
+                max_workers = min(2, num_workers // 4)  # Parallel loading workers
+                prefetch_factor = 4  # Enhanced prefetching
+            
+            # Disable DataLoader multiprocessing to avoid pickle errors with spawn
+            optimized_num_workers = 0  # Use single-threaded DataLoader
+            
+            # Adjust prefetch_factor for single-threaded mode
+            actual_prefetch_factor = prefetch_factor if optimized_num_workers > 0 else None
+            
+            loader = create_optimized_world_model_data_loader(
+                config=data_config,
+                batch_size=batch_size,
+                split=split,
+                shuffle=shuffle,
+                num_workers=optimized_num_workers,
+                chunk_size=chunk_size,
+                cache_size=cache_size,
+                max_workers=max_workers,
+                prefetch_factor=actual_prefetch_factor,
+                pin_memory=False,  # Disable for stability
+            )
+            
+            logger.info(f"✅ Successfully created optimized {split} dataloader "
+                       f"(workers: {optimized_num_workers}, cache: {cache_size}, "
+                       f"parallel_workers: {max_workers})")
+            
+            return loader
+            
+        except Exception as e:
+            logger.warning(f"Failed to create optimized dataloader for {split}: {e}")
+            logger.info("Falling back to original dataloader...")
+    
+    # Fallback to original dataloader
+    logger.info(f"Creating original dataloader for {split} split...")
+    loader = create_world_model_data_loader(
+        data_config,
+        batch_size=batch_size,
+        split=split,
+        shuffle=shuffle,
+        num_workers=min(num_workers, 8),  # Match optimized worker count
+        fake_data=fake_data,
+        current_step=current_step,
+        chunk_size=chunk_size,
+    )
+    
+    logger.info(f"✅ Successfully created original {split} dataloader")
+    return loader
+
+
 def main(config: WorldModelTrainConfig):
     """Main training loop."""
     init_logging()
     logger.info(f"Starting world model training on {platform.node()}")
     logger.info(f"Configuration: {config.name}")
+    
+    # Re-enable optimized dataloader
+    use_optimized = getattr(config, 'use_optimized_dataloader', True)
+    if not use_optimized:
+        logger.info("Optimized dataloader disabled by config")
+    else:
+        logger.info("Using optimized dataloader")
+    
+    # Multiprocessing start method already set at module import
+    
+    # Initialize JAX (will use GPU if available)
+    logger.info("Initializing JAX...")
+    import jax
+    import jax.numpy as jnp
+    
+    # Check JAX GPU availability
+    logger.info(f"JAX devices: {jax.devices()}")
+    logger.info(f"JAX default backend: {jax.default_backend()}")
+    
+    # Force GPU usage if available
+    if jax.devices('gpu'):
+        logger.info("GPU detected, forcing JAX to use GPU")
+        # Test GPU with a simple operation
+        test_array = jnp.ones((1000, 1000))
+        test_result = jnp.sum(test_array)
+        logger.info(f"GPU test successful: {test_result}")
+    else:
+        logger.warning("No GPU detected by JAX - running on CPU")
     
     rng = jax.random.PRNGKey(config.seed)
     train_rng, init_rng, data_rng = jax.random.split(rng, 3)
@@ -498,26 +635,31 @@ def main(config: WorldModelTrainConfig):
     state = init_train_state(config, init_rng)
     logger.info(f"Initialized model with {sum(jnp.size(x) for x in jax.tree_leaves(state.params)):,} parameters")
     
-    train_loader = create_world_model_data_loader(
-        config.data_config,
+    # Create data loaders with fallback
+    train_loader = create_data_loader_with_fallback(
+        data_config=config.data_config,
         batch_size=config.batch_size,
         split="train",
         shuffle=True,
         num_workers=config.num_workers,
         fake_data=(config.data_config.repo_id is None),
         current_step=state.step,
-        chunk_size=config.data_config.chunk_size,
+        chunk_size=getattr(config.data_config, 'chunk_size', 500),
+        use_optimized=use_optimized,
+        train_config=config,
     )
     
-    val_loader = create_world_model_data_loader(
-        config.data_config,
+    val_loader = create_data_loader_with_fallback(
+        data_config=config.data_config,
         batch_size=config.batch_size,
-        split="validation",
+        split="validation", 
         shuffle=False,
         num_workers=config.num_workers,
         fake_data=(config.data_config.repo_id is None),
         current_step=state.step,
-        chunk_size=config.data_config.chunk_size,
+        chunk_size=getattr(config.data_config, 'chunk_size', 500),
+        use_optimized=use_optimized,
+        train_config=config,
     )
     
     init_wandb(config, resuming=config.resume)
@@ -563,7 +705,11 @@ def main(config: WorldModelTrainConfig):
                 )
             )
         
-        train_loader.update_step(step)
+        # Update step if the loader supports it
+        if hasattr(train_loader, 'update_step'):
+            train_loader.update_step(step)
+        elif hasattr(train_loader, 'dataset') and hasattr(train_loader.dataset, 'update_step'):
+            train_loader.dataset.update_step(step)
         
         step_rng = jax.random.fold_in(train_rng, step)
         state, metrics = train_step(state, batch, step_rng)

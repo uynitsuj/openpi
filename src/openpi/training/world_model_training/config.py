@@ -27,6 +27,12 @@ class WorldModelTrainConfig:
     project_name: str = "openpi-worldmodel"
     exp_name: str = "debug"
     
+    # Dataloader optimization settings
+    use_optimized_dataloader: bool = True
+    dataloader_cache_size: int = 200
+    dataloader_max_workers: int = 8
+    dataloader_prefetch_factor: int = 4
+    
     model_config: VJEPA2WorldModelConfig = dataclasses.field(
         default_factory=lambda: VJEPA2WorldModelConfig(
             num_frames=8,
@@ -75,7 +81,7 @@ class WorldModelTrainConfig:
     )
     
     seed: int = 42
-    batch_size: int = 16
+    batch_size: int = 4  # Reduced for RTX 4090 memory constraints
     num_workers: int = 2
     num_train_steps: int = 50000
     
@@ -130,7 +136,7 @@ _WORLD_MODEL_CONFIGS = [
 
     WorldModelTrainConfig(
     name="hummus_vjepa2_world_model",
-        exp_name="hummus_wm_training",
+        exp_name="hummus_wm_training_optimized",
         model_config=VJEPA2WorldModelConfig(
             num_frames=10,
             image_size=224,
@@ -146,10 +152,11 @@ _WORLD_MODEL_CONFIGS = [
             image_size=(224, 224),
             masking_strategy=MaskingStrategy.MULTI_SCALE,
             multi_view_batch_mode=True,
-            use_progressive_masking=True,  
+            use_progressive_masking=True,
+            chunk_size=1000,  # Increased chunk size for better performance
         ),
-        batch_size=32,
-        num_workers=16,
+        batch_size=4,
+        num_workers=32,  # Increased for optimized dataloader
         num_train_steps=100000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=2000,
@@ -179,13 +186,50 @@ _WORLD_MODEL_CONFIGS = [
             multi_view_batch_mode=True,  
             use_progressive_masking=True,  
         ),
-        batch_size=64,  
-        num_workers=128,  
+        batch_size=4,   # Good balance of performance and memory
+        num_workers=8,    # Optimal worker count
         num_train_steps=30000,  
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,  # Increased from 10
             peak_lr=5e-5,  # Reduced from 1e-4
             decay_steps=30000,  # Increased from 100
+            decay_lr=1e-6,
+        ),
+    ),
+    
+    # Optimized version of the debug config  
+    WorldModelTrainConfig(
+        name="yam_dishrack_vjepa2_world_model_optimized",
+        exp_name="yam_wm_training_optimized",
+        use_optimized_dataloader=True,
+        dataloader_cache_size=200,      # Good cache size
+        dataloader_max_workers=8,       # More parallel workers
+        dataloader_prefetch_factor=4,   # Better prefetching
+        model_config=VJEPA2WorldModelConfig(
+            num_frames=8,  
+            image_size=224,
+            encoder_hidden_size=768,
+            predictor_hidden_size=384,
+            encoder_num_layers=6,
+            predictor_num_layers=6,
+            use_pretrained_encoder=False,  
+        ),
+        data_config=WorldModelDataConfig(
+            repo_id="uynitsuj/yam_bimanual_load_dishes_full_absolute",
+            num_frames=8,  
+            image_size=(224, 224),
+            masking_strategy=MaskingStrategy.MULTI_SCALE,
+            multi_view_batch_mode=True,  
+            use_progressive_masking=True,
+            chunk_size=1500,  # Larger chunks for optimized version
+        ),
+        batch_size=4,  
+        num_workers=16,   # Base workers, will be scaled up by optimized loader
+        num_train_steps=30000,  
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=5e-5,
+            decay_steps=30000,
             decay_lr=1e-6,
         ),
     ),

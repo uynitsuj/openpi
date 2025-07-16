@@ -109,6 +109,8 @@ class VideoTransformerEncoder(nn.Module):
             self.vit_config.attention_probs_dropout_prob = dropout
             
             self.vit_model = ViTModel(self.vit_config)
+            # Enable gradient checkpointing to save memory
+            self.vit_model.gradient_checkpointing_enable()
         else:
             # Create ViT from scratch
             self.vit_config = ViTConfig(
@@ -123,6 +125,8 @@ class VideoTransformerEncoder(nn.Module):
                 attention_probs_dropout_prob=dropout,
             )
             self.vit_model = ViTModel(self.vit_config)
+            # Enable gradient checkpointing to save memory
+            self.vit_model.gradient_checkpointing_enable()
         
         # Temporal positional embeddings
         self.temporal_pos_embedding = nn.Parameter(

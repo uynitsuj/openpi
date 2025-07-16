@@ -53,7 +53,7 @@ class WorldModelTrainConfig:
             frame_skip=1,
             image_size=(224, 224),
             masking_strategy=MaskingStrategy.MULTI_SCALE,
-            mask_ratio=0.5,
+            mask_ratio=0.75,  # Increased from 0.5 to make task harder
             multi_view_batch_mode=True,
         )
     )
@@ -61,7 +61,7 @@ class WorldModelTrainConfig:
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(
         default_factory=lambda: _optimizer.CosineDecaySchedule(
             warmup_steps=1000,
-            peak_lr=1e-4,
+            peak_lr=1e-5,  # Reduced from 1e-4
             decay_steps=50000,
             decay_lr=1e-6,
         )
@@ -81,7 +81,7 @@ class WorldModelTrainConfig:
     )
     
     seed: int = 42
-    batch_size: int = 4  # Reduced for RTX 4090 memory constraints
+    batch_size: int = 8  # Increased for better gradient estimates
     num_workers: int = 2
     num_train_steps: int = 50000
     
@@ -155,12 +155,12 @@ _WORLD_MODEL_CONFIGS = [
             use_progressive_masking=True,
             chunk_size=1000,  # Increased chunk size for better performance
         ),
-        batch_size=4,
+        batch_size=8,
         num_workers=32,  # Increased for optimized dataloader
         num_train_steps=100000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=2000,
-            peak_lr=1e-4,
+            peak_lr=1e-5,  # Reduced from 1e-4
             decay_steps=100000,
             decay_lr=1e-6,
         ),
@@ -172,10 +172,10 @@ _WORLD_MODEL_CONFIGS = [
         model_config=VJEPA2WorldModelConfig(
             num_frames=8,  
             image_size=224,
-            encoder_hidden_size=768,  # Increased from 288 to 768
-            predictor_hidden_size=384,  # Increased from 144 to 384
-            encoder_num_layers=6,  # Increased from 4 to 6
-            predictor_num_layers=6,  # Increased from 4 to 6
+            encoder_hidden_size=1024,  # Increased from 288 to 768
+            predictor_hidden_size=512,  # Increased from 144 to 384
+            encoder_num_layers=12,  # Increased from 4 to 6
+            predictor_num_layers=12,  # Increased from 4 to 6
             use_pretrained_encoder=False,  
         ),
         data_config=WorldModelDataConfig(
@@ -186,7 +186,7 @@ _WORLD_MODEL_CONFIGS = [
             multi_view_batch_mode=True,  
             use_progressive_masking=True,  
         ),
-        batch_size=4,   # Good balance of performance and memory
+        batch_size=8,   # Good balance of performance and memory
         num_workers=8,    # Optimal worker count
         num_train_steps=30000,  
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -223,7 +223,7 @@ _WORLD_MODEL_CONFIGS = [
             use_progressive_masking=True,
             chunk_size=1500,  # Larger chunks for optimized version
         ),
-        batch_size=4,  
+        batch_size=8,  
         num_workers=16,   # Base workers, will be scaled up by optimized loader
         num_train_steps=30000,  
         lr_schedule=_optimizer.CosineDecaySchedule(

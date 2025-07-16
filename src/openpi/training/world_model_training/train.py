@@ -371,7 +371,7 @@ def train_step(
     if not hasattr(state, 'torch_optimizer'):
         state.torch_optimizer = torch.optim.AdamW(
             state.model.parameters(),
-            lr=1e-4,
+            lr=1e-5,  # Reduced from 1e-4 to slow down learning
             weight_decay=0.01,
             betas=(0.9, 0.999),
             eps=1e-8,

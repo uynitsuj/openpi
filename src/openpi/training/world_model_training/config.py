@@ -90,7 +90,7 @@ class WorldModelTrainConfig:
     save_interval: int = 1000
     keep_period: Optional[int] = 5000
     
-    checkpoint_base_dir: str = "/home/justinyu/checkpoints"
+    checkpoint_base_dir: str = "/home/yujustin/checkpoints"
     assets_base_dir: str = "./assets"
     
     overwrite: bool = False
@@ -160,19 +160,19 @@ _WORLD_MODEL_CONFIGS = [
     ),
     
     WorldModelTrainConfig(
-        name="hummus_vjepa2_world_model_debug",
+        name="yam_dishrack_vjepa2_world_model_debug",
         exp_name="hummus_wm_training_debug",
         model_config=VJEPA2WorldModelConfig(
             num_frames=8,  
             image_size=224,
             encoder_hidden_size=768,  # Increased from 288 to 768
             predictor_hidden_size=384,  # Increased from 144 to 384
-            encoder_num_layers=8,  # Increased from 4 to 6
-            predictor_num_layers=8,  # Increased from 4 to 6
+            encoder_num_layers=6,  # Increased from 4 to 6
+            predictor_num_layers=6,  # Increased from 4 to 6
             use_pretrained_encoder=False,  
         ),
         data_config=WorldModelDataConfig(
-            repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned2",
+            repo_id="uynitsuj/yam_bimanual_load_dishes_full_absolute",
             num_frames=8,  
             image_size=(224, 224),
             masking_strategy=MaskingStrategy.MULTI_SCALE,
@@ -235,32 +235,32 @@ def create_world_model_config_cli():
     
     parser = argparse.ArgumentParser(description="World Model Training Configuration")
     parser.add_argument(
-        "--config",
+        "--config-name",
         type=str,
         default="hummus_vjepa2_world_model_debug",
         help="Name of the configuration to use",
     )
     parser.add_argument(
-        "--custom_repo_id",
+        "--repo_id",
         type=str,
         help="Custom repository ID to override config",
     )
     parser.add_argument(
-        "--exp_name",
+        "--exp-name",
         type=str,
         help="Custom experiment name to override config",
     )
     
     args = parser.parse_args()
     
-    config = get_world_model_config(args.config)
+    config = get_world_model_config(args.config_name)
     
-    if args.custom_repo_id:
+    if args.repo_id:
         config = dataclasses.replace(
             config,
             data_config=dataclasses.replace(
                 config.data_config,
-                repo_id=args.custom_repo_id,
+                repo_id=args.repo_id,
             )
         )
     

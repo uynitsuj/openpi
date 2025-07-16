@@ -27,6 +27,7 @@ from .video_loader import VideoFrameLoader
 
 logger = logging.getLogger("openpi")
 
+from lerobot.common.constants import HF_LEROBOT_HOME
 
 class ProgressiveMaskingSchedule:
     """Progressive masking schedule similar to official VJEPA2."""
@@ -198,7 +199,12 @@ class WorldModelDataset(Dataset):
         self.dataset = self._load_dataset()
         
         # Initialize video frame loader for direct MP4 access
-        dataset_cache_path = os.path.expanduser("~/.cache/huggingface/lerobot/uynitsuj/hummus_xmi_full_subsample_2_cleaned2")
+        # Use dynamic cache path based on repo_id instead of hardcoded path
+        if self.config.repo_id is None:
+            raise ValueError("repo_id must be specified for world model training")
+        
+        dataset_name = self.config.repo_id
+        dataset_cache_path = os.path.expanduser(f"{HF_LEROBOT_HOME}/{dataset_name}")
         self.video_loader = VideoFrameLoader(dataset_cache_path)
         
         # Calculate total number of episodes and sequences

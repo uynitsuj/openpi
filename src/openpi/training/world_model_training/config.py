@@ -135,54 +135,28 @@ class WorldModelTrainConfig:
 _WORLD_MODEL_CONFIGS = [
 
     WorldModelTrainConfig(
-    name="hummus_vjepa2_world_model",
-        exp_name="hummus_wm_training_optimized",
-        model_config=VJEPA2WorldModelConfig(
-            num_frames=10,
-            image_size=224,
-            encoder_hidden_size=768,
-            predictor_hidden_size=384,
-            encoder_num_layers=6,
-            predictor_num_layers=6,
-            use_pretrained_encoder=False,
-        ),
-        data_config=WorldModelDataConfig(
-            repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned2",
-            num_frames=10,
-            image_size=(224, 224),
-            masking_strategy=MaskingStrategy.MULTI_SCALE,
-            multi_view_batch_mode=True,
-            use_progressive_masking=True,
-            chunk_size=1000,  # Increased chunk size for better performance
-        ),
-        batch_size=8,
-        num_workers=32,  # Increased for optimized dataloader
-        num_train_steps=100000,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=2000,
-            peak_lr=1e-5,  # Reduced from 1e-4
-            decay_steps=100000,
-            decay_lr=1e-6,
-        ),
-    ),
-    
-    WorldModelTrainConfig(
         name="yam_dishrack_vjepa2_world_model_debug",
         exp_name="hummus_wm_training_debug",
         model_config=VJEPA2WorldModelConfig(
-            num_frames=8,  
-            image_size=224,
-            encoder_hidden_size=1024,  # Increased from 288 to 768
-            predictor_hidden_size=512,  # Increased from 144 to 384
-            encoder_num_layers=12,  # Increased from 4 to 6
-            predictor_num_layers=12,  # Increased from 4 to 6
+            num_frames=16,  # Match official (16 frames)
+            image_size=224,  # Match official (256px)
+            encoder_hidden_size=768,  
+            predictor_hidden_size=512,  # Half of encoder size
+            encoder_num_layers=16,  # ViT-Large depth
+            predictor_num_layers=8,  # Deeper predictor
+            encoder_num_heads=16,  # ViT-Large heads
+            predictor_num_heads=8,  # Half of encoder heads
+            encoder_stochastic_depth=0.2,  # Match official
+            predictor_stochastic_depth=0.1,  # Lower for predictor
+            momentum=0.996,  # Official EMA momentum
             use_pretrained_encoder=False,  
         ),
         data_config=WorldModelDataConfig(
             repo_id="uynitsuj/yam_bimanual_load_dishes_full_absolute",
-            num_frames=8,  
-            image_size=(224, 224),
+            num_frames=10,  # Match model config
+            image_size=(224, 224),  # Match model config  
             masking_strategy=MaskingStrategy.MULTI_SCALE,
+            mask_ratio=0.85,  # Higher like official (very challenging)
             multi_view_batch_mode=True,  
             use_progressive_masking=True,  
         ),
@@ -190,9 +164,9 @@ _WORLD_MODEL_CONFIGS = [
         num_workers=8,    # Optimal worker count
         num_train_steps=30000,  
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1000,  # Increased from 10
-            peak_lr=5e-5,  # Reduced from 1e-4
-            decay_steps=30000,  # Increased from 100
+            warmup_steps=2000,  # Longer warmup like official
+            peak_lr=1.5e-4,  # Higher peak LR with larger batch accumulation
+            decay_steps=30000,  
             decay_lr=1e-6,
         ),
     ),

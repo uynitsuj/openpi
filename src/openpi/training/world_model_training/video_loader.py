@@ -109,9 +109,20 @@ class VideoFrameLoader:
                 # Convert BGR to RGB
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 
-                # Resize frame
+                # Resize frame with proper interpolation
                 if frame.shape[:2] != target_size:
-                    frame = cv2.resize(frame, target_size)
+                    current_h, current_w = frame.shape[:2]
+                    target_h, target_w = target_size
+                    
+                    # Choose interpolation method based on scaling direction
+                    if current_h * current_w < target_h * target_w:
+                        # Upscaling: use cubic interpolation for better quality
+                        interpolation = cv2.INTER_CUBIC
+                    else:
+                        # Downscaling: use area interpolation for better anti-aliasing
+                        interpolation = cv2.INTER_AREA
+                    
+                    frame = cv2.resize(frame, (target_w, target_h), interpolation=interpolation)
                 
                 # Normalize to [0, 1]
                 frame = frame.astype(np.float32) / 255.0

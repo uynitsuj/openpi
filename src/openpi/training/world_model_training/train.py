@@ -40,6 +40,7 @@ from openpi.training import optimizer as _optimizer
 from openpi.training import checkpoints as _checkpoints
 from openpi.training.world_model_training.config import WorldModelTrainConfig
 from openpi.training.world_model_training.data_loader import create_world_model_data_loader
+from openpi.training.world_model_training.wandb_utils import log_training_metrics, log_model_info, log_debug_visualization
 from openpi.training import sharding
 
 logger = logging.getLogger("openpi")
@@ -535,64 +536,64 @@ def create_data_loader_with_fallback(
     """Create dataloader with fallback to original if optimized fails."""
     
     # Try optimized dataloader first if available and requested
-    if use_optimized and OPTIMIZED_DATALOADER_AVAILABLE:
-        try:
-            logger.info(f"Creating optimized dataloader for {split} split...")
-            
-            # Use config optimization parameters or calculate defaults
-            if train_config:
-                cache_size = getattr(train_config, 'dataloader_cache_size', max(100, batch_size * 4))
-                max_workers = getattr(train_config, 'dataloader_max_workers', min(2, num_workers // 4))
-                prefetch_factor = getattr(train_config, 'dataloader_prefetch_factor', 4)
-            else:
-                cache_size = max(100, batch_size * 4)  # Dynamic cache size
-                max_workers = min(2, num_workers // 4)  # Parallel loading workers
-                prefetch_factor = 4  # Enhanced prefetching
-            
-            # Disable DataLoader multiprocessing to avoid pickle errors with spawn
-            optimized_num_workers = 0  # Use single-threaded DataLoader
-            
-            # Adjust prefetch_factor for single-threaded mode
-            actual_prefetch_factor = prefetch_factor if optimized_num_workers > 0 else None
-            
-            loader = create_optimized_world_model_data_loader(
-                config=data_config,
-                batch_size=batch_size,
-                split=split,
-                shuffle=shuffle,
-                num_workers=optimized_num_workers,
-                chunk_size=chunk_size,
-                cache_size=cache_size,
-                max_workers=max_workers,
-                prefetch_factor=actual_prefetch_factor,
-                pin_memory=False,  # Disable for stability
-            )
-            
-            logger.info(f"✅ Successfully created optimized {split} dataloader "
-                       f"(workers: {optimized_num_workers}, cache: {cache_size}, "
-                       f"parallel_workers: {max_workers})")
-            
-            return loader
-            
-        except Exception as e:
-            logger.warning(f"Failed to create optimized dataloader for {split}: {e}")
-            logger.info("Falling back to original dataloader...")
+    # if use_optimized and OPTIMIZED_DATALOADER_AVAILABLE:
+    #     try:
+    logger.info(f"Creating optimized dataloader for {split} split...")
     
-    # Fallback to original dataloader
-    logger.info(f"Creating original dataloader for {split} split...")
+    # Use config optimization parameters or calculate defaults
+    if train_config:
+        cache_size = getattr(train_config, 'dataloader_cache_size', max(100, batch_size * 4))
+        max_workers = getattr(train_config, 'dataloader_max_workers', min(2, num_workers // 4))
+        prefetch_factor = getattr(train_config, 'dataloader_prefetch_factor', 4)
+    else:
+        cache_size = max(100, batch_size * 4)  # Dynamic cache size
+        max_workers = min(2, num_workers // 4)  # Parallel loading workers
+        prefetch_factor = 4  # Enhanced prefetching
+    
+    # Disable DataLoader multiprocessing to avoid pickle errors with spawn
+    optimized_num_workers = 0  # Use single-threaded DataLoader
+    
+    # Adjust prefetch_factor for single-threaded mode
+    actual_prefetch_factor = prefetch_factor if optimized_num_workers > 0 else None
+    
     loader = create_world_model_data_loader(
-        data_config,
+        config=data_config,
         batch_size=batch_size,
         split=split,
         shuffle=shuffle,
-        num_workers=min(num_workers, 8),  # Match optimized worker count
-        fake_data=fake_data,
-        current_step=current_step,
+        num_workers=optimized_num_workers,
         chunk_size=chunk_size,
+        cache_size=cache_size,
+        max_workers=max_workers,
+        prefetch_factor=actual_prefetch_factor,
+        pin_memory=False,  # Disable for stability
     )
     
-    logger.info(f"✅ Successfully created original {split} dataloader")
+    logger.info(f"✅ Successfully created optimized {split} dataloader "
+                f"(workers: {optimized_num_workers}, cache: {cache_size}, "
+                f"parallel_workers: {max_workers})")
+    
     return loader
+    
+    # except Exception as e:
+    #     logger.warning(f"Failed to create optimized dataloader for {split}: {e}")
+        # logger.info("Falling back to original dataloader...")
+    
+    # Fallback to original dataloader
+    # logger.info(f"Creating original dataloader for {split} split...")
+    # loader = create_world_model_data_loader(
+    #     data_config,
+    #     batch_size=batch_size,
+    #     split=split,
+    #     shuffle=shuffle,
+    #     num_workers=min(num_workers, 8),  # Match optimized worker count
+    #     # fake_data=fake_data,
+    #     current_step=current_step,
+    #     chunk_size=chunk_size,
+    # )
+    
+    # logger.info(f"✅ Successfully created original {split} dataloader")
+    # return loader
 
 
 def main(config: WorldModelTrainConfig):
@@ -601,12 +602,9 @@ def main(config: WorldModelTrainConfig):
     logger.info(f"Starting world model training on {platform.node()}")
     logger.info(f"Configuration: {config.name}")
     
-    # Re-enable optimized dataloader
-    use_optimized = getattr(config, 'use_optimized_dataloader', True)
-    if not use_optimized:
-        logger.info("Optimized dataloader disabled by config")
-    else:
-        logger.info("Using optimized dataloader")
+    # Always use optimized dataloader (superior performance)
+    use_optimized = True
+    logger.info("Using optimized dataloader with smart image resizing")
     
     # Multiprocessing start method already set at module import
     
@@ -663,6 +661,9 @@ def main(config: WorldModelTrainConfig):
     )
     
     init_wandb(config, resuming=config.resume)
+    
+    # Log model architecture info to wandb
+    log_model_info(state.model, state.model.config if hasattr(state.model, 'config') else config.model_config)
     
     config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
@@ -748,7 +749,37 @@ def main(config: WorldModelTrainConfig):
                 except (TypeError, ValueError):
                     continue
             
-            wandb.log(avg_metrics, step=step)
+            # Use improved wandb logging with better organization
+            log_training_metrics(
+                step=step,
+                train_loss=avg_metrics.get('reconstruction_loss', 0.0),
+                learning_rate=getattr(state.torch_optimizer.param_groups[0], 'lr', None) if hasattr(state, 'torch_optimizer') else None,
+                grad_norm=avg_metrics.get('grad_norm', 0.0),
+                momentum=getattr(state.model.config, 'momentum', None) if hasattr(state.model, 'config') else None,
+            )
+            
+            # Log debug visualization every 100 steps
+            if step % 100 == 0 and step > 0:
+                try:
+                    # Get a fresh batch for visualization
+                    viz_batch = next(iter(train_loader))
+                    if isinstance(viz_batch, tuple) and len(viz_batch) >= 2:
+                        video_frames = viz_batch[0].video_frames
+                        mask = viz_batch[0].mask
+                        
+                        # Get model outputs for visualization
+                        with torch.no_grad():
+                            outputs = state.model.forward(video_frames, mask)
+                        
+                        log_debug_visualization(
+                            video_frames=video_frames,
+                            mask=mask,
+                            outputs=outputs,
+                            step=step,
+                            prefix="train"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to create debug visualization at step {step}: {e}")
             
             # Don't override the current metrics display with averaged ones
             # The current metrics are more useful for real-time monitoring
@@ -797,7 +828,12 @@ def main(config: WorldModelTrainConfig):
                 except (TypeError, ValueError):
                     continue
             
-            wandb.log(avg_val_metrics, step=step)
+            # Use improved validation logging
+            log_training_metrics(
+                step=step,
+                train_loss=None,  # No train loss for validation step
+                val_metrics=avg_val_metrics,
+            )
             logger.info(f"Validation at step {step}: {avg_val_metrics}")
         
         if step % config.save_interval == 0 and step > 0:

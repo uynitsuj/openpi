@@ -156,7 +156,8 @@ _WORLD_MODEL_CONFIGS = [
             num_frames=10,  # Match model config
             image_size=(224, 224),  # Match model config  
             masking_strategy=MaskingStrategy.MULTI_SCALE,
-            mask_ratio=0.85,  # Higher like official (very challenging)
+            # mask_ratio=0.85,  # Higher like official (very challenging)
+            frame_skip=2,
             multi_view_batch_mode=True,  
             use_progressive_masking=True,  
         ),

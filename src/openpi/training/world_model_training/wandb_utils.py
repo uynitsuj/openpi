@@ -179,7 +179,9 @@ def create_mask_visualization(
                 # Original frame
                 ax_orig = axes[abs_row, col_in_row * 2]
                 ax_orig.imshow(frames[b, t])
-                ax_orig.set_title(f"Batch {b}, Frame {t}", fontsize=8)
+                # Add a hash of the frame to help identify if samples are changing
+                frame_hash = hash(frames[b, t].tobytes()) % 10000
+                ax_orig.set_title(f"Batch {b}, Frame {t} ({frame_hash})", fontsize=8)
                 ax_orig.axis('off')
                 
                 # Masked frame

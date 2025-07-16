@@ -41,29 +41,29 @@ class ProgressiveMaskingSchedule:
     def __init__(self, total_steps: int = 50000):
         self.total_steps = total_steps
         
-        # Default schedule based on official VJEPA2
+        # Progressive masking schedule: 25% → 50% → 75%
         self.schedule = {
-            # Phase 1: Initial training (0-30% of steps)
+            # Phase 1: Easy training (0-33% of steps) - 25% masking
             'phase1': {
                 'start_step': 0,
-                'end_step': int(0.3 * total_steps),
-                'mask_ratio': 0.5,
+                'end_step': int(0.33 * total_steps),
+                'mask_ratio': 0.25,
                 'block_size': 4,
                 'num_masked_patches': None,  # Use mask_ratio percentage
             },
-            # Phase 2: Progressive difficulty (30-70% of steps)
+            # Phase 2: Medium difficulty (33-66% of steps) - 50% masking
             'phase2': {
-                'start_step': int(0.3 * total_steps),
-                'end_step': int(0.7 * total_steps),
-                'mask_ratio': 0.75,
+                'start_step': int(0.33 * total_steps),
+                'end_step': int(0.66 * total_steps),
+                'mask_ratio': 0.50,
                 'block_size': 8,
                 'num_masked_patches': None,  # Use mask_ratio percentage
             },
-            # Phase 3: High difficulty (70-100% of steps)
+            # Phase 3: Hard difficulty (66-100% of steps) - 75% masking
             'phase3': {
-                'start_step': int(0.7 * total_steps),
+                'start_step': int(0.66 * total_steps),
                 'end_step': total_steps,
-                'mask_ratio': 0.9,
+                'mask_ratio': 0.75,
                 'block_size': 16,
                 'num_masked_patches': None,  # Use mask_ratio percentage
             }

@@ -34,7 +34,8 @@ import tqdm_loggable.auto as tqdm
 import wandb
 
 from openpi.models.world_model import WorldModelInput, WorldModelOutput
-from openpi.models.vjepa2_world_model import VJEPA2WorldModel, create_vjepa2_model
+from openpi.models.vjepa2_world_model import VJEPA2WorldModel, create_vjepa2_model, VJEPA2WorldModelConfig
+from openpi.models.siglip_vjepa2_world_model import SigLIPVJEPA2WorldModel, create_siglip_vjepa2_model, SigLIPVJEPA2WorldModelConfig
 from openpi.shared import array_typing as at
 from openpi.training import optimizer as _optimizer
 from openpi.training import checkpoints as _checkpoints
@@ -230,13 +231,29 @@ def init_train_state(config: WorldModelTrainConfig, init_rng: jax.Array) -> Worl
     """Initialize the training state."""
     logger.info("Initializing world model...")
     
-    model = create_vjepa2_model(config.model_config)
+    # Create model based on config type
+    if isinstance(config.model_config, SigLIPVJEPA2WorldModelConfig):
+        # Use smaller SigLIP model
+        config.model_config.siglip_model_name = "google/siglip-base-patch16-224"
+        model = create_siglip_vjepa2_model(config.model_config)
+        logger.info("Created SigLIP V-JEPA2 world model using smaller base model")
+    elif isinstance(config.model_config, VJEPA2WorldModelConfig):
+        model = create_vjepa2_model(config.model_config)
+        logger.info("Created standard V-JEPA2 world model")
+    else:
+        raise ValueError(f"Unsupported model config type: {type(config.model_config)}")
     
-    # Move model to GPU if available
-    import torch
-    if torch.cuda.is_available():
-        model = model.cuda()
-        logger.info("Model moved to GPU")
+    # JAX models automatically use available GPU devices
+    logger.info("Model initialized (JAX will use available GPU devices automatically)")
+    
+    # Memory optimization settings
+    jax.config.update('jax_enable_x64', False)  # Use 32-bit precision
+    jax.config.update('jax_debug_nans', False)  # Disable NaN checking
+    jax.config.update('jax_disable_jit', False)  # Ensure JIT is enabled
+    
+    # Clear any existing compilations
+    if hasattr(jax, 'clear_caches'):
+        jax.clear_caches()
     
     tx = _optimizer.create_optimizer(
         config.optimizer,
@@ -244,31 +261,47 @@ def init_train_state(config: WorldModelTrainConfig, init_rng: jax.Array) -> Worl
         weight_decay_mask=None,
     )
     
-    dummy_input = WorldModelInput(
-        video_frames=jnp.zeros((
+    # Initialize JAX/Flax model properly
+    if isinstance(config.model_config, SigLIPVJEPA2WorldModelConfig):
+        # For SigLIP model, create dummy video input
+        dummy_video = jnp.zeros((
             config.batch_size,
-            config.data_config.num_frames,
-            config.data_config.image_size[0],
-            config.data_config.image_size[1] * len(config.data_config.image_keys),
-            3
-        )),
-        mask=jnp.zeros((
-            config.batch_size,
-            config.data_config.num_frames,
-            config.data_config.image_size[0] // 16,
-            config.data_config.image_size[1] * len(config.data_config.image_keys) // 16,
-        ), dtype=bool),
-        camera_names=list(config.data_config.image_keys),
-    )
-    
-    import torch
-    
-    torch_params = dict(model.named_parameters())
-    
-    def torch_to_jax(tensor):
-        return jnp.array(tensor.detach().cpu().numpy())
-    
-    params = {name: torch_to_jax(param) for name, param in torch_params.items()}
+            config.model_config.num_frames,
+            config.model_config.image_size,
+            config.model_config.image_size,
+            config.model_config.num_channels
+        ))
+        
+        # Initialize model parameters
+        model_rng, init_rng = jax.random.split(init_rng)
+        params = model.init(model_rng, dummy_video, train=True)
+        
+    else:
+        # For standard VJEPA2 model, use existing initialization
+        dummy_input = WorldModelInput(
+            video_frames=jnp.zeros((
+                config.batch_size,
+                config.data_config.num_frames,
+                config.data_config.image_size[0],
+                config.data_config.image_size[1] * len(config.data_config.image_keys),
+                3
+            )),
+            mask=jnp.zeros((
+                config.batch_size,
+                config.data_config.num_frames,
+                config.data_config.image_size[0] // 16,
+                config.data_config.image_size[1] * len(config.data_config.image_keys) // 16,
+            ), dtype=bool),
+            camera_names=list(config.data_config.image_keys),
+        )
+        
+        import torch
+        torch_params = dict(model.named_parameters())
+        
+        def torch_to_jax(tensor):
+            return jnp.array(tensor.detach().cpu().numpy())
+        
+        params = {name: torch_to_jax(param) for name, param in torch_params.items()}
     
     opt_state = tx.init(params)
     
@@ -337,6 +370,106 @@ def compute_loss(
     return total_loss_jax, metrics
 
 
+def train_step_jax(
+    state: WorldModelTrainState,
+    batch_iter,
+    config,
+    step: int,
+) -> Tuple[WorldModelTrainState, dict]:
+    """Execute a JAX training step."""
+    
+    # Memory cleanup
+    if hasattr(jax, 'clear_caches'):
+        jax.clear_caches()
+    
+    # Get accumulation steps from config or default to 1
+    grad_accum_steps = getattr(config.optim, 'grad_accum_steps', 1)
+    
+    # Initialize accumulated gradients
+    accumulated_grads = None
+    total_loss = 0.0
+    total_mask_ratio = 0.0
+    
+    for i in range(grad_accum_steps):
+        # Get batch
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            batch_iter = iter(batch_iter.dataset)
+            batch = next(batch_iter)
+        
+        # Extract video frames from batch tuple
+        world_model_input, world_model_output = batch
+        video_frames = jnp.asarray(world_model_input.video_frames)
+        
+        # Create mask if not provided
+        from openpi.models.siglip_vjepa2_world_model import create_video_mask
+        mask_tensor = create_video_mask(
+            video_frames.shape,
+            patch_size=(config.model_config.patch_size, config.model_config.patch_size),
+            temporal_patch_size=config.model_config.temporal_patch_size,
+            mask_ratio=0.75,
+        )
+        
+        # Convert mask to JAX array
+        if hasattr(mask_tensor, 'numpy'):  # If it's a PyTorch tensor
+            mask = jnp.array(mask_tensor.detach().cpu().numpy())
+        elif hasattr(mask_tensor, 'astype'):  # If it's already a JAX array
+            mask = mask_tensor
+        else:  # If it's a numpy array
+            mask = jnp.array(mask_tensor)
+        
+        # Define loss function
+        def loss_fn(params):
+            outputs = state.model.apply(params, video_frames, mask, train=True)
+            predicted = outputs['predicted_features']
+            target = outputs['target_features']
+            # V-JEPA2 loss
+            loss = jnp.mean(jnp.abs(predicted - target) ** config.model_config.loss_exp) / config.model_config.loss_exp
+            return loss / grad_accum_steps  # Scale loss for accumulation
+        
+        # Compute gradients
+        loss_val, grads = jax.value_and_grad(loss_fn)(state.params)
+        
+        # Accumulate gradients
+        if accumulated_grads is None:
+            accumulated_grads = grads
+        else:
+            accumulated_grads = jax.tree_util.tree_map(lambda x, y: x + y, accumulated_grads, grads)
+        
+        total_loss += loss_val
+        total_mask_ratio += jnp.mean(mask)  # mask is already float32 JAX array
+        
+        # Clear intermediate values
+        del grads, loss_val, video_frames, mask, mask_tensor
+        if hasattr(jax, 'clear_caches'):
+            jax.clear_caches()
+    
+    # Apply accumulated gradients
+    updates, new_opt_state = state.tx.update(accumulated_grads, state.optimizer, state.params)
+    new_params = optax.apply_updates(state.params, updates)
+    
+    # Update state
+    new_state = state.replace(
+        step=step + 1,
+        params=new_params,
+        optimizer=new_opt_state,
+    )
+    
+    # Average metrics
+    avg_loss = total_loss / grad_accum_steps
+    avg_mask_ratio = total_mask_ratio / grad_accum_steps
+    
+    # Metrics
+    metrics = {
+        'reconstruction_loss': avg_loss,
+        'mask_ratio': avg_mask_ratio,
+        'num_masked_patches': jnp.sum(mask),  # Using the last mask is fine for this metric
+    }
+    
+    return new_state, metrics
+
+
 def train_step_with_accumulation(
     state: WorldModelTrainState,
     batch_iter,
@@ -361,14 +494,28 @@ def train_step_with_accumulation(
         return tensor
     
     def update_model_params(model, jax_params):
-        for name, param in model.named_parameters():
-            if name in jax_params:
-                param.data = jax_to_torch(jax_params[name])
+        # Check if this is a JAX/Flax model or PyTorch model
+        if hasattr(model, 'named_parameters'):
+            # PyTorch model - update parameters
+            for name, param in model.named_parameters():
+                if name in jax_params:
+                    param.data = jax_to_torch(jax_params[name])
+        else:
+            # JAX/Flax model - parameters are handled differently
+            pass  # JAX models don't need parameter updates like PyTorch
     
     update_model_params(state.model, state.params)
-    state.model.train()
     
-    # Initialize optimizer if not exists
+    # Set training mode if it's a PyTorch model
+    if hasattr(state.model, 'train'):
+        state.model.train()
+    
+    # Handle JAX models differently from PyTorch models
+    if not hasattr(state.model, 'named_parameters'):
+        # JAX/Flax model - use JAX training approach
+        return train_step_jax(state, batch_iter, config, step)
+    
+    # Initialize optimizer if not exists (for PyTorch models)
     if not hasattr(state, 'torch_optimizer'):
         from openpi.training.optimizer import build_optimizer_with_config
         
@@ -825,6 +972,16 @@ def main(config: WorldModelTrainConfig):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         logger.info(f"CUDA memory before training: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+    
+    # JAX memory optimization settings
+    import jax
+    jax.config.update('jax_enable_x64', False)  # Use 32-bit precision
+    jax.config.update('jax_debug_nans', False)  # Disable NaN checking
+    jax.config.update('jax_disable_jit', False)  # Ensure JIT is enabled
+    
+    # Clear any existing compilations
+    if hasattr(jax, 'clear_caches'):
+        jax.clear_caches()
     
     # Always use optimized dataloader (superior performance)
     use_optimized = True

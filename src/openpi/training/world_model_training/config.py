@@ -452,22 +452,22 @@ _WORLD_MODEL_CONFIGS = [
         ),
     ),
     
-    # SigLIP-based world model with frozen encoder
+    # SigLIP-based world model with frozen encoder - memory optimized
     WorldModelTrainConfig(
         name="yam_dishrack_siglip_vjepa2_world_model_frozen",
         exp_name="siglip_frozen_encoder_vjepa2",
         model_config=SigLIPVJEPA2WorldModelConfig(
-            num_frames=16,
-            image_size=224,  # SigLIP native resolution
+            num_frames=8,             # Reduced from 16 for memory
+            image_size=224,           # SigLIP native resolution
             # SigLIP ViT-SO400M-14 parameters
             encoder_hidden_size=1152,  # So400m width
             encoder_num_layers=27,     # So400m depth  
             encoder_num_heads=16,      # So400m heads
             encoder_mlp_ratio=3.74,    # 4304/1152
             # Predictor parameters (smaller than encoder)
-            predictor_hidden_size=576,    # Half of encoder size
-            predictor_num_layers=8,
-            predictor_num_heads=8,
+            predictor_hidden_size=384,    # Reduced from 576 for memory
+            predictor_num_layers=6,       # Reduced from 8 for memory
+            predictor_num_heads=6,        # Reduced from 8 for memory
             predictor_mlp_ratio=4.0,
             # Freezing configuration
             freeze_encoder=True,          # Freeze the entire SigLIP backbone
@@ -478,15 +478,15 @@ _WORLD_MODEL_CONFIGS = [
         ),
         data_config=WorldModelDataConfig(
             repo_id="uynitsuj/yam_bimanual_load_dishes_full_absolute",
-            num_frames=16,  # Match model config
-            image_size=(224, 224),  # SigLIP native resolution
+            num_frames=8,             # Reduced from 16 for memory
+            image_size=(224, 224),    # SigLIP native resolution
             masking_strategy=MaskingStrategy.MULTI_SCALE,
-            mask_ratio=0.75,  # Standard VJEPA-2 masking
-            frame_skip=2,     # Moderate temporal sampling
+            mask_ratio=0.75,          # Standard VJEPA-2 masking
+            frame_skip=4,             # Increased from 2 for memory
             multi_view_batch_mode=False,  # Single view for simplicity
             use_progressive_masking=True,
         ),
-        batch_size=4,      # Conservative for large model
+        batch_size=2,              # Reduced from 4 for memory
         num_workers=2,
         num_train_steps=30000,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -501,7 +501,7 @@ _WORLD_MODEL_CONFIGS = [
             warmup_steps=500,
             cosine_cycle=8000,    # Longer cycle for stability
             weight_decay=0.01,    # Lower weight decay for frozen backbone
-            grad_accum_steps=8,   # Memory efficient
+            grad_accum_steps=16,  # Increased from 8 for memory (maintain effective batch size)
             use_gradient_checkpointing=True,
             enable_mixed_precision=True,
         ),

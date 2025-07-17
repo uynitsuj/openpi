@@ -138,8 +138,8 @@ _WORLD_MODEL_CONFIGS = [
         name="yam_dishrack_vjepa2_world_model_debug",
         exp_name="hummus_wm_training_debug",
         model_config=VJEPA2WorldModelConfig(
-            num_frames=16,  # Match official (16 frames)
-            image_size=224,  # Match official (256px)
+            num_frames=10, 
+            image_size=224, 
             encoder_hidden_size=768,  
             predictor_hidden_size=512,  # Half of encoder size
             encoder_num_layers=16,  # ViT-Large depth
@@ -147,8 +147,8 @@ _WORLD_MODEL_CONFIGS = [
             encoder_num_heads=16,  # ViT-Large heads
             predictor_num_heads=8,  # Half of encoder heads
             encoder_stochastic_depth=0.2,  # Match official
-            predictor_stochastic_depth=0.1,  # Lower for predictor
-            momentum=0.996,  # Official EMA momentum
+            predictor_stochastic_depth=0.2,  # Lower for predictor
+            momentum=0.999,  # Official EMA momentum
             use_pretrained_encoder=False,  
         ),
         data_config=WorldModelDataConfig(
@@ -156,19 +156,19 @@ _WORLD_MODEL_CONFIGS = [
             num_frames=10,  # Match model config
             image_size=(224, 224),  # Match model config  
             masking_strategy=MaskingStrategy.MULTI_SCALE,
-            # mask_ratio=0.85,  # Higher like official (very challenging)
+            mask_ratio=0.75,  # Higher like official (very challenging)
             frame_skip=3,  # Skip frames for more temporal diversity (every 3rd frame)
             multi_view_batch_mode=True,  
-            use_progressive_masking=True,  
+            use_progressive_masking=False,  
         ),
         batch_size=8,   # Good balance of performance and memory
         num_workers=8,    # Optimal worker count
         num_train_steps=30000,  
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=2000,  # Longer warmup like official
-            peak_lr=1.5e-4,  # Higher peak LR with larger batch accumulation
+            warmup_steps=300,
+            peak_lr=1.5e-6,
             decay_steps=30000,  
-            decay_lr=1e-6,
+            decay_lr=1e-7,
         ),
     ),
     

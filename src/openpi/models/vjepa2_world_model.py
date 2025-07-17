@@ -159,6 +159,7 @@ class VideoTransformerEncoder(nn.Module):
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        stochastic_depth: float = 0.1,
         use_pretrained: bool = True,
         pretrained_model: str = "google/vit-base-patch16-224",
     ):
@@ -185,7 +186,8 @@ class VideoTransformerEncoder(nn.Module):
             
             self.vit_model = ViTModel(self.vit_config)
             # Enable gradient checkpointing to save memory
-            self.vit_model.gradient_checkpointing_enable()
+            if hasattr(self.vit_model, 'gradient_checkpointing_enable'):
+                self.vit_model.gradient_checkpointing_enable()
         else:
             # Create ViT from scratch
             self.vit_config = ViTConfig(
@@ -201,7 +203,8 @@ class VideoTransformerEncoder(nn.Module):
             )
             self.vit_model = ViTModel(self.vit_config)
             # Enable gradient checkpointing to save memory
-            self.vit_model.gradient_checkpointing_enable()
+            if hasattr(self.vit_model, 'gradient_checkpointing_enable'):
+                self.vit_model.gradient_checkpointing_enable()
         
         # Temporal positional embeddings
         self.temporal_pos_embedding = nn.Parameter(
@@ -296,7 +299,7 @@ class VideoTransformerPredictor(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, predictor_hidden_size))
         
         # Transformer blocks for prediction with stochastic depth
-        stoch_depth_probs = [0.0] + [dropout * (i / (num_layers - 1)) for i in range(1, num_layers)]
+        stoch_depth_probs = [dropout * (i / max(1, num_layers - 1)) for i in range(num_layers)]
         self.predictor_blocks = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=predictor_hidden_size,
@@ -410,6 +413,27 @@ class VJEPA2WorldModelConfig:
     pretrained_model: str = "google/vit-base-patch16-224"
 
 
+class EMATarget:
+    """EMA target with optional freeze functionality."""
+    
+    def __init__(self, params, momentum):
+        self.params = params
+        self.momentum = momentum
+        self.frozen = False
+
+    def update(self, new_params, step, freeze_after=None):
+        if freeze_after is not None and step >= freeze_after:
+            self.frozen = True
+        if self.frozen:
+            return
+        for key in self.params:
+            if key in new_params:
+                self.params[key] = (
+                    self.params[key] * self.momentum + 
+                    new_params[key] * (1.0 - self.momentum)
+                )
+
+
 class VJEPA2WorldModel(nn.Module):
     """
     VJEPA-2 World Model with separate context and target encoders.
@@ -435,6 +459,7 @@ class VJEPA2WorldModel(nn.Module):
             num_heads=config.encoder_num_heads,
             mlp_ratio=config.encoder_mlp_ratio,
             dropout=config.encoder_dropout,
+            stochastic_depth=config.encoder_stochastic_depth,
             use_pretrained=config.use_pretrained_encoder,
             pretrained_model=config.pretrained_model,
         )
@@ -450,6 +475,7 @@ class VJEPA2WorldModel(nn.Module):
             num_heads=config.encoder_num_heads,
             mlp_ratio=config.encoder_mlp_ratio,
             dropout=config.encoder_dropout,
+            stochastic_depth=config.encoder_stochastic_depth,
             use_pretrained=config.use_pretrained_encoder,
             pretrained_model=config.pretrained_model,
         )
@@ -468,7 +494,7 @@ class VJEPA2WorldModel(nn.Module):
             num_layers=config.predictor_num_layers,
             num_heads=config.predictor_num_heads,
             mlp_ratio=config.predictor_mlp_ratio,
-            dropout=config.predictor_dropout,
+            dropout=config.predictor_stochastic_depth,  # Use stochastic depth for predictor dropout
             num_mask_tokens=config.predictor_num_mask_tokens,
         )
         
@@ -477,6 +503,9 @@ class VJEPA2WorldModel(nn.Module):
         
         # EMA momentum for target encoder updates
         self.momentum = config.momentum
+        
+        # EMA target state
+        self.ema_target = None
         
     def forward(
         self,
@@ -598,23 +627,85 @@ class VJEPA2WorldModel(nn.Module):
         
         return loss
     
-    def update_target_encoder(self, momentum: Optional[float] = None):
+    def init_ema_target(self, momentum=None):
+        """Initialize EMA target with current context encoder parameters."""
+        if momentum is None:
+            momentum = self.momentum
+        
+        context_params = {}
+        for name, param in self.context_encoder.named_parameters():
+            context_params[name] = param.data.clone()
+        
+        self.ema_target = EMATarget(context_params, momentum)
+    
+    def update_target_encoder(self, momentum: Optional[float] = None, step: int = 0, freeze_after: Optional[int] = None):
         """
         Update target encoder with EMA from context encoder (like official VJEPA-2).
         
         Args:
             momentum: Momentum coefficient for EMA update (uses self.momentum if None)
+            step: Current training step
+            freeze_after: Step after which to freeze EMA updates
         """
         if momentum is None:
             momentum = self.momentum
-            
+        
+        # Initialize EMA target if not exists
+        if self.ema_target is None:
+            self.init_ema_target(momentum)
+        
+        # Get current context encoder parameters
+        context_params = {}
+        for name, param in self.context_encoder.named_parameters():
+            context_params[name] = param.data
+        
+        # Update EMA target
+        self.ema_target.update(context_params, step, freeze_after)
+        
+        # Copy EMA parameters to target encoder
         with torch.no_grad():
-            for target_param, context_param in zip(
-                self.target_encoder.parameters(), 
-                self.context_encoder.parameters()
-            ):
-                # EMA update: target = momentum * target + (1 - momentum) * context
-                target_param.data.mul_(momentum).add_(context_param.data, alpha=1 - momentum)
+            for name, param in self.target_encoder.named_parameters():
+                if name in self.ema_target.params:
+                    param.data.copy_(self.ema_target.params[name])
+    
+    def is_ema_frozen(self) -> bool:
+        """Check if EMA target is frozen."""
+        return self.ema_target is not None and self.ema_target.frozen
+    
+    def freeze_encoder_blocks(self, n_freeze: int):
+        """Freeze the first n_freeze blocks of the context encoder."""
+        if not hasattr(self.context_encoder, 'vit_model'):
+            return
+        
+        vit_model = self.context_encoder.vit_model
+        if not hasattr(vit_model, 'encoder') or not hasattr(vit_model.encoder, 'layer'):
+            return
+        
+        layers = vit_model.encoder.layer
+        for i in range(min(n_freeze, len(layers))):
+            for param in layers[i].parameters():
+                param.requires_grad = False
+    
+    def unfreeze_encoder_blocks(self):
+        """Unfreeze all encoder blocks."""
+        if not hasattr(self.context_encoder, 'vit_model'):
+            return
+        
+        vit_model = self.context_encoder.vit_model
+        if not hasattr(vit_model, 'encoder') or not hasattr(vit_model.encoder, 'layer'):
+            return
+        
+        layers = vit_model.encoder.layer
+        for layer in layers:
+            for param in layer.parameters():
+                param.requires_grad = True
+    
+    def apply_encoder_freezing_schedule(self, step: int, freeze_blocks: int, unfreeze_after: int):
+        """Apply encoder freezing schedule based on training step."""
+        if step < unfreeze_after:
+            self.freeze_encoder_blocks(freeze_blocks)
+        else:
+            self.unfreeze_encoder_blocks()
     
     def predict_masked_regions(
         self,

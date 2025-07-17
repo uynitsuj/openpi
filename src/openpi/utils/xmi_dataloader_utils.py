@@ -2,29 +2,10 @@ import numpy as np
 import json
 from pathlib import Path
 import viser.transforms as vtf
-import cv2
+from openpi.utils.video_processor import resize_and_pad_video
 
-def extract_video_frames(video_path):
-    """Extract frames from a video file."""
-    cap = cv2.VideoCapture(str(video_path))
-    frames = []
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        # Convert BGR to RGB
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames.append(frame)
-    
-    cap.release()
-    return np.array(frames)
-
-
-def load_episode_data(episode_path: Path):
+def load_episode_data(episode_path: Path, cfg: dict, base_dir: Path, ep_idx: int):
     """Load data for a specific episode."""
-    print(f"Loading episode: {episode_path.name}")
-    
     try:
         # Load action data (4x4 transformation matrices)
         action_data = {}
@@ -84,38 +65,30 @@ def load_episode_data(episode_path: Path):
             with open(annotation_file, 'r') as f:
                 annotations = json.load(f)
         
-        # Find and extract video files
+        # Process video files
         video_files = {}
-        images = {}
         camera_names = []
-        
-        for video_file in episode_path.glob("*.mp4"):
-            camera_name = video_file.stem  # e.g., "left_camera-images-rgb"
-            video_files[camera_name] = video_file
-            
-            # Extract frames from video
-            frames = extract_video_frames(video_file)
-            if len(frames) > 0:
-                images[camera_name] = frames
-                camera_names.append(camera_name)
-        
-        # Synchronize frame counts across all cameras
-        if images:
-            min_frames = min(len(frames) for frames in images.values())
-            for camera_name in images:
-                images[camera_name] = images[camera_name][:min_frames]
-            # print(f"Loaded {len(images)} camera feeds with {min_frames} frames each")
-            
-            # Print resolution info for each camera
-            # for camera_name in camera_names:
-            #     shape = images[camera_name].shape
-                # print(f"  {camera_name}: {shape[1]}x{shape[2]} resolution")
+                
+        if not cfg.skip_videos:
+            chunk_id = ep_idx // cfg.chunk_size
+            for video_file in episode_path.glob("*.mp4"):
+                camera_name = video_file.stem
+                video_files[camera_name] = video_file
+                
+                ret = resize_and_pad_video(
+                    input_path=str(video_file), 
+                    output_path=str(base_dir / "videos" / f"chunk-{chunk_id:03d}" / f"{camera_name}" / f"episode_{ep_idx:06d}.mp4"), 
+                    target_size=cfg.resize_size, # type: ignore
+                    fps=cfg.fps//cfg.temporal_subsample_factor, # type: ignore
+                    frame_stride=cfg.temporal_subsample_factor # type: ignore
+                )
+                if not ret:
+                    raise ValueError(f"Failed to resize and pad video {video_file}")
         
         return {
             'action_data': action_data,
             'joint_data': joint_data, 
             'timestamp_data': timestamp_data,
-            'images': images,
             'camera_names': camera_names,
             'annotations': annotations,
             'video_files': video_files

@@ -631,115 +631,6 @@ def main(config: _config.TrainConfig, num_eval_batches: int = 10, checkpoint_ste
                 for key, img in observation.images.items():
                     img_array = np.array(img)
                     logging.info(f"Image '{key}': shape={img_array.shape}, range=[{img_array.min():.2f}, {img_array.max():.2f}]")
-                    
-                    # Check for duplicate images in the batch
-                    if img_array.shape[0] >= 3:
-                        img0 = img_array[0]
-                        img1 = img_array[1] 
-                        img2 = img_array[2]
-                        
-                        # Compare images using MSE
-                        mse_01 = np.mean((img0 - img1) ** 2)
-                        mse_02 = np.mean((img0 - img2) ** 2)
-                        mse_12 = np.mean((img1 - img2) ** 2)
-                        
-                        # logging.info(f"Image '{key}' similarity check:")
-                        # logging.info(f"  MSE between sample 0 and 1: {mse_01:.6f}")
-                        # logging.info(f"  MSE between sample 0 and 2: {mse_02:.6f}")  
-                        # logging.info(f"  MSE between sample 1 and 2: {mse_12:.6f}")
-                        
-                        if mse_01 < 1e-10 and mse_02 < 1e-10:
-                            logging.warning(f"  ⚠️  Images appear to be IDENTICAL (likely duplicate data)")
-                        elif mse_01 < 1e-6 and mse_02 < 1e-6:
-                            logging.warning(f"  ⚠️  Images appear to be nearly identical (very similar)")
-                        # else:
-                        #     logging.info(f"  ✅ Images appear to be different (normal)")
-                        
-                        # Save difference images to visualize the subtle differences
-                        if key == 'base_0_rgb':  # Only for base camera to avoid clutter
-                            diff_01 = np.abs(img0 - img1)
-                            diff_02 = np.abs(img0 - img2)
-                            
-                            # Amplify differences for visualization (scale by 10)
-                            diff_01_amplified = np.clip(diff_01 * 10, 0, 1)
-                            diff_02_amplified = np.clip(diff_02 * 10, 0, 1)
-                            
-                            # Convert to [0, 255] for saving
-                            diff_01_uint8 = (diff_01_amplified * 255).astype(np.uint8)
-                            diff_02_uint8 = (diff_02_amplified * 255).astype(np.uint8)
-                            
-                            # Save difference images
-                            diff_01_img = Image.fromarray(diff_01_uint8)
-                            diff_02_img = Image.fromarray(diff_02_uint8)
-                            
-                            diff_01_path = sample_images_dir / f"{key}_diff_0_vs_1_amplified.png"
-                            diff_02_path = sample_images_dir / f"{key}_diff_0_vs_2_amplified.png"
-                            
-                            diff_01_img.save(diff_01_path)
-                            diff_02_img.save(diff_02_path)
-                            
-                            logging.info(f"  💡 Saved amplified difference images:")
-                            logging.info(f"    - {diff_01_path}")
-                            logging.info(f"    - {diff_02_path}")
-                    
-                    # Save a few sample images from the batch for visual verification
-                    for sample_idx in range(min(3, img_array.shape[0])):  # Save first 3 samples
-                        sample_img = img_array[sample_idx]  # Shape: (224, 224, 3)
-                        
-                        # Convert from [-1, 1] back to [0, 255] for saving
-                        sample_img_uint8 = ((sample_img + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-                        
-                        # Save as PNG
-                        pil_img = Image.fromarray(sample_img_uint8)
-                        image_path = sample_images_dir / f"{key}_sample_{sample_idx}.png"
-                        pil_img.save(image_path)
-                
-                logging.info(f"Sample images saved to: {sample_images_dir}")
-                
-            if hasattr(observation, 'state'):
-                state_array = np.array(observation.state)
-                logging.info(f"State: shape={state_array.shape}")
-                
-                # Check if states are also duplicated
-                if state_array.shape[0] >= 3:
-                    state0 = state_array[0]
-                    state1 = state_array[1]
-                    state2 = state_array[2]
-                    
-                    state_mse_01 = np.mean((state0 - state1) ** 2)
-                    state_mse_02 = np.mean((state0 - state2) ** 2)
-                    
-                    # logging.info(f"State similarity check:")
-                    # logging.info(f"  MSE between sample 0 and 1: {state_mse_01:.6f}")
-                    # logging.info(f"  MSE between sample 0 and 2: {state_mse_02:.6f}")
-                    
-                    if state_mse_01 < 1e-10 and state_mse_02 < 1e-10:
-                        logging.warning(f"  ⚠️  States appear to be IDENTICAL")
-            #         else:
-            #             logging.info(f"  ✅ States appear to be different")
-                
-            # logging.info(f"Actions GT: shape={np.array(actions_gt).shape}")
-            
-            # Check actions for duplication too
-            actions_array = np.array(actions_gt)
-            if actions_array.shape[0] >= 3:
-                action0 = actions_array[0]
-                action1 = actions_array[1] 
-                action2 = actions_array[2]
-                
-                action_mse_01 = np.mean((action0 - action1) ** 2)
-                action_mse_02 = np.mean((action0 - action2) ** 2)
-                
-                # logging.info(f"Action similarity check:")
-                # logging.info(f"  MSE between sample 0 and 1: {action_mse_01:.6f}")
-                # logging.info(f"  MSE between sample 0 and 2: {action_mse_02:.6f}")
-                
-                if action_mse_01 < 1e-10 and action_mse_02 < 1e-10:
-                    logging.warning(f"  ⚠️  Actions appear to be IDENTICAL")
-                # else:
-                #     logging.info(f"  ✅ Actions appear to be different")
-            
-            logging.info("==========================================")
         
         # Run inference
         eval_rng = jax.random.fold_in(rng, batch_idx)
@@ -796,9 +687,12 @@ def main(config: _config.TrainConfig, num_eval_batches: int = 10, checkpoint_ste
                 'L_Rot_0', 'L_Rot_1', 'L_Rot_2', 'L_Rot_3', 'L_Rot_4', 'L_Rot_5',
                 'L_Pos_X', 'L_Pos_Y', 'L_Pos_Z', 'L_Gripper',
                 'R_Rot_0', 'R_Rot_1', 'R_Rot_2', 'R_Rot_3', 'R_Rot_4', 'R_Rot_5',
-                'R_Pos_X', 'R_Pos_Y', 'R_Pos_Z', 'R_Gripper'
+                'R_Pos_X', 'R_Pos_Y', 'R_Pos_Z', 'R_Gripper',
+                'Head_Rot_0', 'Head_Rot_1', 'Head_Rot_2', 'Head_Rot_3', 'Head_Rot_4', 'Head_Rot_5', 
+                'Head_Pos_X', 'Head_Pos_Y', 'Head_Pos_Z',
             ]
-            plot_action_dim = 20
+            plot_action_dim = 29
+            action_names.extend([f'Pad_{i}' for i in range(29, 32)])
         elif 'aloha' in robot_type or 'aloha' in config.data.repo_id.lower():
             action_names = [
                 'L_Joint_0', 'L_Joint_1', 'L_Joint_2', 'L_Joint_3', 'L_Joint_4', 'L_Joint_5', 'L_Gripper',

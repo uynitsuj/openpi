@@ -142,6 +142,7 @@ def create_torch_dataset(
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
         video_backend=video_backend,
+        tolerance_s=1e-3,
     )
 
     if data_config.prompt_from_task:

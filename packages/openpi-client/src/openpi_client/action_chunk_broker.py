@@ -16,9 +16,10 @@ class ActionChunkBroker(_base_policy.BasePolicy):
     list of chunks is exhausted.
     """
 
-    def __init__(self, policy: _base_policy.BasePolicy, action_horizon: int):
+    def __init__(self, policy: _base_policy.BasePolicy, action_horizon: int, skip_actions: int = 0):
         self._policy = policy
         self._action_horizon = action_horizon
+        self._skip_actions = skip_actions
         self._cur_step: int = 0
 
         self._last_results: Dict[str, np.ndarray] | None = None
@@ -27,7 +28,7 @@ class ActionChunkBroker(_base_policy.BasePolicy):
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
         if self._last_results is None:
             self._last_results = self._policy.infer(obs)
-            self._cur_step = 0
+            self._cur_step = self._skip_actions
 
         def slicer(x):
             if isinstance(x, np.ndarray):

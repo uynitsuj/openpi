@@ -23,10 +23,11 @@ from typing import Literal
 import jsonlines
 from openpi.utils.matrix_utils import rot_6d_to_quat
 
-DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/test_soup_can_xmi_subsample_2"
+# DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250804"
+DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250807"
 
 class XMILeRobotViewer:
-    def __init__(self, dataset_path: str, action_horizon: int = 15):
+    def __init__(self, dataset_path: str, action_horizon: int = 20):
         """
         Initialize XMI LeRobot trajectory viewer.
         
@@ -307,15 +308,22 @@ class XMILeRobotViewer:
         self.right_ee_frame = self.viser_server.scene.add_frame(
             "/right_ee", axes_length=0.1, axes_radius=0.005, origin_radius=0.02
         )
+        self.top_ee_frame = self.viser_server.scene.add_frame(
+            "/top_ee", axes_length=0.1, axes_radius=0.005, origin_radius=0.02
+        )
 
         self.left_ee_action_frames = []
         self.right_ee_action_frames = []
+        self.top_ee_action_frames = []
         for i in range(self.action_horizon):
             self.left_ee_action_frames.append(self.viser_server.scene.add_frame(
                 f"/left_ee_action_{i}", axes_length=0.07, axes_radius=0.003, origin_radius=0.01
             ))
             self.right_ee_action_frames.append(self.viser_server.scene.add_frame(
                 f"/right_ee_action_{i}", axes_length=0.07, axes_radius=0.003, origin_radius=0.01
+            ))
+            self.top_ee_action_frames.append(self.viser_server.scene.add_frame(
+                f"/top_ee_action_{i}", axes_length=0.07, axes_radius=0.003, origin_radius=0.01
             ))
 
         # Add camera frustums for visualization
@@ -504,7 +512,7 @@ class XMILeRobotViewer:
         def _(_):
             self.left_ee_frame.visible = self.show_ee_frames.value
             self.right_ee_frame.visible = self.show_ee_frames.value
-
+            self.top_ee_frame.visible = self.show_ee_frames.value
         @self.show_base_frame.on_update
         def _(_):
             self.rby1_base_frame.visible = self.show_base_frame.value
@@ -537,8 +545,8 @@ class XMILeRobotViewer:
         Parse XMI state vector into end-effector poses and gripper positions.
         XMI format: [left_6d_rot, left_3d_pos, left_1d_gripper, right_6d_rot, right_3d_pos, right_1d_gripper]
         """
-        if len(state) != 20:
-            raise ValueError(f"Expected 20D state for XMI, got {len(state)}D")
+        if len(state) != 20 and len(state) != 29:
+            raise ValueError(f"Expected 20D or 29D state for XMI, got {len(state)}D")
         
         # Extract left arm data
         left_6d_rot = state[0:6]
@@ -561,8 +569,18 @@ class XMILeRobotViewer:
         right_se3 = vtf.SE3.from_rotation_and_translation(
             vtf.SO3(wxyz=right_quat_wxyz), right_3d_pos
         )
+
+        head_se3 = None
+
+        if len(state) == 29:
+            head_6d_rot = state[20:26]
+            head_position = state[26:29]
+            head_quat_wxyz = rot_6d_to_quat(head_6d_rot.reshape(1, 6))[0]  # Remove batch dimension
+            head_se3 = vtf.SE3.from_rotation_and_translation(
+                vtf.SO3(wxyz=head_quat_wxyz), head_position
+            )
         
-        return left_se3, left_gripper, right_se3, right_gripper
+        return left_se3, left_gripper, right_se3, right_gripper, head_se3
     
     def _update_visualization(self):
         """Update the 3D visualization."""
@@ -580,10 +598,15 @@ class XMILeRobotViewer:
                 assert len(action_horizon) == self.action_horizon
 
             for i in range(self.action_horizon):
-                left_se3_action, left_gripper_action, right_se3_action, right_gripper_action = self._parse_xmi_state(action_horizon[i])
+                left_se3_action, left_gripper_action, right_se3_action, right_gripper_action, head_se3_action = self._parse_xmi_state(action_horizon[i])
 
                 left_ee_action_frame = self.left_ee_action_frames[i]
                 right_ee_action_frame = self.right_ee_action_frames[i]
+                top_ee_action_frame = self.top_ee_action_frames[i]
+
+                if head_se3_action is not None:
+                    top_ee_action_frame.position = head_se3_action.wxyz_xyz[-3:]
+                    top_ee_action_frame.wxyz = head_se3_action.rotation().wxyz
 
                 left_ee_action_frame.position = left_se3_action.wxyz_xyz[-3:]
                 left_ee_action_frame.wxyz = left_se3_action.rotation().wxyz
@@ -593,8 +616,8 @@ class XMILeRobotViewer:
                 
             
             try:
-                left_se3, left_gripper, right_se3, right_gripper = self._parse_xmi_state(state)
-                _, left_gripper_action, _, right_gripper_action = self._parse_xmi_state(action)
+                left_se3, left_gripper, right_se3, right_gripper, head_se3 = self._parse_xmi_state(state)
+                _, left_gripper_action, _, right_gripper_action, head_se3_action = self._parse_xmi_state(action)
 
 
                 # Update gripper displays
@@ -621,6 +644,12 @@ class XMILeRobotViewer:
                 self.left_ee_frame.wxyz = left_quat
                 self.right_ee_frame.position = right_pos
                 self.right_ee_frame.wxyz = right_quat
+
+                if head_se3 is not None:
+                    head_pos = head_se3.translation()
+                    head_quat = head_se3.rotation().wxyz
+                    self.top_ee_frame.position = head_pos
+                    self.top_ee_frame.wxyz = head_quat
                 
             except Exception as e:
                 print(f"Error parsing XMI state: {e}")
@@ -657,7 +686,7 @@ class XMILeRobotViewer:
                     except ValueError:
                         # Current episode not in available list, go to first
                         self.episode_selector.value = available_episodes[0]
-            time.sleep(1.0 / 30.0) # Aim for 30fps playback
+            time.sleep(1.0 / 40.0) # Aim for 60fps playback
 
 
 def main(

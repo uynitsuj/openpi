@@ -7,6 +7,7 @@ from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 import flax.traverse_util as traverse_util
 import jax
 import numpy as np
+import torch
 from openpi_client import image_tools
 
 from openpi.models import tokenizer as _tokenizer
@@ -247,76 +248,115 @@ class AbsoluteActions(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
-class Bimanual20D_DeltaActions(DataTransformFn):
-    """Repacks absolute actions into delta actions and inter-gripper relative for bimanual XMI RBY, transforms right gripper into delta space, left gripper references right gripper."""
-    # NOTE: SPECIFIC TO BIMANUAL 20D ACTION FORMAT (bimanual 6D rot, 3D position, 1D gripper)
+class Bimanual_InterGripperProprio_DeltaActions(DataTransformFn):
+    """Repacks actions into delta actions and proprio to inter-gripper relative for bimanual 20D, left gripper proprio references right gripper."""
+    # NOTE: SPECIFIC TO BIMANUAL 20D or 29D ACTION FORMAT (bimanual 6D rot, 3D position, 1D gripper)
 
     # Boolean mask for the action dimensions to be repacked into delta action space. Length
     # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
     # See `make_bool_mask` for more details.
     mask: Sequence[bool] | None
-    use_actions_as_state: bool = False # Used when proprio state may contain partial delta rather than absolute states
-
+    action_dim: int
+    
     def __call__(self, data: DataDict) -> DataDict:
         if "actions" not in data or self.mask is None:
             return data
-        # action format is [left_6d_rot, left_ee_ik_target_handle_position, left_gripper_pos, right_6d_rot, right_ee_ik_target_handle_position, right_gripper_pos]
-        actions = data["actions"]
-        if self.use_actions_as_state:
-            state = deepcopy(actions[0])
-        else:
-            state = data["state"]
 
-        for i in range(actions.shape[0]):
-            left_in_world = vtf.SE3.from_rotation_and_translation(
-                vtf.SO3(wxyz=rot_6d_to_quat(actions[i, :6])[0]), actions[i, 6:9]
+        # action format is [left_6d_rot, left_ee_ik_target_handle_position, left_gripper_pos, right_6d_rot, right_ee_ik_target_handle_position, right_gripper_pos]
+        actions, state = data["actions"], data["state"]
+
+        # import viser # viser debug
+        # viser_server = viser.ViserServer()
+
+        left_t0_in_world = vtf.SE3.from_rotation_and_translation(
+            vtf.SO3(wxyz=rot_6d_to_quat(np.asarray(state[:6]))[0]), np.asarray(state[6:9])
+        )
+
+        right_t0_in_world = vtf.SE3.from_rotation_and_translation(
+            vtf.SO3(wxyz=rot_6d_to_quat(np.asarray(state[10:16]))[0]), np.asarray(state[16:19])
+        )
+
+        if self.action_dim == 29: # TODO FIX THIS IS WRONG LEN IS ALWAYS 32 CUS WE PAD TO 32
+            top_t0_in_world = vtf.SE3.from_rotation_and_translation(
+                vtf.SO3(wxyz=rot_6d_to_quat(np.asarray(data["state"][20:26]))[0]), np.asarray(data["state"][26:29])
             )
-            right_in_world = vtf.SE3.from_rotation_and_translation(
-                vtf.SO3(wxyz=rot_6d_to_quat(actions[i, 9:15])[0]), actions[i, 15:18]
-            )
-            left_in_right = right_in_world.inverse() @ left_in_world
-            left_in_right_6d_rot = quat_to_rot_6d(left_in_right.wxyz_xyz[..., :4][None, ...])[0]
-            actions[i, :6] = left_in_right_6d_rot
-            actions[i, 6:9] = left_in_right.wxyz_xyz[..., -3:]
+            top_in_right = right_t0_in_world.inverse() @ top_t0_in_world
+            top_in_right_6d_rot = quat_to_rot_6d(top_in_right.wxyz_xyz[..., :4][None, ...])[0]
+            data["state"][20:26] = torch.from_numpy(top_in_right_6d_rot)
+            data["state"][26:29] = torch.from_numpy(top_in_right.wxyz_xyz[..., -3:])
+
+        left_in_right = right_t0_in_world.inverse() @ left_t0_in_world
+        left_in_right_6d_rot = quat_to_rot_6d(left_in_right.wxyz_xyz[..., :4][None, ...])[0]
+
+        data["state"][:6] = torch.from_numpy(left_in_right_6d_rot)
+        data["state"][6:9] = torch.from_numpy(left_in_right.wxyz_xyz[..., -3:])
+
+        # viser_server.scene.add_frame(f"left_t0_in_world", position=left_t0_in_world.wxyz_xyz[-3:], wxyz=left_t0_in_world.wxyz_xyz[:4])
+        # viser_server.scene.add_frame(f"right_t0_in_world", position=right_t0_in_world.wxyz_xyz[-3:], wxyz=right_t0_in_world.wxyz_xyz[:4])
+        # viser_server.scene.add_frame(f"right_t0_state_in_world", position=right_t0_state_in_world.wxyz_xyz[-3:], wxyz=right_t0_state_in_world.wxyz_xyz[:4])
+        # viser_server.scene.add_frame(f"right_t0_in_world/left_in_right", position=left_in_right.wxyz_xyz[-3:], wxyz=left_in_right.wxyz_xyz[:4])
+
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
-        actions[..., dims//2:dims] -= np.expand_dims(np.where(mask[dims//2:], state[..., dims//2:dims], 0), axis=-2)
-        data["actions"] = actions        
+        actions[..., :dims] -= np.expand_dims(np.where(mask, actions[0, :dims], 0), axis=-2)
+        data["actions"] = actions
 
         return data
 
 @dataclasses.dataclass(frozen=True)
-class Bimanual20D_AbsoluteActions(DataTransformFn):
-    """Repacks delta actions into absolute action space and inter-gripper relative for bimanual XMI RBY, transforms right gripper into delta space, left gripper references right gripper."""
-    # NOTE: SPECIFIC TO BIMANUAL 20D ACTION FORMAT (bimanual 6D rot, 3D position, 1D gripper)
-    
-    # Boolean mask for the action dimensions to be repacked into absolute action space. Length
+class Bimanual_InterGripperProprio_AbsoluteActions(DataTransformFn):
+    """Repacks actions into delta actions and proprio to inter-gripper relative for bimanual 20D, left gripper proprio references right gripper."""
+    # NOTE: SPECIFIC TO BIMANUAL 20D or 29D ACTION FORMAT (bimanual 6D rot, 3D position, 1D gripper)
+
+    # Boolean mask for the action dimensions to be repacked into delta action space. Length
     # can be smaller than the actual number of dimensions. If None, this transform is a no-op.
     # See `make_bool_mask` for more details.
     mask: Sequence[bool] | None
-
+    action_dim: int
+    
     def __call__(self, data: DataDict) -> DataDict:
         if "actions" not in data or self.mask is None:
             return data
 
-        # Do the inverse transform to get the absolute actions
-        state, actions = data["state"], data["actions"]
+        # action format is [left_6d_rot, left_ee_ik_target_handle_position, left_gripper_pos, right_6d_rot, right_ee_ik_target_handle_position, right_gripper_pos]
+        actions, state = data["actions"], data["state"]
+
+        left_t0_in_right = vtf.SE3.from_rotation_and_translation(
+            vtf.SO3(wxyz=rot_6d_to_quat(np.asarray(state[:6]))[0]), np.asarray(state[6:9])
+        )
+
+        right_t0_in_world = vtf.SE3.from_rotation_and_translation(
+            vtf.SO3(wxyz=rot_6d_to_quat(np.asarray(state[10:16]))[0]), np.asarray(state[16:19])
+        )
+
+        left_in_world = right_t0_in_world @ left_t0_in_right
+        left_in_world_6d_rot = quat_to_rot_6d(left_in_world.wxyz_xyz[..., :4][None, ...])[0]
+
+        state[:6] = torch.from_numpy(left_in_world_6d_rot)
+        state[6:9] = torch.from_numpy(left_in_world.wxyz_xyz[..., -3:])
+
+        if self.action_dim == 29: # TODO FIX THIS IS WRONG LEN IS ALWAYS 32 CUS WE PAD TO 32
+            top_t0_in_right = vtf.SE3.from_rotation_and_translation(
+                vtf.SO3(wxyz=rot_6d_to_quat(np.asarray(state[20:26]))[0]), np.asarray(state[26:29])
+            )
+            top_in_world = right_t0_in_world @ top_t0_in_right
+            top_in_world_6d_rot = quat_to_rot_6d(top_in_world.wxyz_xyz[..., :4][None, ...])[0]
+            state[20:26] = torch.from_numpy(top_in_world_6d_rot)
+            state[26:29] = torch.from_numpy(top_in_world.wxyz_xyz[..., -3:])
+
+
+        # viser_server.scene.add_frame(f"left_t0_in_world", position=left_t0_in_world.wxyz_xyz[-3:], wxyz=left_t0_in_world.wxyz_xyz[:4])
+        # viser_server.scene.add_frame(f"right_t0_in_world", position=right_t0_in_world.wxyz_xyz[-3:], wxyz=right_t0_in_world.wxyz_xyz[:4])
+        # viser_server.scene.add_frame(f"right_t0_state_in_world", position=right_t0_state_in_world.wxyz_xyz[-3:], wxyz=right_t0_state_in_world.wxyz_xyz[:4])
+        # viser_server.scene.add_frame(f"right_t0_in_world/left_in_right", position=left_in_right.wxyz_xyz[-3:], wxyz=left_in_right.wxyz_xyz[:4])
+
+
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
-        actions[..., dims//2:dims] += np.expand_dims(np.where(mask[dims//2:], state[..., dims//2:dims], 0), axis=-2)
-        for i in range(actions.shape[0]):
-            left_in_right = vtf.SE3.from_rotation_and_translation(
-                vtf.SO3(wxyz=rot_6d_to_quat(actions[i, :6])[0]), actions[i, 6:9]
-            )
-            right_in_world = vtf.SE3.from_rotation_and_translation(
-                vtf.SO3(wxyz=rot_6d_to_quat(actions[i, 9:15])[0]), actions[i, 15:18]
-            )
-            left_in_world = right_in_world @ left_in_right
-            actions[i, :6] = quat_to_rot_6d(left_in_world.wxyz_xyz[..., :4][None, ...])[0]
-            actions[i, 6:9] = left_in_world.wxyz_xyz[..., -3:]
-            actions[i, 9:15] = quat_to_rot_6d(right_in_world.wxyz_xyz[..., :4][None, ...])[0]
-            actions[i, 15:18] = right_in_world.wxyz_xyz[..., -3:]
+        actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
         data["actions"] = actions
+
+        return data
 
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):

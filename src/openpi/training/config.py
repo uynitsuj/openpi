@@ -341,6 +341,8 @@ class LeRobotXmiRbyDataConfig(DataConfigFactory):
     
     # If provided, will be injected into the input data if the "prompt" key is not present.
     default_prompt: str | None = None
+    retarget_mode: Literal["20D-relative", "20D-intergripper-relative", "29D-relative", "29D-intergripper-relative"] = "29D-relative"
+    use_top_camera: bool = False
     
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -362,22 +364,37 @@ class LeRobotXmiRbyDataConfig(DataConfigFactory):
 
         # Data transforms using XMI RBY policy transforms
         data_transforms = _transforms.Group(
-            inputs=[xmi_rby_policy.XmiRbyInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
-            outputs=[xmi_rby_policy.XmiRbyOutputs()],
+            inputs=[xmi_rby_policy.XmiRbyInputs(action_dim=model_config.action_dim, model_type=model_config.model_type, retarget_mode=self.retarget_mode, use_top_camera=self.use_top_camera)],
+            outputs=[xmi_rby_policy.XmiRbyOutputs(action_out_dim=20 if "20D" in self.retarget_mode else 29)],
         )
 
         # XMI data uses delta actions for rotations/positions, but absolute gripper positions
         # The conversion script already produces the correct format, but we may need delta conversion
         # for the rotations and positions (indices 0:6, 6:9, 10:16, 16:19) while keeping
         # grippers absolute (indices 9, 19)
-        delta_action_mask = _transforms.make_bool_mask(
-            9, -1,  # left: 6d_rot (delta), 3d_pos (delta), gripper (absolute)
-            9, -1   # right: 6d_rot (delta), 3d_pos (delta), gripper (absolute) 
-        )
-        data_transforms = data_transforms.push(
-            inputs=[_transforms.DeltaActions(delta_action_mask, use_actions_as_state=True)],
-            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
-        )
+        if "20D" in self.retarget_mode:
+            delta_action_mask = _transforms.make_bool_mask(
+                9, -1,  # left: 6d_rot (delta), 3d_pos (delta), gripper (absolute)
+                9, -1   # right: 6d_rot (delta), 3d_pos (delta), gripper (absolute) 
+            )
+        elif "29D" in self.retarget_mode:
+            delta_action_mask = _transforms.make_bool_mask(
+                9, -1,  # left: 6d_rot (delta), 3d_pos (delta), gripper (absolute)
+                9, -1,   # right: 6d_rot (delta), 3d_pos (delta), gripper (absolute) 
+                9,   # head: 6d_rot (delta), 3d_pos (delta)
+            )
+
+        if self.retarget_mode == "20D-relative" or self.retarget_mode == "29D-relative":
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        elif self.retarget_mode == "20D-intergripper-relative" or self.retarget_mode == "29D-intergripper-relative":
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.Bimanual_InterGripperProprio_DeltaActions(delta_action_mask, action_dim=20 if "20D" in self.retarget_mode else 29)],
+                outputs=[_transforms.Bimanual_InterGripperProprio_AbsoluteActions(delta_action_mask, action_dim=20 if "20D" in self.retarget_mode else 29)],
+            )
 
         # Model transforms for tokenization and image processing
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
@@ -834,21 +851,34 @@ _CONFIGS = [
         name="pi0_xmi_rby",
         model=pi0.Pi0Config(action_horizon=25),
         data=LeRobotXmiRbyDataConfig(
-            repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned",
-            default_prompt="do something useful",
+            repo_id="uynitsuj/xmi_data_20250802",
+            default_prompt="pick up the soup can and place it in the bin",
+
+            retarget_mode = "29D-intergripper-relative",
+            
+            use_top_camera=True,
+
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=100_000,
+        batch_size=16,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_hummus_ee_finetune/64000/params"),
+        num_train_steps=120_000,
     ),
     TrainConfig(
         name="pi0_fast_xmi_rby_low_mem_finetune",
-        model=pi0_fast.Pi0FASTConfig(action_dim=20, action_horizon=25, max_token_len=250, paligemma_variant="gemma_2b_lora"),
+        model=pi0_fast.Pi0FASTConfig(action_dim=29, action_horizon=18, max_token_len=290, paligemma_variant="gemma_2b_lora"),
         data=LeRobotXmiRbyDataConfig(
-            repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned",
-            default_prompt="place the coffee cup on the dish",
+            repo_id="uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250801",
+            default_prompt="pick up the soup can and place it in the bin",
+
+            # retarget_mode = "20D-relative",
+            retarget_mode = "29D-intergripper-relative",
+            # retarget_mode = "29D-relative",
+            
+            use_top_camera=True,
+
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
@@ -859,18 +889,30 @@ _CONFIGS = [
         ema_decay=None,
     ),
     TrainConfig(
+        exp_name="soup_can_in_domain_20D_relative",
+
         name="pi0_xmi_rby_low_mem_finetune",
-        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_horizon=25, action_expert_variant="gemma_300m_lora"),
+        model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_horizon=40), #, action_expert_variant="gemma_300m_lora"),
         data=LeRobotXmiRbyDataConfig(
-            repo_id="uynitsuj/hummus_xmi_full_subsample_2_cleaned2",
-            default_prompt="place the coffee cup on the dish",
+            repo_id="uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250807",
+            default_prompt="pick up the soup can and place it in the bin",
+
+            # retarget_mode = "20D-relative",
+            # retarget_mode = "20D-intergripper-relative",
+            retarget_mode = "29D-intergripper-relative",
+            # retarget_mode = "29D-relative",
+            
+            use_top_camera=True,
+
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=50_000,
-        freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_hummus_ee_finetune/64000/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/home/justinyu/checkpoints/pi0_xmi_rby/sky_hummus_ee_finetune/64000/params"),
+
+        num_train_steps=40_000,
+        freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora" #, action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,
     ),
@@ -1054,6 +1096,22 @@ _CONFIGS = [
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
+    ),
+    TrainConfig(
+    name="pi0_yam_sort_throw_cubes_20250716",  # Change this
+    model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+    data=LeRobotYamDataConfig(
+        repo_id="Jeffrey-Liu/yam_sort_throw_cubes_20250716",  # Change this
+        action_space="joint",  # Keep as "joint" for easier start
+        default_prompt="Pick up and throw the blue cubes into the left bin and pick up and throw the green cubes into the right bin",  # Change this
+        base_config=DataConfig(prompt_from_task=True),
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+    num_train_steps=20_000,  # Adjust as needed
+    freeze_filter=pi0.Pi0Config(
+        paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+    ).get_freeze_filter(),
+    ema_decay=None,
     ),
     #
     #

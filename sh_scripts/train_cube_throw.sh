@@ -1,0 +1,1 @@
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi0_yam_sort_throw_cubes_20250716 --exp-name=yam_sort_throw_cubes_20250716 --overwrite

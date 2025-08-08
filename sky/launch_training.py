@@ -17,9 +17,10 @@ import sys
 import tempfile
 import yaml
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 import tyro
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
 import openpi.training.config as _config
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 from datetime import datetime
@@ -27,14 +28,17 @@ from datetime import datetime
 from openpi.utils.sky_utils import (
     check_prerequisites,
     upload_dataset_to_s3,
-    generate_sky_config,
-    launch_training
+    generate_sky_config_aws,
+    launch_training,
+    query_sky_accelerators,
+    generate_sky_config_lambda
 )
 
 @dataclass
 class SkyPilotTrainingConfig:
     config_name: str
     exp_name: Optional[str] = None
+    service_provider: Optional[List[str]] = field(default_factory=lambda: ["lambda"]) #, "aws"]) # Default will search for cheapest service provider in the list
     s3_bucket: str = "s3://xdof-internal-research"
     s3_checkpoint_base: str = "s3://xdof-internal-research/model_ckpts"
     accelerators: str = "A100:8"
@@ -89,7 +93,15 @@ def main(cfg: SkyPilotTrainingConfig):
     # Check prerequisites
     if not check_prerequisites():
         sys.exit(1)
-    
+
+    if len(cfg.service_provider) > 1:
+        cheapest_service_provider = query_sky_accelerators(cfg.accelerators, cfg.region, cfg.service_provider)
+        print(f"Cheapest service provider for the requested accelerators {cfg.accelerators} is: {cheapest_service_provider['cheapest_option']['CLOUD']}")
+        service_provider = cheapest_service_provider['cheapest_option']['CLOUD'].lower()
+    else:
+        service_provider = cfg.service_provider[0]
+        print(f"Using {service_provider} as the service provider")
+
     # Generate dataset name and S3 paths
     dataset_name = dataset_path.name
     s3_dataset_prefix = dataset_path.parent.name
@@ -103,19 +115,32 @@ def main(cfg: SkyPilotTrainingConfig):
         config.assets_dirs
     )
     
-    # Generate SkyPilot configuration
-    print("📝 Generating SkyPilot configuration...")
-    config = generate_sky_config(
-        dataset_s3_path=dataset_s3_path,
-        config_name=cfg.config_name,
-        exp_name=cfg.exp_name,
-        repo_id=repo_id,
-        s3_checkpoint_base=cfg.s3_checkpoint_base, 
-        wandb_api_key=wandb_api_key,
-        accelerators=cfg.accelerators,
-        region=cfg.region,
-    )
-    
+    if service_provider == "aws":
+        
+        # Generate SkyPilot configuration
+        print("📝 Generating SkyPilot configuration for AWS...")
+        config = generate_sky_config_aws(
+            dataset_s3_path=dataset_s3_path,
+            config_name=cfg.config_name,
+            exp_name=cfg.exp_name,
+            repo_id=repo_id,
+            s3_checkpoint_base=cfg.s3_checkpoint_base, 
+            wandb_api_key=wandb_api_key,
+            accelerators=cfg.accelerators,
+            region=cfg.region,
+        )
+    elif service_provider == "lambda":
+        print("📝 Generating SkyPilot configuration for Lambda...")
+        config = generate_sky_config_lambda(
+            dataset_s3_path=dataset_s3_path,
+            config_name=cfg.config_name,
+            exp_name=cfg.exp_name,
+            repo_id=repo_id,
+            s3_checkpoint_base=cfg.s3_checkpoint_base, 
+            wandb_api_key=wandb_api_key,
+            accelerators=cfg.accelerators,
+            region=cfg.region,
+        )    
     # Write config to temporary file
     with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)

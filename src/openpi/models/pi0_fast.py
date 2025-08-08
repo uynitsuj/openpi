@@ -5,6 +5,7 @@ import einops
 import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
+import jax.debug
 import jax.numpy as jnp
 from typing_extensions import override
 
@@ -13,11 +14,18 @@ import openpi.models.gemma_fast as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
+from transformers import AutoProcessor
+import sentencepiece
+import openpi.shared.download as download
 
 logger = logging.getLogger("openpi")
 
 PALIGEMMA_EOS_TOKEN = 1
 
+_fast_tokenizer = AutoProcessor.from_pretrained("physical-intelligence/fast", trust_remote_code=True)
+path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+with path.open("rb") as f:
+    _paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
@@ -128,7 +136,10 @@ class Pi0FASTConfig(_model.BaseModelConfig):
 class Pi0FAST(_model.BaseModel):
     def __init__(self, config: Pi0FASTConfig, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+        self.config = config
         paligemma_config = _gemma.get_config(config.paligemma_variant)
+        _fast_tokenizer.time_horizon = config.action_horizon
+        _fast_tokenizer.action_dim = config.action_dim
         # TODO: rewrite gemma in NNX. For now, use bridge.
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
@@ -233,6 +244,7 @@ class Pi0FAST(_model.BaseModel):
         observation: _model.Observation,
         *,
         max_decoding_steps: int | at.Int[at.Array, ""] = 256,
+        dct_coeff_early_stop: int = 3, # Set to None to disable DCT early stopping and go back to full action signal reconstruction
         temperature: float = 0.0,
     ) -> _model.Actions:
         # TODO: this is a hack to get the image keys.
@@ -293,9 +305,42 @@ class Pi0FAST(_model.BaseModel):
 
             return last_logit, output_tokens, kv_cache, all_eos, step + 1
 
+        def token_length_callback(tokens):
+            # Decode tokens and get length
+            if jnp.any(tokens):
+                decoded_tokens = _paligemma_tokenizer.decode(jnp.trim_zeros(tokens.astype(jnp.int32)[0]).tolist())
+                if decoded_tokens == "Action" or decoded_tokens == "Action:":
+                    return 0
+                
+                # print(decoded_tokens.split("Action: "))
+
+                raw_action_tokens = jnp.array(_paligemma_tokenizer.encode(decoded_tokens.split("Action: ")[1].split("|")[0].strip()))
+                action_tokens = act_tokens_to_paligemma_tokens(raw_action_tokens)
+                
+                action_tok = _fast_tokenizer.bpe_tokenizer.decode(action_tokens.tolist())
+
+                return len(action_tok)
+            else:
+                return 0
+            
+        def act_tokens_to_paligemma_tokens(tokens: jnp.ndarray | list[int]) -> jnp.ndarray:
+            if isinstance(tokens, list):
+                tokens = jnp.array(tokens)
+            return _paligemma_tokenizer.vocab_size() - 1 - 128 - tokens
+
         def cond(carry):
-            _, _, _, all_eos, step = carry
-            return (~all_eos) & (step < max_decoding_steps)
+            _, output_tokens, _, all_eos, step = carry
+
+            if dct_coeff_early_stop is not None and dct_coeff_early_stop < self.config.action_horizon:
+                decoded_length = jax.pure_callback(
+                    token_length_callback,
+                    jnp.zeros((), jnp.int32),  # Return shape and dtype
+                    output_tokens,
+                )
+            
+                return (~all_eos) & (step < max_decoding_steps) & (decoded_length < dct_coeff_early_stop * self.config.action_dim)
+            else:
+                return (~all_eos) & (step < max_decoding_steps)
 
         # Use lax.while_loop so we can jit the full decoding loop.
         _, output_tokens, _, _, _ = jax.lax.while_loop(cond, step, (last_logit, output_tokens, kv_cache, False, 0))

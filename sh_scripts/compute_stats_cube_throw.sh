@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 uv run scripts/compute_norm_stats.py --config-name pi0_yam_sort_throw_cubes_20250716 --epsilon 1e-2

@@ -2,7 +2,18 @@ import subprocess
 import os
 from pathlib import Path
 from typing import Optional, Tuple, Union
+import json
 
+def get_video_resolution(path: str):
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-select_streams", "v:0", "-show_entries", "stream=width,height",
+        path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    info = json.loads(result.stdout)
+    stream = info["streams"][0]
+    return stream["width"], stream["height"]
 
 def resize_and_pad_video(
     input_path: str,
@@ -14,7 +25,9 @@ def resize_and_pad_video(
     bitrate: Optional[str] = None,
     overwrite: bool = True,
     fps: Optional[Union[int, float, str]] = None,
-    frame_stride: Optional[int] = None
+    frame_stride: Optional[int] = None,
+    keep_left_half: bool = False,
+    crop_to_square: bool = False
 ) -> bool:
     """
     Resize, pad, and optionally subsample a video using ffmpeg.
@@ -87,19 +100,64 @@ def resize_and_pad_video(
     elif fps is not None:
         # Use fps filter for frame rate conversion
         filters.append(f"fps={fps}")
+
+    # if keep_left_half:
+    #     # Crop the left half first
+    #     filters.append("crop=iw/2:ih:0:0")
+        
+    #     if crop_to_square:
+    #         # Now crop a centered square from the result
+    #         center_square_crop = "crop='if(lt(iw,ih),iw,ih)':'if(lt(iw,ih),iw,ih)':'trunc((iw-if(lt(iw,ih),iw,ih))/2)':'trunc((ih-if(lt(iw,ih),iw,ih))/2)'"
+
+    #         filters.append(center_square_crop)
+
+    # if crop_to_square and not keep_left_half:
+    #     # Crop a centered square from the full frame
+    #     center_square_crop = "crop='if(lt(iw,ih),iw,ih)':'if(lt(iw,ih),iw,ih)':'trunc((iw-if(lt(iw,ih),iw,ih))/2)':'trunc((ih-if(lt(iw,ih),iw,ih))/2)'"
+
+    #     filters.append(center_square_crop)    
+
+    # # # Spatial scaling and padding filters
+    # # if target_aspect_ratio:
+    # #     scale_filter = f"scale='if(gt(a,{target_width}/{target_height}),{target_width},-1)':'if(gt(a,{target_width}/{target_height}),-1,{target_height})'"
+    # # else:
+    # #     # For square output, maintain aspect ratio and fit within target_size
+    # #     scale_filter = f"scale='if(gt(a,1),{target_size},-1)':'if(gt(a,1),-1,{target_size})'"
+
+    # if crop_to_square:
+    #     scale_filter = f"scale={target_size}:{target_size}"
+    # elif target_aspect_ratio:
+    #     scale_filter = f"scale='if(gt(a,{target_width}/{target_height}),{target_width},-1)':'if(gt(a,{target_width}/{target_height}),-1,{target_height})'"
+    # else:
+    #     scale_filter = f"scale='if(gt(a,1),{target_size},-1)':'if(gt(a,1),-1,{target_size})'"
+
     
-    # Spatial scaling and padding filters
-    if target_aspect_ratio:
-        scale_filter = f"scale='if(gt(a,{target_width}/{target_height}),{target_width},-1)':'if(gt(a,{target_width}/{target_height}),-1,{target_height})'"
+    # filters.append(scale_filter)
+    
+    # if not crop_to_square:
+    #     pad_filter = f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2"
+    #     filters.append(pad_filter)
+    
+    if keep_left_half:
+        filters.append("crop=iw/2:ih:0:0")
+
+    if crop_to_square:
+        filters.append(
+            "crop='min(iw\\,ih)':'min(iw\\,ih)':'(iw-min(iw\\,ih))/2':'(ih-min(iw\\,ih))/2'"
+        )
+        filters.append(f"scale={target_size}:{target_size}")
+
     else:
-        # For square output, maintain aspect ratio and fit within target_size
-        scale_filter = f"scale='if(gt(a,1),{target_size},-1)':'if(gt(a,1),-1,{target_size})'"
-    
-    filters.append(scale_filter)
-    
-    pad_filter = f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2"
-    filters.append(pad_filter)
-    
+        # Resize preserving aspect ratio, then pad to target dimensions
+        if target_aspect_ratio:
+            target_width, target_height = target_aspect_ratio
+            scale_filter = f"scale='if(gt(a,{target_width}/{target_height}),{target_width},-1)':'if(gt(a,{target_width}/{target_height}),-1,{target_height})'"
+        else:
+            scale_filter = f"scale='if(gt(a,1),{target_size},-1)':'if(gt(a,1),-1,{target_size})'"
+        filters.append(scale_filter)
+        filters.append(f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2")
+
+
     # Combine all filters
     vf = ",".join(filters)
     cmd.extend(["-vf", vf])
@@ -123,9 +181,8 @@ def resize_and_pad_video(
     
     # Output
     cmd.append(str(output_path))
-    
     try:
-        # Run ffmpeg command
+        # Run ffmpeg command on GPU
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -148,7 +205,9 @@ def resize_and_pad_video(
                 bitrate=bitrate,
                 overwrite=overwrite,
                 fps=fps,
-                frame_stride=frame_stride
+                frame_stride=frame_stride,
+                keep_left_half=keep_left_half,
+                crop_to_square=crop_to_square
             )
         
         print(f"FFmpeg error: {e.stderr}")

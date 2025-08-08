@@ -20,7 +20,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from tqdm import tqdm
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import numpy as np
 import tyro
 import gc
@@ -28,6 +28,15 @@ import shutil
 import viser.transforms as vtf
 from openpi.utils.xmi_dataloader_utils import load_episode_data, validate_episode_data, validate_array_data, validate_records, validate_images
 from openpi.utils.matrix_utils import *
+
+# Video processing imports for timestamp validation
+try:
+    import torch
+    import torchvision
+    HAS_VIDEO_PROCESSING = True
+except ImportError:
+    print("Warning: Video processing libraries not available. Video timestamp validation disabled.")
+    HAS_VIDEO_PROCESSING = False
 
 # Set environment variable for dataset storage
 
@@ -40,11 +49,14 @@ except ImportError:
     print("Warning: LeRobot not available. Hub push functionality disabled.")
     HAS_LEROBOT = False
 
+# TODO: remove this once we have a better way to handle this
+DEG30_MOUNTS = ["20250725", "20250724", "20250727", "20250728", "20250801", "20250804"]
 
 @dataclass
 class XMIConfig:
     # Input data paths
     raw_dataset_folders: List[str] = field(default_factory=lambda: [
+        ## Hummus data
         # "/nfs_us/hummus_xmi_data/pick_place_beverage",
         # "/nfs_us/hummus_xmi_data/pick_place_chips_bag",
         # "/nfs_us/hummus_xmi_data/pick_place_candy_bag",
@@ -55,30 +67,56 @@ class XMIConfig:
         # "/nfs_us/hummus_xmi_data/pick_place_soup_can",
         # "/nfs_us/hummus_xmi_data/pick_place_toothpaste",
         # "/nfs_us/hummus_xmi_data/pick_place_yoghurt",
+
+        ## US XMI-RBY1 Coffee Cup Data
         # "/home/justinyu/Downloads/20250630",
         # "/home/justinyu/Downloads/data_20250708",
-        "/nfs_us/data/us_xmi_01/20250714",
-        "/nfs_us/data/us_xmi_01/20250715",
-        "/nfs_us/data/oreo_xmi/clean_whiteboard",
-        "/nfs_us/data/oreo_xmi/fold_napkin_place_utensils_inside_and_roll_it_up",
-        "/nfs_us/data/oreo_xmi/folding_skirt_pile_and_stacking",
-        "/nfs_us/data/oreo_xmi/folding_trousers_pile_and_stacking",
-        "/nfs_us/data/oreo_xmi/folding_tshirt_pile_and_stacking",
-        "/nfs_us/data/oreo_xmi/insert_the_plug",
-        "/nfs_us/data/oreo_xmi/packing_luggage",
-        "/nfs_us/data/oreo_xmi/painting_nails",
-        "/nfs_us/data/oreo_xmi/place_fake_bread",
-        "/nfs_us/data/oreo_xmi/place_trousers_on_hanger",
-        "/nfs_us/data/oreo_xmi/place_tshirt_on_hanger",
-        "/nfs_us/data/oreo_xmi/put_pillow_into_pillowcase",
-        "/nfs_us/data/oreo_xmi/serve_a_lunch_box",
-        "/nfs_us/data/oreo_xmi/sorting_stationery_into_containers",
-        "/nfs_us/data/oreo_xmi/untangling_cables",
-        "/nfs_us/data/oreo_xmi/zip_up_a_jacket",
+
+        ## US XMI-RBY1 In-Domain Soup Can Data
+        # "/nfs_us/data/us_xmi_01/20250714",
+        # "/nfs_us/data/us_xmi_01/20250715",
+        # "/nfs_us/data/us_xmi_01/20250717/hand_off",
+        # "/nfs_us/data/us_xmi_01/20250717/missed_grasps", # Hmmm maybe don't include this causes gripper to prematurely predict close gripper action in deployment which has the opposite intended effect
+        # "/nfs_us/data/us_xmi_01/20250724", 
+
+        "/nfs_us/data/us_xmi_01/20250725", # Better head data than prior data
+        "/nfs_us/data/us_xmi_01/20250727",
+        "/nfs_us/data/us_xmi_01/20250728",
+        "/nfs_us/data/us_xmi_01/20250801",
+        "/nfs_us/data/us_xmi_01/20250804",
+
+        # ## Oreo data
+        # # "/nfs_us/data/oreo_xmi/clean_whiteboard", 
+        # "/nfs_us/data/oreo_xmi/fold_napkin_place_utensils_inside_and_roll_it_up",
+        # "/nfs_us/data/oreo_xmi/folding_skirt_pile_and_stacking",
+        # "/nfs_us/data/oreo_xmi/folding_trousers_pile_and_stacking",
+        # "/nfs_us/data/oreo_xmi/folding_tshirt_pile_and_stacking",
+        # "/nfs_us/data/oreo_xmi/insert_the_plug",
+        # "/nfs_us/data/oreo_xmi/packing_luggage",
+        # # "/nfs_us/data/oreo_xmi/painting_nails",
+        # "/nfs_us/data/oreo_xmi/place_fake_bread",
+        # "/nfs_us/data/oreo_xmi/place_trousers_on_hanger",
+        # "/nfs_us/data/oreo_xmi/place_tshirt_on_hanger",
+        # # "/nfs_us/data/oreo_xmi/put_pillow_into_pillowcase",
+        # "/nfs_us/data/oreo_xmi/serve_a_lunch_box",
+        # "/nfs_us/data/oreo_xmi/sorting_stationery_into_containers",
+        # "/nfs_us/data/oreo_xmi/untangling_cables",
+        # "/nfs_us/data/oreo_xmi/zip_up_a_jacket",
+
+        ## SZ XMI-RBY OOD Data
+        # "/nfs_us/data/sz_xmi_02/20250731",
+        # "/nfs_us/data/sz_xmi_02/20250801",
+        # "/nfs_us/data/sz_xmi_02/20250802",
+        # "/nfs_us/data/sz_xmi_02/20250803",
+        # "/nfs_us/data/sz_xmi_02/20250804",
+        # "/nfs_us/data/sz_xmi_02/20250805",
+        # "/nfs_us/data/sz_xmi_02/20250806",
+
     ])
     
     # Language instructions corresponding to each dataset folder (ANNOTATION OVERRIDES)
     language_instructions: List[str] = field(default_factory=lambda: [
+        ## Hummus data
         # "pick up the beverage and place it in the bin",
         # "pick up the chips bag and place it in the bin",
         # "pick up the candy bag and place it in the bin",
@@ -88,31 +126,48 @@ class XMIConfig:
         # "pick up the shaving razor and place it in the bin",
         # "pick up the soup can and place it in the bin",
         # "pick up the toothpaste and place it in the bin",
-        # "pick up the yoghurt and place it in the bin",
+        # "pick up the yogurt and place it in the bin",
+
+        ## US XMI-RBY1 Coffee Cup Data
         # "place the coffee cup on the dish",
-        # "place the coffee cup on the dish"
+        # "place the coffee cup on the dish",
+
+        ## US XMI-RBY1 In-Domain Soup Can Data
+        # "pick up the soup can and place it in the bin",
+        # "pick up the soup can and place it in the bin",
+        # "pick up the soup can and place it in the bin",
+        # "pick up the soup can and place it in the bin",
+        # "pick up the soup can and place it in the bin",
+        
         "pick up the soup can and place it in the bin",
         "pick up the soup can and place it in the bin",
-        "clean the whiteboard with the eraser",
-        "place the utensils inside the napkin and roll it up",
-        "fold the skirt and stack it in a neat pile",
-        "fold the trousers and stack it in a neat pile",
-        "fold the tshirt and stack it in a neat pile",
-        "insert the plug into the socket",
-        "pack the luggage",
-        "paint the nails",
-        "place the bread on the plate",
-        "place the trousers on the hanger",
-        "place the tshirt on the hanger",
-        "put the pillow into the pillowcase",
-        "serve the lunch box",
-        "sort the stationery into the containers",
-        "untangle the cables and put them in the bin",
-        "zip up the jacket",
+        "pick up the soup can and place it in the bin",
+        "pick up the soup can and place it in the bin",
+        "pick up the soup can and place it in the bin",
+
+
+        # ## Oreo data
+        # # "clean the whiteboard with the eraser",
+        # "place the utensils inside the napkin and roll it up",
+        # "fold the skirt and stack it in a neat pile",
+        # "fold the trousers and stack it in a neat pile",
+        # "fold the tshirt and stack it in a neat pile",
+        # "insert the plug into the socket",
+        # "pack the luggage",
+        # # "paint the nails",
+        # "place the bread on the plate",
+        # "place the trousers on the hanger",
+        # "place the tshirt on the hanger",
+        # # "put the pillow into the pillowcase",
+        # "serve the lunch box",
+        # "sort the stationery into the containers",
+        # "untangle the cables and put them in the bin",
+        # "zip up the jacket",
     ])
     
     # Repository name for output dataset
-    repo_name: str = "uynitsuj/oreo_xmi_subsample_2"
+    # repo_name: str = "uynitsuj/hummus_xmi_data_20250722_test_sz_to_us"
+    repo_name: str = "uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250807"
     
     # Camera settings
     camera_keys: List[str] = field(default_factory=lambda: [
@@ -127,21 +182,39 @@ class XMIConfig:
         "top_camera-images-rgb": "top_camera-images-rgb"
     })
     
-    # Calibration files
+    # Calibration files TODO: very bad, going forward calibration data should be attached to and extracted from episode metadata
     left_controller_calib: str = "/nfs_us/justinyu/us_xmi_calib/Left_Controller_20250603_15/calib_results/controller2franka.npy"
     right_controller_calib: str = "/nfs_us/justinyu/us_xmi_calib/Right_Controller_20250603_15/calib_results/controller2franka.npy"
+    quest_to_zed_calib: str = "/home/justinyu/nfs_us/justinyu/us_xmi_calib/Head_Franka_20250604_12/calib_results/head2cam.npy"
     
     # Processing settings
     resize_size: int = 224
     fps: int = 30 # Framerate of original video
-    temporal_subsample_factor: int = 2 # Subsample every N frames (1 = no subsampling)
+    temporal_subsample_factor: int = 1 # Subsample every N frames (1 = no subsampling)
+    crop_images_to_square: bool = True # Whether to crop images to square (if False, will keep original aspect ratio and pad with black instead)
     chunk_size: int = 1000
-    max_workers: int = 8
+    max_workers: int = 10
     max_episodes: Optional[int] = None
     skip_videos: bool = False
     first_frame_head_reorient: bool = False
+    no_filter_quality: bool = True  # If True, will not filter out low quality episodes
+    include_head_pose: bool = True # Whether to include head state in the lerobot proprio state and action (for head / active vision retargeting) NOTE: makes state dim and action dim 29 instead of 20 (adds 6d rot 3d pos)
 
-    delta_proprio_keys: str = "z" # Makes the proprioceptive state for this axis delta. Can set to None to keep absolute
+    gripper_action_delay_tsteps: int = 8 # Number of timesteps to delay the gripper action by
+
+    perturb_z_height: bool = True # Whether to perturb the z height of the head and hands around average tabletop height
+    perturb_z_height_range: Tuple[float, float] = (0.59, 1.0) # Range of z height of hands perturbation (uniformly sampled)
+
+    perturb_xy_position: bool = True # Whether to perturb the xy position of the head and hands around average tabletop position
+    perturb_x_position_range: Tuple[float, float] = (0.05, 0.2) # Range of x position perturbation (uniformly sampled)
+    perturb_y_position_range: Tuple[float, float] = (-0.1, 0.1) # Range of y position perturbation (uniformly sampled)
+
+    delta_proprio_keys: str = None # Makes the proprioceptive state for this axis delta. Can set to None to keep both state and action absolute
+
+    # Validation settings
+    max_se3_diff_in_meters: float = 0.20  # Maximum allowed SE3 difference in meters
+    max_se3_diff_in_degrees: float = 11  # Maximum allowed SE3 difference in degrees
+    video_timestamp_tolerance_s: float = 0.0001  # Maximum allowed deviation from expected frame interval for video validation (seconds)
     
     # Hub settings
     push_to_hub: bool = False
@@ -171,390 +244,6 @@ def convert_to_uint8(img: np.ndarray) -> np.ndarray:
         img = (255 * img).astype(np.uint8)
     return img
 
-
-def detect_available_encoders():
-    """Detect available hardware and software video encoders."""
-    import subprocess
-    
-    encoders = []
-    
-    # Test for available encoders by checking ffmpeg
-    try:
-        result = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], 
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                              universal_newlines=True, timeout=10)
-        encoder_output = result.stdout
-        
-        # Check for hardware encoders (in order of preference)
-        hardware_encoders = [
-            ('h264_nvenc', 'NVIDIA NVENC H.264'),
-            ('hevc_nvenc', 'NVIDIA NVENC H.265'),
-            ('h264_qsv', 'Intel Quick Sync H.264'),
-            ('hevc_qsv', 'Intel Quick Sync H.265'),
-            ('h264_amf', 'AMD VCE H.264'),
-            ('hevc_amf', 'AMD VCE H.265'),
-            ('h264_videotoolbox', 'Apple VideoToolbox H.264'),
-            ('hevc_videotoolbox', 'Apple VideoToolbox H.265'),
-        ]
-        
-        for encoder_name, description in hardware_encoders:
-            if encoder_name in encoder_output:
-                encoders.append((encoder_name, description, 'hardware'))
-        
-        # Software encoders as fallback
-        software_encoders = [
-            ('libx264', 'Software H.264', 'software'),
-            ('libx265', 'Software H.265', 'software'),
-        ]
-        
-        for encoder_name, description, enc_type in software_encoders:
-            if encoder_name in encoder_output:
-                encoders.append((encoder_name, description, enc_type))
-                
-    except Exception as e:
-        print(f"Warning: Could not detect encoders: {e}")
-        # Fallback to basic software encoder
-        encoders = [('libx264', 'Software H.264 (fallback)', 'software')]
-    
-    return encoders
-
-
-def get_encoder_settings(encoder_name: str, quality: str = 'fast') -> dict:
-    """Get optimized settings for different encoders."""
-    
-    settings: dict = {
-        'pix_fmt': 'yuv420p',
-        'movflags': '+faststart'  # Enable fast start for web playback
-    }
-    
-    if 'nvenc' in encoder_name:
-        # NVIDIA NVENC settings
-        if quality == 'fastest':
-            encoder_settings = {
-                'preset': 'p1',      # Fastest preset
-                'tune': 'ull',       # Ultra-low latency
-                'rc': 'vbr',         # Variable bitrate
-                'cq': '28',          # Quality (lower = better, 18-28 typical)
-                'b:v': '3M',         # Target bitrate
-                'maxrate': '6M',     # Max bitrate
-                'bufsize': '6M',     # Buffer size
-                'gpu': '0'           # GPU index
-            }
-        else:  # 'fast'
-            encoder_settings = {
-                'preset': 'p4',      # Faster preset
-                'tune': 'hq',        # High quality
-                'rc': 'vbr',
-                'cq': '23',
-                'b:v': '5M',
-                'maxrate': '10M',
-                'bufsize': '10M',
-                'gpu': '0'
-            }
-        settings.update(encoder_settings)
-    
-    elif 'qsv' in encoder_name:
-        # Intel Quick Sync settings
-        if quality == 'fastest':
-            encoder_settings = {
-                'preset': 'veryfast',
-                'global_quality': '28',
-                'look_ahead': '0',
-                'b:v': '3M'
-            }
-        else:  # 'fast'
-            encoder_settings = {
-                'preset': 'fast',
-                'global_quality': '23',
-                'look_ahead': '1',
-                'b:v': '5M'
-            }
-        settings.update(encoder_settings)
-    
-    elif 'amf' in encoder_name:
-        # AMD VCE settings
-        if quality == 'fastest':
-            encoder_settings = {
-                'quality': 'speed',
-                'rc': 'vbr_peak',
-                'qp_i': '28',
-                'qp_p': '30',
-                'b:v': '3M'
-            }
-        else:  # 'fast'
-            encoder_settings = {
-                'quality': 'balanced',
-                'rc': 'vbr_peak',
-                'qp_i': '22',
-                'qp_p': '24',
-                'b:v': '5M'
-            }
-        settings.update(encoder_settings)
-    
-    elif 'videotoolbox' in encoder_name:
-        # Apple VideoToolbox settings
-        if quality == 'fastest':
-            encoder_settings = {
-                'q:v': '65',         # Quality (0-100, higher = better)
-                'realtime': '1',     # Real-time encoding
-                'b:v': '3M'
-            }
-        else:  # 'fast'
-            encoder_settings = {
-                'q:v': '55',
-                'b:v': '5M'
-            }
-        settings.update(encoder_settings)
-    
-    else:
-        # Software encoder fallback (libx264/libx265)
-        if quality == 'fastest':
-            encoder_settings = {
-                'preset': 'ultrafast',
-                'crf': '28',
-                'tune': 'fastdecode'
-            }
-        else:  # 'fast'
-            encoder_settings = {
-                'preset': 'veryfast',
-                'crf': '23'
-            }
-        settings.update(encoder_settings)
-    
-    return settings
-
-
-def benchmark_encoder(encoder_name: str, test_frames: List[np.ndarray], fps: int, temporal_subsample_factor: int = 1):
-    """Benchmark an encoder with test frames."""
-    import tempfile
-    import time
-    import subprocess
-    
-    if not test_frames:
-        return float('inf')
-    
-    height, width, _ = test_frames[0].shape
-    
-    with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as temp_input:
-        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_output:
-            try:
-                # Write test frames
-                frame_data = np.stack(test_frames).astype(np.uint8)
-                temp_input.write(frame_data.tobytes())
-                temp_input.flush()
-                
-                # Get encoder settings
-                settings = get_encoder_settings(encoder_name, 'fastest')
-                
-                # Build ffmpeg command
-                cmd = [
-                    'ffmpeg', '-y',
-                    '-f', 'rawvideo',
-                    '-pix_fmt', 'rgb24',
-                    '-s', f'{width}x{height}',
-                    '-framerate', str(fps/temporal_subsample_factor),
-                    '-i', temp_input.name,
-                    '-vcodec', encoder_name,
-                ]
-                
-                # Add encoder-specific settings
-                for key, value in settings.items():
-                    if key not in ['common']:
-                        cmd.extend([f'-{key}', str(value)])
-                
-                cmd.append(temp_output.name)
-                
-                # Benchmark encoding time
-                start_time = time.time()
-                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-                end_time = time.time()
-                
-                if result.returncode == 0:
-                    encoding_time = end_time - start_time
-                    return encoding_time
-                else:
-                    return float('inf')
-                    
-            except Exception:
-                return float('inf')
-            finally:
-                # Cleanup
-                try:
-                    os.unlink(temp_input.name)
-                    os.unlink(temp_output.name)
-                except:
-                    pass
-
-
-def select_best_encoder(test_frames: List[np.ndarray] = None, fps: int = 30, temporal_subsample_factor: int = 1):
-    """Select the best available encoder, optionally with benchmarking."""
-    encoders = detect_available_encoders()
-    
-    if not encoders:
-        return 'libx264', 'fast'
-    
-    print(f"Available encoders: {[(name, desc) for name, desc, _ in encoders]}")
-    
-    # If we have test frames, benchmark the encoders
-    if test_frames and len(test_frames) >= 10:
-        print("Benchmarking encoders...")
-        benchmark_results = []
-        
-        # Test up to 3 fastest hardware encoders + software fallback
-        test_encoders = [enc for enc in encoders if enc[2] == 'hardware'][:3]
-        test_encoders.extend([enc for enc in encoders if enc[2] == 'software'][:1])
-        
-        for encoder_name, description, enc_type in test_encoders:
-            print(f"Testing {encoder_name} ({description})...")
-            # Use subset of frames for benchmarking
-            test_subset = test_frames[:min(10, len(test_frames))]
-            encode_time = benchmark_encoder(encoder_name, test_subset, fps, temporal_subsample_factor)
-            if encode_time != float('inf'):
-                benchmark_results.append((encoder_name, encode_time, description))
-                print(f"  {encoder_name}: {encode_time:.2f}s for {len(test_subset)} frames")
-            else:
-                print(f"  {encoder_name}: Failed")
-        
-        if benchmark_results:
-            # Sort by encoding time (fastest first)
-            benchmark_results.sort(key=lambda x: x[1])
-            best_encoder = benchmark_results[0][0]
-            print(f"Best encoder: {best_encoder} ({benchmark_results[0][2]})")
-            
-            # Use fastest quality for best performance
-            quality = 'fastest' if any('nvenc' in best_encoder or 'qsv' in best_encoder or 'amf' in best_encoder 
-                                    for best_encoder in [best_encoder]) else 'fast'
-            return best_encoder, quality
-    
-    # Default selection without benchmarking
-    # Prefer hardware encoders in order of typical performance
-    preferred_order = ['h264_nvenc', 'h264_qsv', 'h264_amf', 'h264_videotoolbox', 'libx264']
-    
-    for preferred in preferred_order:
-        for encoder_name, description, enc_type in encoders:
-            if encoder_name == preferred:
-                quality = 'fastest' if enc_type == 'hardware' else 'fast'
-                print(f"Selected encoder: {encoder_name} ({description}) with {quality} quality")
-                return encoder_name, quality
-    
-    # Fallback to first available
-    encoder_name, description, enc_type = encoders[0]
-    quality = 'fastest' if enc_type == 'hardware' else 'fast'
-    print(f"Using fallback encoder: {encoder_name} ({description}) with {quality} quality")
-    return encoder_name, quality
-
-
-def encode_video_optimized(frames: List[np.ndarray], save_path: Path, fps: int, temporal_subsample_factor: int = 1,
-                          encoder_name: str = None, quality: str = 'fast'):
-    """Encode frames into a video using optimized ffmpeg settings."""
-    import subprocess
-    import tempfile
-    
-    if not frames:
-        print(f"Error: No frames provided for encoding to {save_path}")
-        return
-    
-    height, width, _ = frames[0].shape
-    
-    # Get encoder settings
-    settings = get_encoder_settings(encoder_name, quality)
-    
-    # Create temporary raw video file
-    with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as temp_file:
-        temp_path = temp_file.name
-        # Write frames as raw video data
-        frame_data = np.stack(frames).astype(np.uint8)
-        temp_file.write(frame_data.tobytes())
-    
-    try:
-        # Calculate effective framerate (frames are already subsampled)
-        effective_fps = fps / temporal_subsample_factor
-        
-        # Build optimized ffmpeg command
-        cmd = [
-            'ffmpeg', '-y',
-            '-f', 'rawvideo',
-            '-pix_fmt', 'rgb24',
-            '-s', f'{width}x{height}',
-            '-framerate', str(effective_fps),
-            '-i', temp_path,
-            '-vcodec', encoder_name,
-        ]
-        
-        # Add encoder-specific settings
-        for key, value in settings.items():
-            if key not in ['common']:
-                cmd.extend([f'-{key}', str(value)])
-        
-        # Add common settings
-        cmd.extend(['-r', str(effective_fps)])
-        cmd.append(str(save_path))
-        
-        result = subprocess.run(cmd, capture_output=True, timeout=60)
-        if result.returncode != 0:
-            print(f"Warning: Optimized encoding failed for {save_path}, trying fallback")
-            print(f"Error: {result.stderr.decode()}")
-            # Fallback to simple encoding
-            encode_video_simple(frames, save_path, fps, temporal_subsample_factor)
-        
-    except Exception as e:
-        print(f"Exception in optimized encoding for {save_path}: {e}")
-        # Fallback to simple encoding
-        encode_video_simple(frames, save_path, fps, temporal_subsample_factor)
-    finally:
-        # Clean up temporary file
-        try:
-            os.unlink(temp_path)
-        except:
-            pass
-
-
-def encode_video_simple(frames: List[np.ndarray], save_path: Path, fps: int, temporal_subsample_factor: int = 1):
-    """Simple fallback encoding function."""
-    import subprocess
-    import tempfile
-    
-    if not frames:
-        return
-    
-    height, width, _ = frames[0].shape
-    
-    with tempfile.NamedTemporaryFile(suffix='.raw', delete=False) as temp_file:
-        temp_path = temp_file.name
-        frame_data = np.stack(frames).astype(np.uint8)
-        temp_file.write(frame_data.tobytes())
-    
-    try:
-        # Calculate effective framerate (frames are already subsampled)
-        effective_fps = fps / temporal_subsample_factor
-        
-        cmd = [
-            'ffmpeg', '-y',
-            '-f', 'rawvideo',
-            '-pix_fmt', 'rgb24',
-            '-s', f'{width}x{height}',
-            '-framerate', str(effective_fps),
-            '-i', temp_path,
-            '-vcodec', 'libx264',
-            '-preset', 'ultrafast',
-            '-crf', '28',
-            '-pix_fmt', 'yuv420p',
-            '-r', str(effective_fps),
-            str(save_path)
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, timeout=60)
-        if result.returncode != 0:
-            print(f"Simple encoding also failed for {save_path}: {result.stderr.decode()}")
-    except Exception as e:
-        print(f"Simple encoding exception for {save_path}: {e}")
-    finally:
-        try:
-            os.unlink(temp_path)
-        except:
-            pass
-
-
 def find_episode_directories(raw_dataset_folders: List[str]) -> List[Path]:
     """Find all episode directories from the input folders."""
     episode_dirs = []
@@ -570,6 +259,43 @@ def find_episode_directories(raw_dataset_folders: List[str]) -> List[Path]:
         episode_dirs.extend(trajs)
     
     return sorted(episode_dirs)
+
+
+
+def load_episode_annotations(episode_path: Path) -> dict:
+    """Load annotation data for a YAMS episode to check quality labels."""
+    annotations = {}
+
+    # Look for annotation files for each camera
+    camera_prefixes = ["left_camera-images-rgb", "right_camera-images-rgb", "top_camera-images-rgb"]
+
+    for camera_prefix in camera_prefixes:
+        annotation_file = episode_path / f"{camera_prefix}_annotation.json"
+        if annotation_file.exists():
+            try:
+                with open(annotation_file) as f:
+                    annotation_data = json.load(f)
+                    annotations[camera_prefix] = annotation_data
+            except Exception as e:
+                print(f"Warning: Could not load annotation file {annotation_file}: {e}")
+
+    return annotations
+
+def is_episode_good_quality(episode_path: Path) -> bool:
+    """Check if an episode is labeled as 'good' quality based on annotations."""
+    annotations = load_episode_annotations(episode_path)
+
+    if not annotations:
+        return False
+
+    # Check if any camera has "good" quality label
+    for camera_prefix, annotation_data in annotations.items():
+        video_labels = annotation_data.get("video_labels", [])
+        for label in video_labels:
+            if label.get("class_description") == "overall_quality" and label.get("label") == "good":
+                return True
+
+    return False
 
 
 def move_problematic_episode(episode_path: Path, error_msg: str, cfg: XMIConfig, episode_idx: int = None) -> bool:
@@ -622,6 +348,143 @@ def move_problematic_episode(episode_path: Path, error_msg: str, cfg: XMIConfig,
         return False
 
 
+def validate_video_timestamp_synchronization(
+    episode_path: Path,
+    cfg: XMIConfig,
+    episode_idx: int = None,
+    tolerance_s: float = 0.1
+) -> tuple[bool, Optional[str]]:
+    """
+    Validate that video timestamps have consistent frame intervals matching the expected FPS.
+    
+    This function checks if video files can be loaded and if their frame intervals
+    are consistent with the expected frame rate. This prevents timestamp synchronization 
+    errors that would cause failures during downstream processing.
+    
+    Args:
+        episode_path: Path to the episode directory
+        cfg: Configuration object containing camera and timing settings
+        episode_idx: Optional episode index for logging
+        tolerance_s: Maximum allowed deviation from expected frame interval (seconds)
+        
+    Returns:
+        tuple[bool, Optional[str]]: (is_valid, error_message)
+    """
+    if not HAS_VIDEO_PROCESSING:
+        # Skip validation if video processing libraries aren't available
+        return True, None
+    
+    if cfg.skip_videos:
+        # Skip validation if videos aren't being processed
+        return True, None
+    
+    try:
+        # Expected frame interval based on original video fps (before subsampling)
+        expected_frame_interval = 1.0 / cfg.fps
+        
+        # Check each camera video
+        for cam_key in cfg.camera_keys:
+            # Look for video files in the episode directory
+            video_patterns = [
+                episode_path / f"{cam_key}.mp4",
+                episode_path / f"{cam_key}.avi", 
+                episode_path / f"{cam_key}.mov"
+            ]
+            
+            video_path = None
+            for pattern in video_patterns:
+                if pattern.exists():
+                    video_path = pattern
+                    break
+            
+            if video_path is None:
+                continue  # Skip if no video file found for this camera
+            
+            # Set torchvision backend
+            torchvision.set_video_backend("pyav")
+            
+            try:
+                # Load video metadata
+                reader = torchvision.io.VideoReader(str(video_path), "video")
+                
+                # Get video info
+                video_info = reader.get_metadata()["video"]
+                video_fps = video_info["fps"][0] if isinstance(video_info["fps"], list) else video_info["fps"]
+                video_duration = video_info["duration"][0] if isinstance(video_info["duration"], list) else video_info["duration"]
+                
+                # Check if video FPS matches expected FPS
+                fps_tolerance = 1.0  # Allow 1 FPS difference
+                if abs(video_fps - cfg.fps) > fps_tolerance:
+                    reader = None
+                    return False, f"Video {cam_key} FPS mismatch: {video_fps} != {cfg.fps} (expected)"
+                
+                if video_duration < 0.1:  # Less than 100ms
+                    reader = None
+                    return False, f"Video {cam_key} too short: {video_duration}s duration"
+                
+                # Load the first several frames to check timestamp consistency
+                reader.seek(0.0, keyframes_only=True)
+                
+                loaded_ts = []
+                frame_count = 0
+                
+                for frame in reader:
+                    current_ts = frame["pts"]
+                    loaded_ts.append(current_ts)
+                    frame_count += 1
+                    
+                    # Get enough frames to check consistency (at least 5)
+                    if frame_count >= 10:
+                        break
+                
+                reader.container.close()
+                reader = None
+                
+                if len(loaded_ts) < 3:
+                    return False, f"Video {cam_key} could not load sufficient frames for validation (got {len(loaded_ts)})"
+                
+                # Check frame interval consistency
+                frame_intervals = []
+                for i in range(1, len(loaded_ts)):
+                    interval = loaded_ts[i] - loaded_ts[i-1]
+                    frame_intervals.append(interval)
+                
+                # Calculate statistics of frame intervals
+                mean_interval = np.mean(frame_intervals)
+                max_deviation = np.max(np.abs(np.array(frame_intervals) - mean_interval))
+                
+                # Check if frame intervals are consistent with expected FPS
+                expected_deviation = abs(mean_interval - expected_frame_interval)
+                if expected_deviation > tolerance_s:
+                    return False, (
+                        f"Video {cam_key} frame interval mismatch: "
+                        f"mean={mean_interval:.4f}s, expected={expected_frame_interval:.4f}s, "
+                        f"deviation={expected_deviation:.4f}s > {tolerance_s}s tolerance"
+                    )
+                
+                # Check if frame intervals are internally consistent
+                if max_deviation > tolerance_s:
+                    return False, (
+                        f"Video {cam_key} inconsistent frame intervals: "
+                        f"max_deviation={max_deviation:.4f}s > {tolerance_s}s tolerance. "
+                        f"Intervals: {[f'{x:.4f}' for x in frame_intervals[:5]]}"
+                    )
+                
+            except Exception as e:
+                if 'reader' in locals() and reader is not None:
+                    try:
+                        reader.container.close()
+                    except:
+                        pass
+                    reader = None
+                return False, f"Video {cam_key} validation failed: {str(e)}"
+        
+        return True, None
+        
+    except Exception as e:
+        return False, f"Video timestamp validation error: {str(e)}"
+
+
 def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Path = None, episode_idx: int = None) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Process XMI episode data and apply all coordinate transformations.
@@ -644,6 +507,7 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     # Load controller calibration transformations
     left_controller_calib_tf = vtf.SE3.from_matrix(np.load(cfg.left_controller_calib)).inverse()
     right_controller_calib_tf = vtf.SE3.from_matrix(np.load(cfg.right_controller_calib)).inverse()
+    quest_to_zed_calib_tf = vtf.SE3.from_matrix(np.load(cfg.quest_to_zed_calib)).inverse()
     
     # Transform from Quest coordinate system to world coordinate system
     q2w = vtf.SE3.from_rotation_and_translation(
@@ -663,7 +527,31 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     head_height = np.mean(head_data_all.wxyz_xyz[:, -1])
     # print(f"Average head height: {head_height}m")
 
-    head_translation = np.array([head_z_tf.translation()[0], -head_z_tf.translation()[1], 0.0])
+    metadata_file = episode_path / "metadata.json"
+    if metadata_file.exists():
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+    else:
+        raise FileNotFoundError(f"Metadata file not found: {metadata_file}")
+        
+    if "config_path" in metadata.keys() and 'sz' in metadata["config_path"][0]:
+        sz_to_us_tf = vtf.SE3.from_matrix(np.array([ # TODO: very bad temporary hack for hummus data, going forward calibration data should extracted in the metadata
+            [1.0,      0.0,        0.0,        0.0],
+            [0.0,  0.956304,  0.292371,  0.02955328],
+            [0.0,  -0.292371,   0.956304,  0.00117534],
+            [0.0,      0.0,        0.0,        1.0]
+        ]))
+        quest_to_zed_calib_tf = quest_to_zed_calib_tf @ sz_to_us_tf.inverse()
+
+    if "start_datetime" in metadata.keys() and any(mount in metadata["start_datetime"] for mount in DEG30_MOUNTS):
+        old_mount_to_new_mount_tf = vtf.SE3.from_rotation_and_translation(
+            vtf.SO3.from_rpy_radians(-25 * np.pi/180, 0.0, 0.0), np.array([0.0, 0.0, 0.0])
+        )
+        quest_to_zed_calib_tf = quest_to_zed_calib_tf @ old_mount_to_new_mount_tf.inverse() # TODO: REMOVE HACK EVENTUALLY
+
+    head_translation = np.mean(head_data_all.wxyz_xyz[:, -3:], axis=0)
+    head_translation[1] = -head_translation[1]
+    head_translation[2] = 0.0
     if cfg.first_frame_head_reorient:
         head_z_axis_rot = vtf.SO3.from_rpy_radians(
             -head_z_tf.rotation().as_rpy_radians().roll,
@@ -685,6 +573,9 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     else:
         # Default to the direction of left gripper z axis (worried that randomly oriented world frame proprio input could mess up normalization statistics)
         # Make the current hand z axis point toward world negative x axis
+        def mean_angle(thetas):
+            """Circular mean of a list/array of angles in radians."""
+            return np.angle(np.exp(1j * np.asarray(thetas)).mean())
 
         left_hand_matrix = action_data["action-left-hand_in_quest_world_frame"][0]
         world_frame = action_data["action-left-quest_world_frame"][0]
@@ -731,9 +622,9 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
         hand_z_axis = tf_right_ee_ik_target.as_matrix()[:, 2]
         hand_z_axis_angle_right = np.arctan2(hand_z_axis[1], hand_z_axis[0])
         # Average the two angles
-        rby1_base_frame_wxyz = (vtf.SO3.from_rpy_radians(0.0, 0.0, np.pi + (hand_z_axis_angle_left + hand_z_axis_angle_right) / 2.0)).wxyz
+        avg_angle = mean_angle([hand_z_axis_angle_left, hand_z_axis_angle_right])
 
-
+        rby1_base_frame_wxyz = (vtf.SO3.from_rpy_radians(0.0, 0.0, np.pi + avg_angle)).wxyz
 
     rby1_base_frame_position = head_translation
 
@@ -755,10 +646,10 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     # Add end effector TCP frame with offset (same as combined viewer)
     pitch_180 = vtf.SE3.from_rotation_and_translation(vtf.SO3.from_rpy_radians(0.0, np.pi, 0.0), np.array([0.0, 0.0, 0.0]))
     yaw_45 = vtf.SE3.from_rotation_and_translation(vtf.SO3.from_rpy_radians(0.0, 0.0, np.pi/4), np.array([0.0, 0.0, 0.0]))
-    offset = vtf.SE3.from_rotation_and_translation(vtf.SO3.identity(), np.array([-0.08275, 0.0, 0.005]))
+    offset = vtf.SE3.from_rotation_and_translation(vtf.SO3.identity(), np.array([-0.08275, 0.0, 0.005])) # (WE ARE NOT ADDING TCP TO FLANGE HERE, THIS GOES TO XMI FLANGE)
     ee_tf = yaw_45 @ offset @ pitch_180
 
-    tf_left_ee_ik_target = left_hand_tf_reflected @ left_controller_calib_tf @ ee_tf
+    tf_left_ee_ik_target = left_hand_tf_reflected @ left_controller_calib_tf @ ee_tf # TODO: left_controller_calib_tf np.load from file should eventually be replaced with metadata extraction
 
     left_ee_ik_target_handle_position = tf_left_ee_ik_target.wxyz_xyz[:, -3:]
     left_ee_ik_target_handle_wxyz = tf_left_ee_ik_target.wxyz_xyz[:, :4]
@@ -780,7 +671,7 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
         -right_hand_tf.rotation().as_rpy_radians().yaw,
     ), right_hand_tf_pos)
 
-    tf_right_ee_ik_target = right_hand_tf_reflected @ right_controller_calib_tf @ ee_tf
+    tf_right_ee_ik_target = right_hand_tf_reflected @ right_controller_calib_tf @ ee_tf # TODO: right_controller_calib_tf np.load from file should eventually be replaced with metadata extraction
 
     right_ee_ik_target_handle_position = tf_right_ee_ik_target.wxyz_xyz[:, -3:]
     right_ee_ik_target_handle_wxyz = tf_right_ee_ik_target.wxyz_xyz[:, :4]
@@ -803,7 +694,7 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     left_ee_ik_target_handle_position = left_ee_transforms_rby1_base.wxyz_xyz[:, -3:]
     left_ee_ik_target_handle_wxyz = left_ee_transforms_rby1_base.wxyz_xyz[:, :4]
     
-    # Transform right end-effector poses to RBY1 base frame coordinates  
+    # Transform right end-effector poses to RBY1 base frame coordinates
     right_ee_transforms_world = vtf.SE3.from_rotation_and_translation(
         vtf.SO3(wxyz=right_ee_ik_target_handle_wxyz),
         right_ee_ik_target_handle_position
@@ -811,6 +702,21 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     right_ee_transforms_rby1_base = world_to_rby1_base @ right_ee_transforms_world
     right_ee_ik_target_handle_position = right_ee_transforms_rby1_base.wxyz_xyz[:, -3:]
     right_ee_ik_target_handle_wxyz = right_ee_transforms_rby1_base.wxyz_xyz[:, :4]
+
+   
+
+    head_tf = vtf.SE3.from_rotation_and_translation(
+        vtf.SO3.from_rpy_radians(-head_data_all.rotation().as_rpy_radians().roll, 
+        head_data_all.rotation().as_rpy_radians().pitch, 
+        -head_data_all.rotation().as_rpy_radians().yaw),
+        np.concatenate([head_data_all.wxyz_xyz[:, -3:-2], -head_data_all.wxyz_xyz[:, -2:-1], head_data_all.wxyz_xyz[:, -1:]], axis=1))
+    
+    head_offset = vtf.SE3.from_rotation_and_translation(vtf.SO3.from_rpy_radians(-np.pi/2, 0.0, 0.0), np.array([0.0, 0.0, 0.0]))
+    # import pdb; pdb.set_trace()
+    tf_head_target_world =  vtf.SE3(np.concatenate([head_tf.rotation().wxyz, head_tf.translation()], axis=1)) @ quest_to_zed_calib_tf @ head_offset # TODO: quest_to_zed_calib_tf np.load from file should eventually be replaced with metadata extraction
+    head_transforms_rby1_base = world_to_rby1_base @ tf_head_target_world
+
+
 
     # Get gripper positions
     left_gripper_pos = joint_data['left-joint_pos'][..., None]
@@ -830,12 +736,18 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     # Convert rotation matrices to 6D representation using matrix_utils
     left_6d_rot = rot_mat_to_rot_6d(left_rot_matrices)  # Shape: (N, 6)
     right_6d_rot = rot_mat_to_rot_6d(right_rot_matrices)  # Shape: (N, 6)
+
+    head_rot_matrices = vtf.SO3(wxyz=head_transforms_rby1_base.wxyz_xyz[:, :4]).as_matrix()  # Shape: (N, 3, 3)
+
+    head_6d_rot = rot_mat_to_rot_6d(head_rot_matrices)  # Shape: (N, 6)
+    head_position = head_transforms_rby1_base.wxyz_xyz[:, -3:]
     
     # Ensure all arrays have the same length
     seq_length = max(
         len(left_6d_rot), len(right_6d_rot),
         len(left_ee_ik_target_handle_position), len(right_ee_ik_target_handle_position),
-        len(left_gripper_pos), len(right_gripper_pos)
+        len(left_gripper_pos), len(right_gripper_pos), 
+        len(head_6d_rot), len(head_position)
     )
     
     # Pad arrays to same length if needed
@@ -848,6 +760,8 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     
     left_6d_rot = pad_to_length(left_6d_rot, seq_length)
     right_6d_rot = pad_to_length(right_6d_rot, seq_length)
+    head_6d_rot = pad_to_length(head_6d_rot, seq_length)
+    head_position = pad_to_length(head_position, seq_length)
     left_ee_ik_target_handle_position = pad_to_length(left_ee_ik_target_handle_position, seq_length)
     right_ee_ik_target_handle_position = pad_to_length(right_ee_ik_target_handle_position, seq_length)
     left_gripper_pos = pad_to_length(left_gripper_pos, seq_length)
@@ -855,6 +769,37 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
 
     left_gripper_action = pad_to_length(left_gripper_action, seq_length)
     right_gripper_action = pad_to_length(right_gripper_action, seq_length)
+
+
+    # Validate jerky motion, logic inherited from https://github.com/xdofai/lab42/blob/d224643d2a96fbddada5c3029aeaba677ee5e76a/xdof/data_delivery/utils/validators.py#L409
+    from viser.transforms import SE3
+    for trajectory in [right_ee_transforms_rby1_base.as_matrix(), left_ee_transforms_rby1_base.as_matrix(), head_transforms_rby1_base.as_matrix()]:
+        se3_poses = [SE3.from_matrix(pose) for pose in trajectory]
+        se3_diffs = []
+        for i in range(len(se3_poses) - 1):
+            # Calculate relative transform: T2 * T1.inverse()
+            relative_transform = se3_poses[i + 1].multiply(se3_poses[i].inverse())
+
+            # Get translation and rotation differences
+            translation_diff = np.linalg.norm(relative_transform.translation())
+            rotation_diff = np.rad2deg(np.linalg.norm(relative_transform.rotation().log()))
+
+            se3_diffs.append((translation_diff, rotation_diff))
+
+        se3_diffs = np.array(se3_diffs)
+
+        # Check for jerky motion in both translation and rotation
+        translation_indices = np.where(se3_diffs[:, 0] > cfg.max_se3_diff_in_meters)[0]
+        rotation_indices = np.where(se3_diffs[:, 1] > cfg.max_se3_diff_in_degrees)[0]
+        # Check translation
+        if len(translation_indices) > 0:
+            print(f"jerky_cartesian_motion_detected (translation)")
+            move_problematic_episode(episode_path, f"Jerky motion detected (translation)", cfg, episode_idx)
+            return None, None
+        if len(rotation_indices) > 0:
+            print(f"jerky_cartesian_motion_detected (rotation)")
+            move_problematic_episode(episode_path, f"Jerky motion detected (rotation)", cfg, episode_idx)
+            return None, None
     
     # Combine into full end-effector state
     # FORMAT: [left_6d_rot, left_3d_pos, left_1d_gripper, right_6d_rot, right_3d_pos, right_1d_gripper]
@@ -876,17 +821,43 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     assert len(left_gripper_action.shape) == 2
     assert len(right_gripper_action.shape) == 2
 
+    if cfg.gripper_action_delay_tsteps > 0:
+        left_gripper_action = np.concatenate([
+            np.ones((cfg.gripper_action_delay_tsteps, left_gripper_action.shape[1])) * left_gripper_action[0],
+            left_gripper_action[:-cfg.gripper_action_delay_tsteps]
+        ], axis=0)
+        right_gripper_action = np.concatenate([
+            np.ones((cfg.gripper_action_delay_tsteps, right_gripper_action.shape[1])) * right_gripper_action[0],
+            right_gripper_action[:-cfg.gripper_action_delay_tsteps]
+        ], axis=0)
+
 
     proprio_data = np.concatenate([
         left_6d_rot, left_ee_ik_target_handle_position, left_gripper_pos,
         right_6d_rot, right_ee_ik_target_handle_position, right_gripper_pos
     ], axis=1)
 
+    state_dim = 20
+    action_dim = 20
+
+    if cfg.include_head_pose:
+        proprio_data = np.concatenate([
+            proprio_data,
+            head_6d_rot, head_position
+        ], axis=1)
+        state_dim = 29
+
     action_data = np.concatenate([
         left_6d_rot, left_ee_ik_target_handle_position, left_gripper_action,
         right_6d_rot, right_ee_ik_target_handle_position, right_gripper_action
     ], axis=1)
 
+    if cfg.include_head_pose:
+        action_data = np.concatenate([
+            action_data,
+            head_6d_rot, head_position
+        ], axis=1)
+        action_dim = 29
     # We need seq_length - 1 steps since we calculate actions as deltas
     seq_length = seq_length - 1
     
@@ -896,6 +867,7 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     # Calculate actions as deltas
     states = []
     actions = []
+
     
     for step in range(seq_length):
         # Current state
@@ -918,16 +890,44 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     
     states = np.array(states, dtype=np.float32)
     actions = np.array(actions, dtype=np.float32)
+
+    if cfg.perturb_z_height:
+        random_z_height = np.random.uniform(cfg.perturb_z_height_range[0], cfg.perturb_z_height_range[1])
+        left_hand_z_t0 = states[0, 8]
+        right_hand_z_t0 = states[0, 18]
+        avg_z_t0 = (left_hand_z_t0 + right_hand_z_t0) / 2
+        diff_z_t0 = random_z_height - avg_z_t0
+        states[:, 8] += diff_z_t0
+        states[:, 18] += diff_z_t0
+        states[:, -1] += diff_z_t0
+
+        actions[:, 8] += diff_z_t0
+        actions[:, 18] += diff_z_t0
+        actions[:, -1] += diff_z_t0
+
+    if cfg.perturb_xy_position:
+        random_x_position = np.random.uniform(cfg.perturb_x_position_range[0], cfg.perturb_x_position_range[1])
+        random_y_position = np.random.uniform(cfg.perturb_y_position_range[0], cfg.perturb_y_position_range[1])
+        random_xy_position = np.array([random_x_position, random_y_position])
+        states[:, 6:8] += random_xy_position
+        states[:, 16:18] += random_xy_position
+        states[:, 26:28] += random_xy_position
+
+        actions[:, 6:8] += random_xy_position
+        actions[:, 16:18] += random_xy_position
+        actions[:, 26:28] += random_xy_position
+    
+
     
     # VALIDATION: Check final processed arrays
-    is_valid, error_msg = validate_array_data(states, "states", expected_shape=(seq_length, 20))
+    is_valid, error_msg = validate_array_data(states, "states", expected_shape=(seq_length, state_dim))
     if not is_valid:
         print(f"❌ States validation failed: {error_msg}")
         if episode_path is not None:
             move_problematic_episode(episode_path, f"States validation failed: {error_msg}", cfg, episode_idx)
         return None, None
     
-    is_valid, error_msg = validate_array_data(actions, "actions", expected_shape=(seq_length, 20))
+    is_valid, error_msg = validate_array_data(actions, "actions", expected_shape=(seq_length, action_dim))
     if not is_valid:
         print(f"❌ Actions validation failed: {error_msg}")
         if episode_path is not None:
@@ -1010,6 +1010,10 @@ def compute_basic_episode_stats(episode_idx: int, episode_info: dict, cfg: XMICo
 
     state_dim = 20  # XMI uses 20-dimensional state/action space
     action_dim = 20
+
+    if cfg.include_head_pose:
+        state_dim += 9
+        action_dim += 9
     
     if not parquet_path.exists():
         # Return minimal stats if parquet doesn't exist
@@ -1139,28 +1143,39 @@ def process_xmi_episode(
     # print(f"Processing episode {idx}: {episode_path.name}")
     
     # Load episode data
+    # Quality filtering
+    if not cfg.no_filter_quality and not is_episode_good_quality(episode_path):
+        print(f"  Skipping episode {idx}: poor quality")
+        return None
     episode_data = load_episode_data(episode_path, cfg, base_dir, idx)
     if not episode_data:
         print(f"  ❌ Failed to load episode {idx}")
         move_problematic_episode(episode_path, "Failed to load episode data", cfg, idx)
         return None
     
-    # Process episode in memory-efficient chunks
-    try:
-        records = process_episode_in_chunks(episode_data, cfg, max_chunk_frames=cfg.max_frames_per_chunk, episode_path=episode_path, episode_idx=idx)
-        if not records:
-            print(f"  ❌ No valid data in episode {idx}")
-            # Episode already moved by process_episode_in_chunks if it was a validation failure
-            return None
-        
-        seq_length = len(records)
-        # print(f"  Episode {idx}: {seq_length} frames total")
-                
-    except Exception as e:
-        error_msg = f"Error processing episode {idx}: {e}"
-        print(f"  ❌ {error_msg}")
-        move_problematic_episode(episode_path, error_msg, cfg, idx)
+    # Validate video timestamp synchronization
+    is_valid, error_msg = validate_video_timestamp_synchronization(episode_path, cfg, idx, cfg.video_timestamp_tolerance_s)
+    if not is_valid:
+        print(f"  ❌ Video timestamp validation failed for episode {idx}: {error_msg}")
+        move_problematic_episode(episode_path, f"Video timestamp synchronization failed: {error_msg}", cfg, idx)
         return None
+    
+    # Process episode in memory-efficient chunks
+    # try:
+    records = process_episode_in_chunks(episode_data, cfg, max_chunk_frames=cfg.max_frames_per_chunk, episode_path=episode_path, episode_idx=idx)
+    if not records:
+        print(f"  ❌ No valid data in episode {idx}")
+        # Episode already moved by process_episode_in_chunks if it was a validation failure
+        return None
+    
+    seq_length = len(records)
+    # print(f"  Episode {idx}: {seq_length} frames total")
+                
+    # except Exception as e:
+    #     error_msg = f"Error processing episode {idx}: {e}"
+    #     print(f"  ❌ {error_msg}")
+    #     move_problematic_episode(episode_path, error_msg, cfg, idx)
+    #     return None
     
     # Update episode and task indices in records
     for record in records:
@@ -1223,6 +1238,8 @@ def process_xmi_episode(
         "episode_index": idx,
         "tasks": [language_instruction],
         "length": seq_length,
+        "original_episode_name": episode_path.name,  # Add original episode directory name
+        "original_episode_path": str(episode_path),  # Add full original path for reference
     }
     
     task_mapping = write_episode_metadata_immediately(episode_metadata, [language_instruction], base_dir)
@@ -1418,6 +1435,41 @@ def rewrite_episodes_stats(all_episodes: list, base_dir: Path, cfg: XMIConfig):
         write_episode_stats(new_idx, episode_stats, base_dir)
 
 
+def write_episode_name_mapping(all_episodes: list, base_dir: Path):
+    """
+    Write a JSON file that maps original episode names to LeRobot episode indices.
+    
+    Args:
+        all_episodes: List of episode metadata with original names and new indices
+        base_dir: Base directory of the dataset
+    """
+    print("Writing episode name mapping...")
+    
+    # Create mapping dictionary
+    episode_mapping = {}
+    
+    for episode in all_episodes:
+        lerobot_episode_name = f"episode_{episode['episode_index']:06d}"
+        original_name = episode.get('original_episode_name', 'unknown')
+        original_path = episode.get('original_episode_path', 'unknown')
+        
+        episode_mapping[original_name] = {
+            "lerobot_episode_index": episode['episode_index'],
+            "lerobot_episode_name": lerobot_episode_name,
+            "original_episode_path": original_path,
+            "task": episode['tasks'][0] if episode['tasks'] else 'unknown',
+            "length": episode['length']
+        }
+    
+    # Write to JSON file
+    mapping_file = base_dir / "meta" / "episode_name_mapping.json"
+    with open(mapping_file, 'w') as f:
+        json.dump(episode_mapping, f, indent=2, sort_keys=True)
+    
+    print(f"✅ Episode name mapping written to: {mapping_file}")
+    print(f"   Mapped {len(episode_mapping)} episodes")
+
+
 def main(cfg: XMIConfig):
     """Main function to convert XMI data to LeRobot format."""
     
@@ -1593,6 +1645,9 @@ def main(cfg: XMIConfig):
     # Rewrite episode stats with updated indices
     rewrite_episodes_stats(all_episodes, base_dir, cfg)
     
+    # Write episode name mapping
+    write_episode_name_mapping(all_episodes, base_dir)
+    
     # Calculate final dataset statistics
     total_frames = sum(e["length"] for e in all_episodes)
     actual_chunks = (len(all_episodes) + cfg.chunk_size - 1) // cfg.chunk_size
@@ -1605,17 +1660,24 @@ def main(cfg: XMIConfig):
             for line in f:
                 task_data = json.loads(line.strip())
                 all_tasks[task_data['task_index']] = task_data['task']
+
+    state_dim = 20
+    action_dim = 20
+
+    if cfg.include_head_pose:
+        state_dim = 29
+        action_dim = 29
     
     # Write info.json
     features = {
         "state": {
             "dtype": "float32", 
-            "shape": [20],  # XMI uses 20-dimensional state space
+            "shape": [state_dim],  # XMI uses 20-dimensional state space. If include_head_pose, then 29.
             "names": ["state"],
         },
         "actions": {
             "dtype": "float32",
-            "shape": [20],  # XMI uses 20-dimensional action space
+            "shape": [action_dim],  # XMI uses 20-dimensional action space. If include_head_pose, then 29.
             "names": ["actions"],
         },
         "timestamp": {"dtype": "float32", "shape": [1], "names": None},

@@ -63,9 +63,11 @@ class YAMSConfig:
     fps: int = 30  # TODO: Change this before running # real data: 30, mujoco sim: 11
     chunk_size: int = 1000  # number of frames per chunk (for memory considerations)
     max_workers: int = 1  # Set lower on machines with less memory -- must be 1 for cartesian
-    no_filter_quality: bool = False  # If True, will not filter out low quality episodes
+    no_filter_quality: bool = True  # If True, will not filter out low quality episodes
     max_episodes: int | None = None  # If specified, will only process this many episodes
     skip_videos: bool = False  # If True, will not process videos
+    single_arm: bool = True  # If True, expect only left arm data (7 DoF), if False expect bimanual data (14 DoF)
+
 
     """
     Huggingface hub settings:
@@ -593,9 +595,14 @@ def compute_basic_episode_stats(episode_idx: int, episode_info: dict, cfg: YAMSC
     parquet_path = base_dir / "data" / f"chunk-{chunk_id:03d}" / f"episode_{episode_idx:06d}.parquet"
 
     if cfg.action_space == "abs_joint":
-        state_dim = 14
-        action_dim = 14
+        if cfg.single_arm:
+            state_dim = 7
+            action_dim = 7
+        else:
+            state_dim = 14
+            action_dim = 14
     elif cfg.action_space == "abs_cartesian":
+        assert not cfg.single_arm
         state_dim = 20
         action_dim = 20
     else:
@@ -709,7 +716,7 @@ def process_episode_in_chunks(episode_data: dict, cfg: YAMSConfig, max_chunk_fra
     """Process episode data in memory-efficient chunks to handle long episodes."""
 
     # Process joint data first (this is relatively small)
-    full_joint_state, full_joint_action = process_joint_data(episode_data["joint_data"])
+    full_joint_state, full_joint_action = process_joint_data(episode_data["joint_data"], cfg.single_arm)
     if full_joint_state is None:
         return [], {}
 
@@ -1320,9 +1327,14 @@ def main(cfg: YAMSConfig):
 
     # Write info.json
     if cfg.action_space == "abs_joint":
-        state_dim = 14
-        action_dim = 14
+        if cfg.single_arm:
+            state_dim = 7
+            action_dim = 7
+        else:
+            state_dim = 14
+            action_dim = 14
     elif cfg.action_space == "abs_cartesian":
+        assert not cfg.single_arm
         state_dim = 20
         action_dim = 20
     else:
@@ -1331,12 +1343,12 @@ def main(cfg: YAMSConfig):
     features = {
         "state": {
             "dtype": "float32",
-            "shape": [state_dim],  # YAMS joint state dimension (6 joints + 1 gripper per arm × 2 arms)
+            "shape": [state_dim],  # YAMS joint state dimension (single-arm: 7, bimanual: 14)
             "names": ["state"],
         },
         "actions": {
             "dtype": "float32",
-            "shape": [action_dim],  # YAMS action dimension (6 joints + 1 gripper per arm × 2 arms)
+            "shape": [action_dim],  # YAMS action dimension (single-arm: 7, bimanual: 14)
             "names": ["actions"],
         },
         "timestamp": {"dtype": "float32", "shape": [1], "names": None},

@@ -7,11 +7,13 @@ requires-python = ">=3.11"
 license = { file = "LICENSE" }
 dependencies = [
     "augmax>=0.3.4",
+    "dm-tree>=0.1.8",
     "einops>=0.8.0",
     "equinox>=0.11.8",
     "flatbuffers>=24.3.25",
     "flax==0.10.2",
     "fsspec[gcs]>=2024.6.0",
+    "gym-aloha>=0.1.1",
     "imageio>=2.36.1",
     "jax[cuda12]==0.5.3",
     "jaxtyping==0.2.36",
@@ -37,7 +39,7 @@ dependencies = [
     "polars>=1.30.0",
     "datasets==3.6.0",
     "s3fs",
-    "viser",
+    "viser"
 ]
 
 

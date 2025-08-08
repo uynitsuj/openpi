@@ -2,7 +2,7 @@ import numpy as np
 import json
 from pathlib import Path
 import viser.transforms as vtf
-from openpi.utils.video_processor import resize_and_pad_video
+from openpi.utils.video_processor import resize_and_pad_video, get_video_resolution
 
 def load_episode_data(episode_path: Path, cfg: dict, base_dir: Path, ep_idx: int):
     """Load data for a specific episode."""
@@ -74,13 +74,14 @@ def load_episode_data(episode_path: Path, cfg: dict, base_dir: Path, ep_idx: int
             for video_file in episode_path.glob("*.mp4"):
                 camera_name = video_file.stem
                 video_files[camera_name] = video_file
-                
                 ret = resize_and_pad_video(
                     input_path=str(video_file), 
                     output_path=str(base_dir / "videos" / f"chunk-{chunk_id:03d}" / f"{camera_name}" / f"episode_{ep_idx:06d}.mp4"), 
                     target_size=cfg.resize_size, # type: ignore
                     fps=cfg.fps//cfg.temporal_subsample_factor, # type: ignore
-                    frame_stride=cfg.temporal_subsample_factor # type: ignore
+                    frame_stride=cfg.temporal_subsample_factor, # type: ignore
+                    keep_left_half = True if "top" in camera_name and get_video_resolution(str(video_file))[0]/get_video_resolution(str(video_file))[1] > 3 else False, # if top camera is 3x wider than tall, it's highly likely to be a concat of two videos
+                    crop_to_square = cfg.crop_images_to_square # type: ignore
                 )
                 if not ret:
                     raise ValueError(f"Failed to resize and pad video {video_file}")
@@ -268,11 +269,11 @@ def validate_records(records: list) -> tuple[bool, str]:
             if not isinstance(state, list) or not isinstance(actions, list):
                 return False, f"Record {i}: state and actions must be lists"
             
-            if len(state) != 20:
-                return False, f"Record {i}: state has {len(state)} elements, expected 20"
+            # if len(state) != 20:
+            #     return False, f"Record {i}: state has {len(state)} elements, expected 20"
             
-            if len(actions) != 20:
-                return False, f"Record {i}: actions has {len(actions)} elements, expected 20"
+            # if len(actions) != 20:
+            #     return False, f"Record {i}: actions has {len(actions)} elements, expected 20"
             
             # Check for None values in state/actions
             for j, val in enumerate(state):

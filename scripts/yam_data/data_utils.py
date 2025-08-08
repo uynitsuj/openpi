@@ -137,41 +137,52 @@ def load_yams_episode_data_fast(episode_path: Path) -> dict | None:
         return None
 
 
-def process_joint_data(joint_data: dict) -> tuple[np.ndarray, np.ndarray | None]:
-    """Process and combine joint data from YAMS episode."""
-    # Check if we have the required joint data
-    required_keys = ["left-joint_pos", "right-joint_pos", "left-gripper_pos", "right-gripper_pos"]
-    if not all(key in joint_data for key in required_keys):
-        raise ValueError("Missing required joint data keys")
+def process_joint_data(joint_data: dict, single_arm: bool = False) -> tuple[np.ndarray, np.ndarray | None]:
+    """Process and combine joint data from YAMS episode. Handles both single-arm and bimanual data."""
 
-    # Get joint positions and gripper positions (use views, not copies)
+    # Check that we have left arm data (always required)
+    if not all(key in joint_data for key in ["left-joint_pos", "left-gripper_pos"]):
+        raise ValueError("Missing left arm joint data (left-joint_pos, left-gripper_pos)")
+
+    # Get left arm data
     left_joint_pos = joint_data["left-joint_pos"]  # Shape: (N, 6)
-    right_joint_pos = joint_data["right-joint_pos"]  # Shape: (N, 6)
     left_gripper_pos = joint_data["left-gripper_pos"]  # Shape: (N, 1)
-    right_gripper_pos = joint_data["right-gripper_pos"]  # Shape: (N, 1)
-
-    # Apply joint position flipping (create copies only when needed)
-    # left_joint_pos = np.flip(left_joint_pos, axis=1).copy()  # Copy needed for flip # BAD BAD BAD
-    # right_joint_pos = np.flip(right_joint_pos, axis=1).copy()  # Copy needed for flip # BAD BAD BAD
-
-    # Pre-allocate full state array to avoid multiple concatenations
     seq_length = len(left_joint_pos)
-    full_joint_state = np.empty((seq_length, 14), dtype=np.float32)
 
-    full_joint_state[:, :6] = left_joint_pos
-    full_joint_state[:, 6:7] = left_gripper_pos[:, 0:1]
-    full_joint_state[:, 7:13] = right_joint_pos
-    full_joint_state[:, 13:14] = right_gripper_pos[:, 0:1]
+    if single_arm:
+        # Single-arm case: 7-dimensional state (left arm only)
+        print("  Processing single-arm data (left arm only)")
+        full_joint_state = np.empty((seq_length, 7), dtype=np.float32)
+        full_joint_state[:, :6] = left_joint_pos
+        full_joint_state[:, 6:7] = left_gripper_pos[:, 0:1]
 
-    if (
-        "action-left-pos" in joint_data and "action-right-pos" in joint_data
-    ):  # Some datasets have action data, some don't
-        full_joint_action = np.empty((seq_length, 14), dtype=np.float32)
-        left_action_pos = joint_data["action-left-pos"]  # Shape: (N, 7) (includes gripper)
-        right_action_pos = joint_data["action-right-pos"]  # Shape: (N, 7) (includes gripper)
-        full_joint_action[:, :7] = left_action_pos
-        full_joint_action[:, 7:14] = right_action_pos
-        return full_joint_state, full_joint_action
+        # Handle actions for single-arm
+        if "action-left-pos" in joint_data:
+            left_action_pos = joint_data["action-left-pos"]  # Shape: (N, 7)
+            return full_joint_state, left_action_pos
+    else:
+        # Bimanual case: check for right arm data
+        if not all(key in joint_data for key in ["right-joint_pos", "right-gripper_pos"]):
+            raise ValueError("Bimanual mode requires right arm joint data (right-joint_pos, right-gripper_pos)")
+
+        print("  Processing bimanual data (left + right arms)")
+        right_joint_pos = joint_data["right-joint_pos"]  # Shape: (N, 6)
+        right_gripper_pos = joint_data["right-gripper_pos"]  # Shape: (N, 1)
+
+        full_joint_state = np.empty((seq_length, 14), dtype=np.float32)
+        full_joint_state[:, :6] = left_joint_pos
+        full_joint_state[:, 6:7] = left_gripper_pos[:, 0:1]
+        full_joint_state[:, 7:13] = right_joint_pos
+        full_joint_state[:, 13:14] = right_gripper_pos[:, 0:1]
+
+        # Handle actions for bimanual
+        if "action-left-pos" in joint_data and "action-right-pos" in joint_data:
+            full_joint_action = np.empty((seq_length, 14), dtype=np.float32)
+            left_action_pos = joint_data["action-left-pos"]  # Shape: (N, 7)
+            right_action_pos = joint_data["action-right-pos"]  # Shape: (N, 7)
+            full_joint_action[:, :7] = left_action_pos
+            full_joint_action[:, 7:14] = right_action_pos
+            return full_joint_state, full_joint_action
 
     return full_joint_state, None
 
@@ -205,6 +216,21 @@ def calculate_actions(full_joint_state: np.ndarray, full_joint_action: np.ndarra
 def calculate_actions_cartesian(
     full_joint_state: np.ndarray, full_joint_action: np.ndarray | None, seq_length: int, robot: Any
 ):
+    # Check configuration and raise error if not bimanual
+    joint_state_dim = full_joint_state.shape[1]
+    if joint_state_dim != 14:
+        raise ValueError(
+            f"Unexpected joint state dimension: {joint_state_dim}. "
+            "Expected 14 for bimanual configuration (6 left joints + 1 left gripper + 6 right joints + 1 right gripper)."
+        )
+
+    if full_joint_action is not None:
+        joint_action_dim = full_joint_action.shape[1]
+        if joint_action_dim != 14:
+            raise ValueError(
+                f"Unexpected joint action dimension: {joint_action_dim}. " "Expected 14 for bimanual configuration."
+            )
+
     from openpi.utils.matrix_utils import quat_to_rot_6d
 
     joint_states = full_joint_state[:seq_length]
@@ -272,6 +298,15 @@ def calculate_actions_cartesian(
 
 
 def calculate_actions_delta_cartesian(full_joint_state: np.ndarray, seq_length: int, robot: Any):
+    # Check configuration and raise error if not bimanual
+    joint_state_dim = full_joint_state.shape[1]
+    if joint_state_dim != 14:
+        raise ValueError(
+            f"Unexpected joint state dimension: {joint_state_dim}. "
+            "Expected 14 for bimanual configuration (6 left joints + 1 left gripper + 6 right joints + 1 right gripper). "
+            "Delta cartesian action space is currently only supported for bimanual (dual arm) configurations."
+        )
+
     from openpi.utils.matrix_utils import quat_to_rot_6d
 
     joint_states = full_joint_state[:seq_length]

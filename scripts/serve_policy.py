@@ -86,13 +86,23 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
         dir="gs://openpi-assets/checkpoints/pi0_fast_libero",
     ),
     EnvMode.XDOF_FAST_XMI_RBY: Checkpoint(
-        config="pi0fast_xmi_rby_low_mem_finetune",
-        dir="/home/justinyu/checkpoints/pi0fast_xmi_rby_low_mem_finetune/coffee_cup_on_dish_subsampled_and_gripper_proprio/29999",
+        config="pi0_fast_xmi_rby_low_mem_finetune",
+        # dir="/home/justinyu/checkpoints/pi0_fast_xmi_rby_low_mem_finetune/pi0fast_coffee_cup_20250709_1500/29999",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_fast_xmi_rby_low_mem_finetune/sky_pi0fast_soup_can_in_domain_29D_intergripper_relative_20250801/36000",
     ),
     EnvMode.XDOF_XMI_RBY: Checkpoint(
         config="pi0_xmi_rby_low_mem_finetune",
-        dir="/home/justinyu/checkpoints/pi0_xmi_rby_low_mem_finetune/sky_xmi_rby_coffee_cup_on_dish_combined_20250710_005840/29999",
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby_low_mem_finetune/whismy_pi0_soup_can_delta_z_proprio_temporal_2/25000",
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby_low_mem_finetune/ruin_soup_can_20D_intergripper_20250723/24000",
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby_low_mem_finetune/whismy_soup_can_in_domain_29D_intergripper_relative_20250725/42000",
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby_low_mem_finetune/whismy_soup_can_in_domain_29D_intergripper_relative_20250727/30000" # HEAD RETARGETING WORKS :DDD
+        dir="/home/justinyu/checkpoints/pi0_xmi_rby_low_mem_finetune/whismy_soup_can_in_domain_29D_intergripper_relative_20250801/49999" 
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby_low_mem_finetune/whismy_pi0_soup_can_no_intergripper_temporal_2/49999",
     ),
+    # EnvMode.XDOF_XMI_RBY: Checkpoint(
+    #     config="pi0_xmi_rby",
+    #     dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_hummus_ee_finetune/40000",
+    # ),
 }
 
 

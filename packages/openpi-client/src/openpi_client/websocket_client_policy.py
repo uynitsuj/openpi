@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from typing_extensions import override
 import websockets.sync.client
@@ -41,15 +41,24 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
                 time.sleep(5)
 
     @override
-    def infer(self, obs: Dict) -> Dict:  # noqa: UP006
-        data = self._packer.pack(obs)
-        self._ws.send(data)
+    def infer(
+        self, 
+        obs: Dict, 
+        inference_delay: int | None = None,
+        executed_steps: int | None = None) -> Dict:  # noqa: UP006
+        """
+        If prev_action_chunk is supplied we send it so the server can do
+        prefix-inpainting; otherwise we fall back to the old behaviour.
+        """
+        payload: Dict[str, Any] = obs
+        if inference_delay is not None:
+            payload["inference_delay"] = inference_delay
+            payload["executed_steps"] = executed_steps
+        self._ws.send(self._packer.pack(payload))
         response = self._ws.recv()
         if isinstance(response, str):
-            # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")
         return msgpack_numpy.unpackb(response)
-
     @override
     def reset(self) -> None:
         pass

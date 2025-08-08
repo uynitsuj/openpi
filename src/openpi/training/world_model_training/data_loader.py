@@ -35,6 +35,33 @@ logger = logging.getLogger("openpi")
 from lerobot.common.constants import HF_LEROBOT_HOME
 
 
+def maybe_time_reverse(frames, p=0.15, rng=None):
+    """Apply time reversal augmentation."""
+    import random
+    if random.random() < p:
+        return frames[::-1]
+    return frames
+
+
+def maybe_frame_drop(frames, drop_p=0.15):
+    """Apply frame dropping augmentation."""
+    import random
+    keep = [i for i in range(len(frames)) if random.random() > drop_p]
+    if len(keep) == 0: 
+        keep = [0]
+    return [frames[i] for i in keep]
+
+
+def get_curriculum_mask_ratio(step: int, cfg) -> float:
+    """Get curriculum mask ratio for current training step."""
+    if step >= cfg.curriculum_steps:
+        return cfg.end_ratio
+    # linear ramp with proper clamping
+    frac = min(1.0, step / max(1, cfg.curriculum_steps))
+    mask_ratio = cfg.start_ratio + frac * (cfg.end_ratio - cfg.start_ratio)
+    return mask_ratio
+
+
 class ProgressiveMaskingSchedule:
     """Progressive masking schedule similar to official VJEPA2."""
     
@@ -140,6 +167,11 @@ class WorldModelDataConfig:
     val_split_ratio: float = 0.1
     test_split_ratio: float = 0.1
     split_seed: int = 42
+    
+    # Video augmentation options
+    use_video_augmentation: bool = True
+    time_reverse_prob: float = 0.15
+    frame_drop_prob: float = 0.15
 
 
 class LRUCache:
@@ -632,6 +664,32 @@ class OptimizedWorldModelDataset(Dataset):
                     frame_images = {"base_0_rgb": dummy_frame}
                 
                 frame_sequences.append(frame_images)
+            
+            # Apply video augmentations if enabled and in training split
+            if (self.config.use_video_augmentation and 
+                self.split == "train" and 
+                len(frame_sequences) > 1):
+                
+                # Apply time reversal
+                frame_sequences = maybe_time_reverse(
+                    frame_sequences, 
+                    p=self.config.time_reverse_prob
+                )
+                
+                # Apply frame dropping
+                frame_sequences = maybe_frame_drop(
+                    frame_sequences,
+                    drop_p=self.config.frame_drop_prob
+                )
+                
+                # Pad/truncate back to fixed number of frames
+                if len(frame_sequences) != self.config.num_frames:
+                    if len(frame_sequences) > self.config.num_frames:
+                        frame_sequences = frame_sequences[:self.config.num_frames]
+                    else:
+                        # Pad with repeated last frame
+                        while len(frame_sequences) < self.config.num_frames:
+                            frame_sequences.append(frame_sequences[-1])
             
             # Batch process images
             if self.config.normalize_images:

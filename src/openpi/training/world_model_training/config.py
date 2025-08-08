@@ -11,12 +11,49 @@ from typing import Optional, Any, Dict, List, Literal
 import logging
 
 from openpi.models.vjepa2_world_model import VJEPA2WorldModelConfig
+from openpi.models.siglip_vjepa2_world_model import SigLIPVJEPA2WorldModelConfig
 from openpi.models.video_masking import MaskingStrategy
 from openpi.training.world_model_training.data_loader import WorldModelDataConfig
 from openpi.training import optimizer as _optimizer
 from openpi.training import weight_loaders
 
 logger = logging.getLogger("openpi")
+
+
+@dataclasses.dataclass(frozen=True)
+class WorldModelOptimConfig:
+    """Optimizer configuration for world model training."""
+    peak_lr: float = 5e-6              # scaled for tiny batch
+    min_lr: float = 5e-8               # floor for cosine
+    warmup_steps: int = 300
+    cosine_cycle: int = 6000           # restart period
+    weight_decay: float = 0.04
+    grad_accum_steps: int = 16         # eff batch = batch * accum (increased for memory)
+    
+    # Memory optimization settings
+    use_gradient_checkpointing: bool = True
+    enable_mixed_precision: bool = True
+    memory_efficient_attention: bool = True
+
+
+@dataclasses.dataclass(frozen=True)
+class WorldModelMaskCurriculum:
+    """Mask curriculum configuration for progressive masking."""
+    start_ratio: float = 0.30
+    end_ratio: float = 0.50
+    curriculum_steps: int = 6000       # linear ramp; then hold
+    fixed_temporal_scale: float = 1.0  # mask spans all frames
+
+
+@dataclasses.dataclass(frozen=True)
+class WorldModelRegularization:
+    """Regularization configuration for world model training."""
+    ema_momentum: float = 0.999
+    freeze_ema_after: Optional[int] = 8000   # set None to disable
+    encoder_freeze_blocks: int = 4        # unfreeze_after steps below
+    unfreeze_after: int = 3000            # unfreeze earlier to adapt to harder masks
+    stochastic_depth: float = 0.2
+    dropout: float = 0.1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -110,6 +147,17 @@ class WorldModelTrainConfig:
     validation_interval: int = 100
     validation_steps: int = 100
     
+    # New V-JEPA2 configurations
+    optim: WorldModelOptimConfig = dataclasses.field(
+        default_factory=WorldModelOptimConfig
+    )
+    mask_curr: WorldModelMaskCurriculum = dataclasses.field(
+        default_factory=WorldModelMaskCurriculum
+    )
+    reg: WorldModelRegularization = dataclasses.field(
+        default_factory=WorldModelRegularization
+    )
+    
     @property
     def checkpoint_dir(self) -> pathlib.Path:
         """Get the checkpoint directory for this config."""
@@ -136,19 +184,19 @@ _WORLD_MODEL_CONFIGS = [
 
     WorldModelTrainConfig(
         name="yam_dishrack_vjepa2_world_model_debug",
-        exp_name="hummus_wm_training_debug",
+        exp_name="hummus_wm_training_debug_v3",
         model_config=VJEPA2WorldModelConfig(
-            num_frames=16,  # Match official (16 frames)
-            image_size=224,  # Match official (256px)
+            num_frames=10,
+            image_size=224, 
             encoder_hidden_size=768,  
             predictor_hidden_size=512,  # Half of encoder size
             encoder_num_layers=16,  # ViT-Large depth
             predictor_num_layers=8,  # Deeper predictor
             encoder_num_heads=16,  # ViT-Large heads
             predictor_num_heads=8,  # Half of encoder heads
-            encoder_stochastic_depth=0.2,  # Match official
-            predictor_stochastic_depth=0.1,  # Lower for predictor
-            momentum=0.996,  # Official EMA momentum
+            encoder_stochastic_depth=0.2,  # Reduced
+            predictor_stochastic_depth=0.1,  # Reduced
+            momentum=0.999,  # Official EMA momentum
             use_pretrained_encoder=False,  
         ),
         data_config=WorldModelDataConfig(
@@ -156,20 +204,23 @@ _WORLD_MODEL_CONFIGS = [
             num_frames=10,  # Match model config
             image_size=(224, 224),  # Match model config  
             masking_strategy=MaskingStrategy.MULTI_SCALE,
-            # mask_ratio=0.85,  # Higher like official (very challenging)
-            frame_skip=3,  # Skip frames for more temporal diversity (every 3rd frame)
-            multi_view_batch_mode=True,  
+            mask_ratio=0.5,  # Reduced from 0.75
+            frame_skip=4,  # Increased skip to reduce data volume
+            multi_view_batch_mode=False,  # Disable for memory
             use_progressive_masking=True,  
         ),
-        batch_size=8,   # Good balance of performance and memory
-        num_workers=8,    # Optimal worker count
+        batch_size=4,   # Reduced from 8 for memory
+        num_workers=2,    # Reduced worker count
         num_train_steps=30000,  
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=2000,  # Longer warmup like official
-            peak_lr=1.5e-4,  # Higher peak LR with larger batch accumulation
+            warmup_steps=300,
+            peak_lr=1.5e-6,
             decay_steps=30000,  
-            decay_lr=1e-6,
+            decay_lr=1e-7,
         ),
+        optim=WorldModelOptimConfig(),
+        mask_curr=WorldModelMaskCurriculum(),
+        reg=WorldModelRegularization(),
     ),
     
     # Optimized version of the debug config  
@@ -206,6 +257,266 @@ _WORLD_MODEL_CONFIGS = [
             peak_lr=5e-5,
             decay_steps=30000,
             decay_lr=1e-6,
+        ),
+    ),
+    
+    # === Parameter Sweep Configs ===
+    
+    # Run A: 0.30 → 0.50 over 6k, freeze at best
+    WorldModelTrainConfig(
+        name="yam_dishrack_vjepa2_world_model_sweep_a",
+        exp_name="sweep_a_0.30_to_0.50_freeze_at_best",
+        model_config=VJEPA2WorldModelConfig(
+            num_frames=10,
+            image_size=224, 
+            encoder_hidden_size=768,  
+            predictor_hidden_size=512,
+            encoder_num_layers=16,
+            predictor_num_layers=8,
+            encoder_num_heads=16,
+            predictor_num_heads=8,
+            encoder_stochastic_depth=0.2,
+            predictor_stochastic_depth=0.1,
+            momentum=0.999,
+            use_pretrained_encoder=False,  
+        ),
+        data_config=WorldModelDataConfig(
+            repo_id="uynitsuj/yam_bimanual_load_dishes_full_absolute",
+            num_frames=10,
+            image_size=(224, 224),
+            masking_strategy=MaskingStrategy.MULTI_SCALE,
+            mask_ratio=0.5,
+            frame_skip=4,
+            multi_view_batch_mode=False,
+            use_progressive_masking=True,
+        ),
+        batch_size=4,
+        num_workers=2,
+        num_train_steps=30000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=1.5e-6,
+            decay_steps=30000,
+            decay_lr=1e-7,
+        ),
+        optim=WorldModelOptimConfig(),
+        mask_curr=WorldModelMaskCurriculum(
+            start_ratio=0.30,
+            end_ratio=0.50,
+            curriculum_steps=6000,
+        ),
+        reg=WorldModelRegularization(
+            freeze_ema_after=None,  # freeze at best val
+        ),
+    ),
+    
+    # Run B: 0.30 → 0.70 over 10k, freeze at 5k
+    WorldModelTrainConfig(
+        name="yam_dishrack_vjepa2_world_model_sweep_b",
+        exp_name="sweep_b_0.30_to_0.70_freeze_at_5k",
+        model_config=VJEPA2WorldModelConfig(
+            num_frames=10,
+            image_size=224, 
+            encoder_hidden_size=768,  
+            predictor_hidden_size=512,
+            encoder_num_layers=16,
+            predictor_num_layers=8,
+            encoder_num_heads=16,
+            predictor_num_heads=8,
+            encoder_stochastic_depth=0.2,
+            predictor_stochastic_depth=0.1,
+            momentum=0.999,
+            use_pretrained_encoder=False,  
+        ),
+        data_config=WorldModelDataConfig(
+            repo_id="uynitsuj/yam_bimanual_load_dishes_full_absolute",
+            num_frames=10,
+            image_size=(224, 224),
+            masking_strategy=MaskingStrategy.MULTI_SCALE,
+            mask_ratio=0.5,
+            frame_skip=4,
+            multi_view_batch_mode=False,
+            use_progressive_masking=True,
+        ),
+        batch_size=4,
+        num_workers=2,
+        num_train_steps=30000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=1.5e-6,
+            decay_steps=30000,
+            decay_lr=1e-7,
+        ),
+        optim=WorldModelOptimConfig(),
+        mask_curr=WorldModelMaskCurriculum(
+            start_ratio=0.30,
+            end_ratio=0.70,
+            curriculum_steps=10000,
+        ),
+        reg=WorldModelRegularization(
+            freeze_ema_after=5000,  # freeze at 5k
+        ),
+    ),
+    
+    # Run C: fixed 0.50 (no ramp), freeze at 3k
+    WorldModelTrainConfig(
+        name="yam_dishrack_vjepa2_world_model_sweep_c",
+        exp_name="sweep_c_fixed_0.50_freeze_at_3k",
+        model_config=VJEPA2WorldModelConfig(
+            num_frames=10,
+            image_size=224, 
+            encoder_hidden_size=768,  
+            predictor_hidden_size=512,
+            encoder_num_layers=16,
+            predictor_num_layers=8,
+            encoder_num_heads=16,
+            predictor_num_heads=8,
+            encoder_stochastic_depth=0.2,
+            predictor_stochastic_depth=0.1,
+            momentum=0.999,
+            use_pretrained_encoder=False,  
+        ),
+        data_config=WorldModelDataConfig(
+            repo_id="uynitsuj/yam_bimanual_load_dishes_full_absolute",
+            num_frames=10,
+            image_size=(224, 224),
+            masking_strategy=MaskingStrategy.MULTI_SCALE,
+            mask_ratio=0.5,
+            frame_skip=4,
+            multi_view_batch_mode=False,
+            use_progressive_masking=False,  # disabled for fixed ratio
+        ),
+        batch_size=4,
+        num_workers=2,
+        num_train_steps=30000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=1.5e-6,
+            decay_steps=30000,
+            decay_lr=1e-7,
+        ),
+        optim=WorldModelOptimConfig(),
+        mask_curr=WorldModelMaskCurriculum(
+            start_ratio=0.50,
+            end_ratio=0.50,
+            curriculum_steps=1,  # no ramp
+        ),
+        reg=WorldModelRegularization(
+            freeze_ema_after=3000,  # freeze at 3k
+        ),
+    ),
+    
+    # Debug config: freeze entire encoder after best val to test drift hypothesis
+    WorldModelTrainConfig(
+        name="yam_dishrack_vjepa2_world_model_debug_freeze_all",
+        exp_name="debug_freeze_entire_encoder",
+        model_config=VJEPA2WorldModelConfig(
+            num_frames=10,
+            image_size=224, 
+            encoder_hidden_size=768,  
+            predictor_hidden_size=512,
+            encoder_num_layers=16,
+            predictor_num_layers=8,
+            encoder_num_heads=16,
+            predictor_num_heads=8,
+            encoder_stochastic_depth=0.2,
+            predictor_stochastic_depth=0.1,
+            momentum=0.999,
+            use_pretrained_encoder=False,  
+        ),
+        data_config=WorldModelDataConfig(
+            repo_id="uynitsuj/yam_bimanual_load_dishes_full_absolute",
+            num_frames=10,
+            image_size=(224, 224),
+            masking_strategy=MaskingStrategy.MULTI_SCALE,
+            mask_ratio=0.5,
+            frame_skip=4,
+            multi_view_batch_mode=False,
+            use_progressive_masking=True,
+        ),
+        batch_size=4,
+        num_workers=2,
+        num_train_steps=30000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=300,
+            peak_lr=1.5e-6,
+            decay_steps=30000,
+            decay_lr=1e-7,
+        ),
+        optim=WorldModelOptimConfig(),
+        mask_curr=WorldModelMaskCurriculum(),
+        reg=WorldModelRegularization(
+            freeze_ema_after=None,  # freeze at best val
+            encoder_freeze_blocks=16,  # freeze all blocks
+            unfreeze_after=999999,  # never unfreeze
+        ),
+    ),
+    
+    # SigLIP-based world model with frozen encoder - memory optimized
+    WorldModelTrainConfig(
+        name="yam_dishrack_siglip_vjepa2_world_model_frozen",
+        exp_name="siglip_frozen_encoder_vjepa2",
+        model_config=SigLIPVJEPA2WorldModelConfig(
+            num_frames=8,             # Reduced from 16 for memory
+            image_size=224,           # SigLIP native resolution
+            # SigLIP ViT-SO400M-14 parameters
+            encoder_hidden_size=1152,  # So400m width
+            encoder_num_layers=27,     # So400m depth  
+            encoder_num_heads=16,      # So400m heads
+            encoder_mlp_ratio=3.74,    # 4304/1152
+            # Predictor parameters (smaller than encoder)
+            predictor_hidden_size=384,    # Reduced from 576 for memory
+            predictor_num_layers=6,       # Reduced from 8 for memory
+            predictor_num_heads=6,        # Reduced from 8 for memory
+            predictor_mlp_ratio=4.0,
+            # Freezing configuration
+            freeze_encoder=True,          # Freeze the entire SigLIP backbone
+            freeze_encoder_blocks=0,      # Not applicable when entire encoder frozen
+            # EMA and loss parameters
+            momentum=0.996,               # Standard EMA momentum
+            loss_exp=2.0,                 # L2 loss
+        ),
+        data_config=WorldModelDataConfig(
+            repo_id="uynitsuj/yam_bimanual_load_dishes_full_absolute",
+            num_frames=8,             # Reduced from 16 for memory
+            image_size=(224, 224),    # SigLIP native resolution
+            masking_strategy=MaskingStrategy.MULTI_SCALE,
+            mask_ratio=0.75,          # Standard VJEPA-2 masking
+            frame_skip=4,             # Increased from 2 for memory
+            multi_view_batch_mode=False,  # Single view for simplicity
+            use_progressive_masking=True,
+        ),
+        batch_size=2,              # Reduced from 4 for memory
+        num_workers=2,
+        num_train_steps=30000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,     # Longer warmup for frozen features
+            peak_lr=5e-5,         # Higher LR since only predictor trains
+            decay_steps=30000,
+            decay_lr=5e-7,
+        ),
+        optim=WorldModelOptimConfig(
+            peak_lr=5e-5,         # Higher LR for predictor-only training
+            min_lr=5e-7,
+            warmup_steps=500,
+            cosine_cycle=8000,    # Longer cycle for stability
+            weight_decay=0.01,    # Lower weight decay for frozen backbone
+            grad_accum_steps=16,  # Increased from 8 for memory (maintain effective batch size)
+            use_gradient_checkpointing=True,
+            enable_mixed_precision=True,
+        ),
+        mask_curr=WorldModelMaskCurriculum(
+            start_ratio=0.50,     # Start higher since backbone is frozen
+            end_ratio=0.75,       # Standard end ratio
+            curriculum_steps=8000,
+        ),
+        reg=WorldModelRegularization(
+            ema_momentum=0.996,
+            freeze_ema_after=10000,  # Later freezing for frozen backbone
+            encoder_freeze_blocks=0,  # Not applicable
+            unfreeze_after=999999,    # Never unfreeze
+            stochastic_depth=0.0,     # Disabled for frozen backbone
+            dropout=0.1,
         ),
     ),
 ]

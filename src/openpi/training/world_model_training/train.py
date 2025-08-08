@@ -34,7 +34,8 @@ import tqdm_loggable.auto as tqdm
 import wandb
 
 from openpi.models.world_model import WorldModelInput, WorldModelOutput
-from openpi.models.vjepa2_world_model import VJEPA2WorldModel, create_vjepa2_model
+from openpi.models.vjepa2_world_model import VJEPA2WorldModel, create_vjepa2_model, VJEPA2WorldModelConfig
+from openpi.models.siglip_vjepa2_world_model import SigLIPVJEPA2WorldModel, create_siglip_vjepa2_model, SigLIPVJEPA2WorldModelConfig
 from openpi.shared import array_typing as at
 from openpi.training import optimizer as _optimizer
 from openpi.training import checkpoints as _checkpoints
@@ -230,13 +231,29 @@ def init_train_state(config: WorldModelTrainConfig, init_rng: jax.Array) -> Worl
     """Initialize the training state."""
     logger.info("Initializing world model...")
     
-    model = create_vjepa2_model(config.model_config)
+    # Create model based on config type
+    if isinstance(config.model_config, SigLIPVJEPA2WorldModelConfig):
+        # Use smaller SigLIP model
+        config.model_config.siglip_model_name = "google/siglip-base-patch16-224"
+        model = create_siglip_vjepa2_model(config.model_config)
+        logger.info("Created SigLIP V-JEPA2 world model using smaller base model")
+    elif isinstance(config.model_config, VJEPA2WorldModelConfig):
+        model = create_vjepa2_model(config.model_config)
+        logger.info("Created standard V-JEPA2 world model")
+    else:
+        raise ValueError(f"Unsupported model config type: {type(config.model_config)}")
     
-    # Move model to GPU if available
-    import torch
-    if torch.cuda.is_available():
-        model = model.cuda()
-        logger.info("Model moved to GPU")
+    # JAX models automatically use available GPU devices
+    logger.info("Model initialized (JAX will use available GPU devices automatically)")
+    
+    # Memory optimization settings
+    jax.config.update('jax_enable_x64', False)  # Use 32-bit precision
+    jax.config.update('jax_debug_nans', False)  # Disable NaN checking
+    jax.config.update('jax_disable_jit', False)  # Ensure JIT is enabled
+    
+    # Clear any existing compilations
+    if hasattr(jax, 'clear_caches'):
+        jax.clear_caches()
     
     tx = _optimizer.create_optimizer(
         config.optimizer,
@@ -244,31 +261,47 @@ def init_train_state(config: WorldModelTrainConfig, init_rng: jax.Array) -> Worl
         weight_decay_mask=None,
     )
     
-    dummy_input = WorldModelInput(
-        video_frames=jnp.zeros((
+    # Initialize JAX/Flax model properly
+    if isinstance(config.model_config, SigLIPVJEPA2WorldModelConfig):
+        # For SigLIP model, create dummy video input
+        dummy_video = jnp.zeros((
             config.batch_size,
-            config.data_config.num_frames,
-            config.data_config.image_size[0],
-            config.data_config.image_size[1] * len(config.data_config.image_keys),
-            3
-        )),
-        mask=jnp.zeros((
-            config.batch_size,
-            config.data_config.num_frames,
-            config.data_config.image_size[0] // 16,
-            config.data_config.image_size[1] * len(config.data_config.image_keys) // 16,
-        ), dtype=bool),
-        camera_names=list(config.data_config.image_keys),
-    )
-    
-    import torch
-    
-    torch_params = dict(model.named_parameters())
-    
-    def torch_to_jax(tensor):
-        return jnp.array(tensor.detach().cpu().numpy())
-    
-    params = {name: torch_to_jax(param) for name, param in torch_params.items()}
+            config.model_config.num_frames,
+            config.model_config.image_size,
+            config.model_config.image_size,
+            config.model_config.num_channels
+        ))
+        
+        # Initialize model parameters
+        model_rng, init_rng = jax.random.split(init_rng)
+        params = model.init(model_rng, dummy_video, train=True)
+        
+    else:
+        # For standard VJEPA2 model, use existing initialization
+        dummy_input = WorldModelInput(
+            video_frames=jnp.zeros((
+                config.batch_size,
+                config.data_config.num_frames,
+                config.data_config.image_size[0],
+                config.data_config.image_size[1] * len(config.data_config.image_keys),
+                3
+            )),
+            mask=jnp.zeros((
+                config.batch_size,
+                config.data_config.num_frames,
+                config.data_config.image_size[0] // 16,
+                config.data_config.image_size[1] * len(config.data_config.image_keys) // 16,
+            ), dtype=bool),
+            camera_names=list(config.data_config.image_keys),
+        )
+        
+        import torch
+        torch_params = dict(model.named_parameters())
+        
+        def torch_to_jax(tensor):
+            return jnp.array(tensor.detach().cpu().numpy())
+        
+        params = {name: torch_to_jax(param) for name, param in torch_params.items()}
     
     opt_state = tx.init(params)
     
@@ -337,6 +370,345 @@ def compute_loss(
     return total_loss_jax, metrics
 
 
+def train_step_jax(
+    state: WorldModelTrainState,
+    batch_iter,
+    config,
+    step: int,
+) -> Tuple[WorldModelTrainState, dict]:
+    """Execute a JAX training step."""
+    
+    # Memory cleanup
+    if hasattr(jax, 'clear_caches'):
+        jax.clear_caches()
+    
+    # Get accumulation steps from config or default to 1
+    grad_accum_steps = getattr(config.optim, 'grad_accum_steps', 1)
+    
+    # Initialize accumulated gradients
+    accumulated_grads = None
+    total_loss = 0.0
+    total_mask_ratio = 0.0
+    
+    for i in range(grad_accum_steps):
+        # Get batch
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            batch_iter = iter(batch_iter.dataset)
+            batch = next(batch_iter)
+        
+        # Extract video frames from batch tuple
+        world_model_input, world_model_output = batch
+        video_frames = jnp.asarray(world_model_input.video_frames)
+        
+        # Create mask if not provided
+        from openpi.models.siglip_vjepa2_world_model import create_video_mask
+        mask_tensor = create_video_mask(
+            video_frames.shape,
+            patch_size=(config.model_config.patch_size, config.model_config.patch_size),
+            temporal_patch_size=config.model_config.temporal_patch_size,
+            mask_ratio=0.75,
+        )
+        
+        # Convert mask to JAX array
+        if hasattr(mask_tensor, 'numpy'):  # If it's a PyTorch tensor
+            mask = jnp.array(mask_tensor.detach().cpu().numpy())
+        elif hasattr(mask_tensor, 'astype'):  # If it's already a JAX array
+            mask = mask_tensor
+        else:  # If it's a numpy array
+            mask = jnp.array(mask_tensor)
+        
+        # Define loss function
+        def loss_fn(params):
+            outputs = state.model.apply(params, video_frames, mask, train=True)
+            predicted = outputs['predicted_features']
+            target = outputs['target_features']
+            # V-JEPA2 loss
+            loss = jnp.mean(jnp.abs(predicted - target) ** config.model_config.loss_exp) / config.model_config.loss_exp
+            return loss / grad_accum_steps  # Scale loss for accumulation
+        
+        # Compute gradients
+        loss_val, grads = jax.value_and_grad(loss_fn)(state.params)
+        
+        # Accumulate gradients
+        if accumulated_grads is None:
+            accumulated_grads = grads
+        else:
+            accumulated_grads = jax.tree_util.tree_map(lambda x, y: x + y, accumulated_grads, grads)
+        
+        total_loss += loss_val
+        total_mask_ratio += jnp.mean(mask)  # mask is already float32 JAX array
+        
+        # Clear intermediate values
+        del grads, loss_val, video_frames, mask, mask_tensor
+        if hasattr(jax, 'clear_caches'):
+            jax.clear_caches()
+    
+    # Apply accumulated gradients
+    updates, new_opt_state = state.tx.update(accumulated_grads, state.optimizer, state.params)
+    new_params = optax.apply_updates(state.params, updates)
+    
+    # Update state
+    new_state = state.replace(
+        step=step + 1,
+        params=new_params,
+        optimizer=new_opt_state,
+    )
+    
+    # Average metrics
+    avg_loss = total_loss / grad_accum_steps
+    avg_mask_ratio = total_mask_ratio / grad_accum_steps
+    
+    # Metrics
+    metrics = {
+        'reconstruction_loss': avg_loss,
+        'mask_ratio': avg_mask_ratio,
+        'num_masked_patches': jnp.sum(mask),  # Using the last mask is fine for this metric
+    }
+    
+    return new_state, metrics
+
+
+def train_step_with_accumulation(
+    state: WorldModelTrainState,
+    batch_iter,
+    config,
+    step: int,
+) -> Tuple[WorldModelTrainState, dict]:
+    """Execute a training step with gradient accumulation."""
+    
+    import torch
+    from openpi.training.world_model_training.data_loader import get_curriculum_mask_ratio
+    
+    # Memory optimization: clear cache before training step
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    grad_accum = config.optim.grad_accum_steps
+    
+    def jax_to_torch(arr):
+        tensor = torch.from_numpy(np.array(arr)).float()
+        if torch.cuda.is_available():
+            tensor = tensor.cuda()
+        return tensor
+    
+    def update_model_params(model, jax_params):
+        # Check if this is a JAX/Flax model or PyTorch model
+        if hasattr(model, 'named_parameters'):
+            # PyTorch model - update parameters
+            for name, param in model.named_parameters():
+                if name in jax_params:
+                    param.data = jax_to_torch(jax_params[name])
+        else:
+            # JAX/Flax model - parameters are handled differently
+            pass  # JAX models don't need parameter updates like PyTorch
+    
+    update_model_params(state.model, state.params)
+    
+    # Set training mode if it's a PyTorch model
+    if hasattr(state.model, 'train'):
+        state.model.train()
+    
+    # Handle JAX models differently from PyTorch models
+    if not hasattr(state.model, 'named_parameters'):
+        # JAX/Flax model - use JAX training approach
+        return train_step_jax(state, batch_iter, config, step)
+    
+    # Initialize optimizer if not exists (for PyTorch models)
+    if not hasattr(state, 'torch_optimizer'):
+        from openpi.training.optimizer import build_optimizer_with_config
+        
+        # Get current learning rate from scheduler
+        current_lr = config.optim.peak_lr * (step / config.optim.warmup_steps) if step < config.optim.warmup_steps else config.optim.peak_lr
+        
+        state.torch_optimizer = torch.optim.AdamW(
+            state.model.parameters(),
+            lr=current_lr,
+            weight_decay=config.optim.weight_decay,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
+        state.grad_scaler = torch.cuda.amp.GradScaler()
+        state.grad_accum_steps = 0
+    
+    state.model.zero_grad()
+    
+    # Accumulate gradients
+    total_loss = 0.0
+    total_mask_ratio = 0.0
+    total_masked_patches = 0.0
+    
+    for i in range(grad_accum):
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            # Reset iterator if we run out of data
+            batch_iter = iter(batch_iter.dataset)
+            batch = next(batch_iter)
+        
+        # Convert batch format if needed
+        if isinstance(batch[0].video_frames, torch.Tensor):
+            batch = (
+                WorldModelInput(
+                    video_frames=jnp.array(batch[0].video_frames.numpy()),
+                    mask=jnp.array(batch[0].mask.numpy()),
+                    camera_names=batch[0].camera_names,
+                ),
+                WorldModelOutput(
+                    predicted_features=jnp.array(batch[1].predicted_features.numpy()),
+                    reconstruction_loss=jnp.array(batch[1].reconstruction_loss.numpy()),
+                    mask_ratio=jnp.array(batch[1].mask_ratio.numpy()),
+                )
+            )
+        
+        video_frames = jax_to_torch(batch[0].video_frames)
+        mask = jax_to_torch(batch[0].mask).bool()
+        
+        # Update mask ratio if using curriculum
+        if hasattr(config, 'mask_curr'):
+            current_mask_ratio = get_curriculum_mask_ratio(step, config.mask_curr)
+            # Always apply mask curriculum (don't check if different)
+            try:
+                from openpi.models.vjepa2_world_model import create_video_mask
+                new_mask = create_video_mask(
+                    video_frames.shape,
+                    mask_ratio=current_mask_ratio,
+                    device=video_frames.device
+                )
+                mask = new_mask
+                
+                # Debug log mask counts every 100 steps
+                if step % 100 == 0:
+                    actual_mask_count = mask.sum().item()
+                    total_patches = mask.numel()
+                    actual_ratio = actual_mask_count / total_patches
+                    expected_count = total_patches * current_mask_ratio
+                    
+                    logger.info(f"Step {step}: Mask debug - Target ratio: {current_mask_ratio:.3f}, "
+                               f"Actual ratio: {actual_ratio:.3f}, "
+                               f"Masked patches: {actual_mask_count}/{total_patches} "
+                               f"(expected: {expected_count:.0f})")
+                    
+                    # For 10 frames × 224×224 image with patch_size=16: 10 × 14 × 14 = 1960 patches
+                    # For 0.5 ratio: should be ~980 masked patches
+                    
+            except Exception as e:
+                logger.warning(f"Failed to create curriculum mask at step {step}: {e}")
+                # Keep original mask
+        
+        # Use mixed precision if enabled
+        use_amp = getattr(config.optim, 'enable_mixed_precision', True)
+        
+        if use_amp:
+            with torch.amp.autocast('cuda'):
+                loss = state.model.compute_loss(video_frames, mask) / grad_accum  # Scale loss
+        else:
+            loss = state.model.compute_loss(video_frames, mask) / grad_accum  # Scale loss
+        
+        state.grad_scaler.scale(loss).backward()
+        
+        total_loss += loss.item()
+        total_mask_ratio += mask.float().mean().item()
+        total_masked_patches += mask.float().sum().item()
+    
+    # Average metrics
+    total_loss /= grad_accum
+    total_mask_ratio /= grad_accum  
+    total_masked_patches /= grad_accum
+    
+    # Apply gradient clipping
+    if hasattr(config, 'reg') and hasattr(config.reg, 'gradient_clip_norm'):
+        clip_norm = config.reg.gradient_clip_norm
+    else:
+        clip_norm = getattr(state, 'gradient_clip_norm', 1.0)
+    
+    state.grad_scaler.unscale_(state.torch_optimizer)
+    torch.nn.utils.clip_grad_norm_(state.model.parameters(), clip_norm)
+    
+    # Update parameters
+    state.grad_scaler.step(state.torch_optimizer)
+    state.grad_scaler.update()
+    
+    # Update EMA target encoder with freeze support
+    if hasattr(state.model, 'update_target_encoder') and hasattr(config, 'reg'):
+        momentum = getattr(config.reg, 'ema_momentum', 0.999)
+        freeze_after = getattr(config.reg, 'freeze_ema_after', None)
+        state.model.update_target_encoder(momentum, step, freeze_after)
+    
+    # Apply encoder freezing schedule
+    if hasattr(state.model, 'apply_encoder_freezing_schedule') and hasattr(config, 'reg'):
+        freeze_blocks = getattr(config.reg, 'encoder_freeze_blocks', 4)
+        unfreeze_after = getattr(config.reg, 'unfreeze_after', 5000)
+        state.model.apply_encoder_freezing_schedule(step, freeze_blocks, unfreeze_after)
+    
+    # Calculate gradient norm
+    grad_norm = 0.0
+    for param in state.model.parameters():
+        if param.grad is not None:
+            grad_norm += param.grad.data.norm(2).item() ** 2
+    grad_norm = grad_norm ** 0.5
+    
+    # Update parameters in state
+    def torch_to_jax(tensor):
+        return jnp.array(tensor.detach().cpu().numpy())
+    
+    new_params = {}
+    for name, param in state.model.named_parameters():
+        new_params[name] = torch_to_jax(param.data)
+    
+    # Update learning rate
+    if step < config.optim.warmup_steps:
+        new_lr = config.optim.peak_lr * (step / config.optim.warmup_steps)
+    else:
+        # Cosine restart
+        restart_step = (step - config.optim.warmup_steps) % config.optim.cosine_cycle
+        cos_val = 0.5 * (1 + jnp.cos(jnp.pi * restart_step / config.optim.cosine_cycle))
+        new_lr = config.optim.min_lr + (config.optim.peak_lr - config.optim.min_lr) * cos_val
+    
+    for param_group in state.torch_optimizer.param_groups:
+        param_group['lr'] = float(new_lr)
+    
+    new_state = WorldModelTrainState(
+        step=state.step + 1,
+        model=state.model,
+        params=new_params,
+        optimizer=state.optimizer,
+        tx=state.tx,
+        ema_model=state.ema_model,
+        ema_decay=state.ema_decay,
+        target_encoder_momentum=state.target_encoder_momentum,
+        gradient_clip_norm=state.gradient_clip_norm,
+    )
+    # Copy additional PyTorch attributes
+    new_state.torch_optimizer = state.torch_optimizer
+    new_state.grad_scaler = state.grad_scaler
+    new_state.grad_accum_steps = getattr(state, 'grad_accum_steps', 0)
+    
+    metrics = {
+        'reconstruction_loss': jnp.array(total_loss),
+        'mask_ratio': jnp.array(total_mask_ratio),
+        'num_masked_patches': jnp.array(total_masked_patches),
+        'grad_norm': jnp.array(grad_norm),
+        'learning_rate': jnp.array(new_lr),
+    }
+    
+    # Add mask curriculum metrics
+    if hasattr(config, 'mask_curr'):
+        current_mask_ratio = get_curriculum_mask_ratio(step, config.mask_curr)
+        metrics['train/mask_ratio'] = jnp.array(current_mask_ratio)
+    
+    # Add EMA freeze status
+    if hasattr(state.model, 'is_ema_frozen'):
+        metrics['train/ema_frozen'] = jnp.array(float(state.model.is_ema_frozen()))
+    
+    # Memory cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return new_state, metrics
+
+
 def train_step(
     state: WorldModelTrainState,
     batch: Tuple[WorldModelInput, WorldModelOutput],
@@ -366,6 +738,10 @@ def train_step(
     
     state.model.zero_grad()
     
+    # Memory optimization: clear cache before computation
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     with torch.amp.autocast('cuda'):
         loss = state.model.compute_loss(video_frames, mask)
 
@@ -390,7 +766,7 @@ def train_step(
     
     if hasattr(state.model, 'update_target_encoder'):
         momentum = getattr(state, 'target_encoder_momentum', 0.99)
-        state.model.update_target_encoder(momentum)
+        state.model.update_target_encoder(momentum, step=state.step)
     
     grad_norm = 0.0
     for param in state.model.parameters():
@@ -443,6 +819,10 @@ def train_step(
             'target_num_masked_patches': masking_params['num_masked_patches'],
         })
         metrics['_masking_phase'] = masking_params['phase']
+    
+    # Memory cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     return new_state, metrics
 
@@ -575,32 +955,33 @@ def create_data_loader_with_fallback(
     
     return loader
     
-    # except Exception as e:
-    #     logger.warning(f"Failed to create optimized dataloader for {split}: {e}")
-        # logger.info("Falling back to original dataloader...")
-    
-    # Fallback to original dataloader
-    # logger.info(f"Creating original dataloader for {split} split...")
-    # loader = create_world_model_data_loader(
-    #     data_config,
-    #     batch_size=batch_size,
-    #     split=split,
-    #     shuffle=shuffle,
-    #     num_workers=min(num_workers, 8),  # Match optimized worker count
-    #     # fake_data=fake_data,
-    #     current_step=current_step,
-    #     chunk_size=chunk_size,
-    # )
-    
-    # logger.info(f"✅ Successfully created original {split} dataloader")
-    # return loader
-
 
 def main(config: WorldModelTrainConfig):
     """Main training loop."""
     init_logging()
     logger.info(f"Starting world model training on {platform.node()}")
     logger.info(f"Configuration: {config.name}")
+    
+    # Memory optimization settings
+    import torch
+    if torch.cuda.is_available():
+        # Set CUDA memory allocation configuration
+        torch.cuda.empty_cache()
+        # Enable memory efficient settings
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logger.info(f"CUDA memory before training: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+    
+    # JAX memory optimization settings
+    import jax
+    jax.config.update('jax_enable_x64', False)  # Use 32-bit precision
+    jax.config.update('jax_debug_nans', False)  # Disable NaN checking
+    jax.config.update('jax_disable_jit', False)  # Ensure JIT is enabled
+    
+    # Clear any existing compilations
+    if hasattr(jax, 'clear_caches'):
+        jax.clear_caches()
     
     # Always use optimized dataloader (superior performance)
     use_optimized = True
@@ -674,6 +1055,16 @@ def main(config: WorldModelTrainConfig):
     loss_smoothing_factor = 0.9  # Exponential moving average factor
     smoothed_loss = None
     
+    # Early stopping and EMA freeze callback
+    best_val_loss = float('inf')
+    best_val_step = 0
+    patience = getattr(config.reg, 'patience', 2000) if hasattr(config, 'reg') else 2000
+    
+    # EMA freeze based on valley detection
+    val_improvement_threshold = 1e-4  # epsilon for valley detection
+    no_improvement_count = 0
+    required_no_improvement = 3  # freeze after 3 evals with no improvement
+    
     pbar = tqdm.tqdm(
         range(config.num_train_steps),
         desc="Training",
@@ -713,7 +1104,12 @@ def main(config: WorldModelTrainConfig):
             train_loader.dataset.update_step(step)
         
         step_rng = jax.random.fold_in(train_rng, step)
-        state, metrics = train_step(state, batch, step_rng)
+        
+        # Use gradient accumulation if configured
+        if hasattr(config, 'optim') and config.optim.grad_accum_steps > 1:
+            state, metrics = train_step_with_accumulation(state, train_iter, config, step)
+        else:
+            state, metrics = train_step(state, batch, step_rng)
         
         # Apply loss smoothing for more stable training signals
         current_loss = metrics['reconstruction_loss']
@@ -738,6 +1134,11 @@ def main(config: WorldModelTrainConfig):
         pbar.set_postfix_str(current_metrics_str)
         
         if step % config.log_interval == 0:
+            # Periodic memory cleanup
+            if torch.cuda.is_available() and step % (config.log_interval * 10) == 0:
+                torch.cuda.empty_cache()
+                logger.debug(f"CUDA memory at step {step}: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+            
             avg_metrics = {}
             for key in metrics_history[0].keys():
                 if key.startswith('_'):
@@ -771,11 +1172,17 @@ def main(config: WorldModelTrainConfig):
                     'phase1': 1, 'phase2': 2, 'phase3': 3
                 }.get(metrics_history[-1]['_masking_phase'], 0)
             
+            # Add curriculum mask ratio logging
+            if hasattr(config, 'mask_curr'):
+                from openpi.training.world_model_training.data_loader import get_curriculum_mask_ratio
+                current_mask_ratio = get_curriculum_mask_ratio(step, config.mask_curr)
+                masking_metrics['train/curriculum_mask_ratio'] = current_mask_ratio
+            
             if masking_metrics:
                 wandb.log(masking_metrics, step=step)
             
             # Log debug visualization every 100 steps
-            if step % 10 == 0 and step > 0:
+            if step % 100 == 0 and step > 0:
                 try:
                     # Get a fresh batch for visualization by consuming a few samples
                     # This ensures we don't always get the same first sample
@@ -864,6 +1271,33 @@ def main(config: WorldModelTrainConfig):
                 train_loss=None,  # No train loss for validation step
                 val_metrics=avg_val_metrics,
             )
+            
+            # Early stopping and EMA freeze callback with valley detection
+            current_val_loss = avg_val_metrics.get('val_reconstruction_loss', float('inf'))
+            
+            # Check for improvement
+            if best_val_loss - current_val_loss > val_improvement_threshold:
+                # Significant improvement
+                best_val_loss = current_val_loss
+                best_val_step = step
+                no_improvement_count = 0
+                logger.info(f"New best validation loss: {best_val_loss:.6f} at step {step}")
+            else:
+                # No significant improvement
+                no_improvement_count += 1
+                
+            # Freeze EMA after valley (3 consecutive non-improvements)
+            if no_improvement_count >= required_no_improvement:
+                if hasattr(config, 'reg') and hasattr(config.reg, 'freeze_ema_after'):
+                    if hasattr(state.model, 'ema_target') and state.model.ema_target is not None:
+                        if not state.model.ema_target.frozen:
+                            state.model.ema_target.frozen = True
+                            logger.info(f"Freezing EMA at step {step} after valley detection (best val: {best_val_loss:.6f} at step {best_val_step})")
+                
+                # Log EMA freeze status
+                if hasattr(state.model, 'is_ema_frozen'):
+                    wandb.log({"train/ema_frozen": float(state.model.is_ema_frozen())}, step=step)
+            
             logger.info(f"Validation at step {step}: {avg_val_metrics}")
         
         if step % config.save_interval == 0 and step > 0:

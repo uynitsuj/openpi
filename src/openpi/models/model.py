@@ -94,6 +94,13 @@ class Observation(Generic[ArrayT]):
     # Low-dimensional robot state.
     state: at.Float[ArrayT, "*b s"]
 
+    # Past head images, in [-1, 1] float32.
+    past_head_images: at.Float[ArrayT, "*b t h w c"] | None = None
+    # Past head image masks, with same keys as past_head_images.
+    # past_head_image_masks: dict[str, at.Bool[ArrayT, "*b t"]] | None = None
+    # Past state, with same shape as state.
+    past_states: at.Float[ArrayT, "*b t s"] | None = None
+
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
     # Tokenized prompt mask.
@@ -116,10 +123,14 @@ class Observation(Generic[ArrayT]):
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
                 data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
+        if data.get("past_head_images") is not None:
+            data["past_head_images"] = data["past_head_images"].astype(np.float32) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
+            past_head_images=data.get("past_head_images"),
+            past_states=data.get("past_states"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -131,6 +142,10 @@ class Observation(Generic[ArrayT]):
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
+
+        result["past_head_images"] = result.pop("past_head_images")
+        result["past_states"] = result.pop("past_states")
+
         return result
 
 
@@ -150,6 +165,7 @@ def preprocess_observation(
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
     filling in a default image mask (if necessary).
     """
+    past_head_images = None
 
     if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
@@ -186,6 +202,44 @@ def preprocess_observation(
 
         out_images[key] = image
 
+
+    if observation.past_head_images is not None:
+        image = observation.past_head_images
+        if image.shape[-3:-1] != image_resolution:
+            import pdb; pdb.set_trace() # TODO: if entered this branch, check there's no bug in running resize
+            logger.info(f"Resizing past head image from {image.shape[-3:]} to {image_resolution}")
+            image = image_tools.resize_with_pad(image, *image_resolution)
+        # import pdb; pdb.set_trace()
+        # jax.debug.breakpoint()
+        image = image / 2.0 + 0.5
+
+        transforms = []
+        # if "wrist" not in key:
+        #     height, width = image.shape[1:3]
+        #     transforms += [
+        #         augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
+        #         augmax.Resize(width, height),
+        #         augmax.Rotate((-5, 5)),
+        #     ]
+        transforms += [
+            augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
+            augmax.Rotate((-5, 5)),
+        ]
+
+        B, T, H, W, C = image.shape  # e.g. (32, 2, 224, 224, 3)
+        image = image.reshape(B * T, H, W, C)
+
+        # Apply augmax on [B*T, H, W, 3]
+        sub_rngs = jax.random.split(rng, image.shape[0])
+        image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
+
+        # Reshape back to [B, T, H, W, C]
+        image = image.reshape(B, T, H, W, C)
+
+        # Back to [-1, 1].
+        image = image * 2.0 - 1.0
+        past_head_images = image
+
     # obtain mask
     out_masks = {}
     for key in out_images:
@@ -199,6 +253,7 @@ def preprocess_observation(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
+        past_head_images=past_head_images,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,

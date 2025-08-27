@@ -6,7 +6,7 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -126,7 +126,11 @@ class FakeDataset(Dataset):
 
 
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig, video_backend: Literal["pyav", None] = "pyav",  # set to 'pyav' if torchcodec gives issues
+    data_config: _config.DataConfig, 
+    action_horizon: int, 
+    model_config: _model.BaseModelConfig,
+    video_backend: Literal["pyav", None] = "pyav",  # set to 'pyav' if torchcodec gives issues
+    return_video_frames: bool = True,
 ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
@@ -136,14 +140,25 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    # import pdb; pdb.set_trace()
+    delta_timestamps = {
+        key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+    }
+
+    if data_config.history_mode == "naive_past_1s_interval_top_camera_state":
+        for key in data_config.history_sequence_keys:
+            delta_timestamps[key] = [-t for t in range(data_config.history_horizon)]
+
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
+        delta_timestamps=delta_timestamps,
         video_backend=video_backend,
-        tolerance_s=1e-3,
+        tolerance_s=1e-1,
+        return_video_frames=return_video_frames,
+
+        history_mode=data_config.history_mode,
     )
+    # import pdb; pdb.set_trace()
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
@@ -157,7 +172,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "
-                "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
+                "Make sure to run `uv run scripts/compute_norm_stats_jax.py --config-name=<your-config>`."
             )
         norm_stats = data_config.norm_stats
 
@@ -180,6 +195,7 @@ def create_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     num_workers: int = 0,
+    return_video_frames: bool = True,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -197,7 +213,7 @@ def create_data_loader(
     """
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    dataset = create_torch_dataset(data_config, config.model.action_horizon, config.model)
+    dataset = create_torch_dataset(data_config, config.model.action_horizon, config.model, return_video_frames=return_video_frames)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     data_loader = TorchDataLoader(

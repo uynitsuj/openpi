@@ -23,8 +23,10 @@ def _parse_image(image) -> np.ndarray:
     image = np.asarray(image)
     if np.issubdtype(image.dtype, np.floating):
         image = (255 * image).astype(np.uint8)
-    if image.shape[0] == 3:
+    if len(image.shape) == 3 and image.shape[0] == 3:
         image = einops.rearrange(image, "c h w -> h w c")
+    elif len(image.shape) == 4:
+        image = einops.rearrange(image, "t c h w -> t h w c")
     return image
 
 
@@ -65,7 +67,7 @@ class XmiRbyInputs(transforms.DataTransformFn):
         exterior_left_image = _parse_image(data["left_camera-images-rgb"])
         exterior_right_image = _parse_image(data["right_camera-images-rgb"])
         top_image = _parse_image(data["top_camera-images-rgb"])
-        
+        past_head_images = None
 
         match self.model_type:
             case _model.ModelType.PI0:
@@ -76,7 +78,19 @@ class XmiRbyInputs(transforms.DataTransformFn):
                     images = (np.zeros_like(top_image), exterior_left_image, exterior_right_image)
                     image_masks = (np.False_, np.True_, np.True_) # For now skip top camera (XMI head and RBY head visual gap)
                 else:
-                    images = (top_image, exterior_left_image, exterior_right_image)
+                    # import pdb; pdb.set_trace()
+                    if len(top_image.shape) == 3:
+                        images = (top_image, exterior_left_image, exterior_right_image)
+                    elif len(top_image.shape) == 4:
+                        images = (top_image[0], exterior_left_image, exterior_right_image)
+                        # for i in range(top_image.shape[0] - 1):
+                        #     top_image[i] = top_image[i + 1]
+                        # import pdb; pdb.set_trace()
+                        past_head_images = top_image[1:]
+
+                    else:
+                        raise ValueError(f"Unsupported top camera image shape: {top_image.shape}")
+
                     image_masks = (np.True_, np.True_, np.True_)
                 
             case _model.ModelType.PI0_FAST:
@@ -94,6 +108,7 @@ class XmiRbyInputs(transforms.DataTransformFn):
             "state": state,
             "image": dict(zip(names, images, strict=True)),
             "image_mask": dict(zip(names, image_masks, strict=True)),
+            "past_head_images": past_head_images,
         }
 
         # Add actions if available (during training)

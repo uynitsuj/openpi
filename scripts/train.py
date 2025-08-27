@@ -62,6 +62,10 @@ def save_debug_images(observation: _model.Observation, step: int, checkpoint_dir
     # Convert JAX arrays to numpy for easier handling
     images = jax.device_get(observation.images)
     image_masks = jax.device_get(observation.image_masks)
+    if observation.past_head_images is not None:
+        past_head_images = jax.device_get(observation.past_head_images)
+    else:
+        past_head_images = None
     
     # Save first sample from the batch
     sample_idx = 0
@@ -119,6 +123,8 @@ def save_debug_images(observation: _model.Observation, step: int, checkpoint_dir
         try:
             camera_names = list(camera_images.keys())
             num_cameras = len(camera_names)
+            if past_head_images is not None:
+                num_cameras += past_head_images.shape[1]
             
             fig, axes = plt.subplots(1, num_cameras, figsize=(5 * num_cameras, 5))
             if num_cameras == 1:
@@ -130,6 +136,15 @@ def save_debug_images(observation: _model.Observation, step: int, checkpoint_dir
                 axes[i].set_title(f"{camera_name}\nStep {step}\nMean: {img.mean():.1f}, Std: {img.std():.1f}")
                 axes[i].axis('off')
             
+            if past_head_images is not None:
+                for t in range(past_head_images.shape[1], 0, -1):
+                    img = past_head_images[0, past_head_images.shape[1] - t]
+                    if img.dtype == np.float32:
+                        img = (np.clip(img, -1, 1) * 127.5 + 127.5).astype(np.uint8)
+                    axes[-t].imshow(img)
+                    axes[-t].set_title(f"Past Head {t}\nStep {step}\nMean: {img.mean():.1f}, Std: {img.std():.1f}")
+                    axes[-t].axis('off')
+
             plt.tight_layout()
             
             # Save visualization
@@ -146,7 +161,6 @@ def save_debug_images(observation: _model.Observation, step: int, checkpoint_dir
             logging.info(f"Saved debug images for step {step} to {step_dir} (matplotlib not available for visualization)")
         else:
             logging.info(f"Saved debug images for step {step} to {step_dir}")
-
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
 

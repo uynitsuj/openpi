@@ -23,8 +23,9 @@ from typing import Literal
 import jsonlines
 from openpi.utils.matrix_utils import rot_6d_to_quat
 
-# DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250804"
-DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250807"
+# DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250818"
+# DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/xmi_rby_pretrain_data_20250811"
+DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/shelf_soup_in_domain_xmi_data_20250825"
 
 class XMILeRobotViewer:
     def __init__(self, dataset_path: str, action_horizon: int = 20):
@@ -686,7 +687,7 @@ class XMILeRobotViewer:
                     except ValueError:
                         # Current episode not in available list, go to first
                         self.episode_selector.value = available_episodes[0]
-            time.sleep(1.0 / 40.0) # Aim for 60fps playback
+            time.sleep(1.0 / 50.0) # Aim for 60fps playback
 
 
 def main(

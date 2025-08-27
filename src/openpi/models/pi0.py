@@ -179,19 +179,54 @@ class Pi0(_model.BaseModel):
         ar_mask = []
         tokens = []
         # embed images
-        for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+        # unbatched impl
+        # for name in obs.images:
+        #     image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
 
+        #     tokens.append(image_tokens)
+        #     input_mask.append(
+        #         einops.repeat(
+        #             obs.image_masks[name],
+        #             "b -> b s",
+        #             s=image_tokens.shape[1],
+        #         )
+        #     )
+        #     # image tokens attend to each other
+        #     ar_mask += [False] * image_tokens.shape[1]
+
+
+        # batched:
+        image_names = list(obs.images.keys())
+        images = list(obs.images.values())
+        if obs.past_head_images is not None:
+            for t in range(obs.past_head_images.shape[1]):
+                images.append(obs.past_head_images[:, t])
+        else:
+            assert len(images) == len(image_names)
+        stacked_images = jnp.stack(images, axis=1)
+
+        batch_size, num_cams = stacked_images.shape[:2]
+        reshaped_images = stacked_images.reshape(-1, *stacked_images.shape[2:])
+
+        all_image_tokens, _ = self.PaliGemma.img(reshaped_images, train=False)
+        all_image_tokens = all_image_tokens.reshape(batch_size, num_cams, all_image_tokens.shape[1], -1)
+
+        for i, name in enumerate(image_names):
+            image_tokens = all_image_tokens[:, i] 
             tokens.append(image_tokens)
             input_mask.append(
-                einops.repeat(
-                    obs.image_masks[name],
-                    "b -> b s",
-                    s=image_tokens.shape[1],
-                )
+                einops.repeat(obs.image_masks[name], "b -> b s", s=image_tokens.shape[1])
             )
-            # image tokens attend to each other
-            ar_mask += [False] * image_tokens.shape[1]
+        if obs.past_head_images is not None:
+            for t in range(obs.past_head_images.shape[1], 0, -1):
+                image_tokens = all_image_tokens[:, -t]
+                tokens.append(image_tokens)
+                input_mask.append(
+                    einops.repeat(obs.image_masks[image_names[0]], "b -> b s", s=image_tokens.shape[1]) # assumes image_names[0] is the "head" camera
+                )
+
+        # Set attention masks
+        ar_mask = [False] * (image_tokens.shape[1] * num_cams)
 
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:

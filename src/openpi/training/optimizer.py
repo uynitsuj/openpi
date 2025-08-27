@@ -32,34 +32,6 @@ class CosineDecaySchedule(LRScheduleConfig):
 
 
 @dataclasses.dataclass(frozen=True)
-class CosineRestartSchedule(LRScheduleConfig):
-    """Cosine restart schedule with warmup and floor."""
-
-    warmup_steps: int = 300
-    peak_lr: float = 5e-6
-    min_lr: float = 5e-8
-    cosine_cycle: int = 6000
-
-    def create(self) -> optax.Schedule:
-        def schedule(step):
-            step = jnp.asarray(step)
-            lr = jnp.where(
-                step < self.warmup_steps,
-                self.peak_lr * (step / self.warmup_steps),
-                self._cosine_restart(step - self.warmup_steps),
-            )
-            return lr
-        return schedule
-
-    def _cosine_restart(self, step):
-        """Periodic restart to peak_lr, but decay floor = min_lr."""
-        cycle = self.cosine_cycle
-        mod = step % cycle
-        cos = 0.5 * (1 + jnp.cos(jnp.pi * mod / cycle))
-        return self.min_lr + (self.peak_lr - self.min_lr) * cos
-
-
-@dataclasses.dataclass(frozen=True)
 class RsqrtDecaySchedule(LRScheduleConfig):
     """Inverse square root decay schedule with warmup."""
 
@@ -127,36 +99,6 @@ class SGD(OptimizerConfig):
     ) -> optax.GradientTransformation:
         assert weight_decay_mask is None, "Weight decay is not supported for SGD"
         return optax.sgd(lr, momentum=self.momentum, nesterov=self.nesterov)
-
-
-def build_optimizer_with_config(params, config):
-    """Build optimizer with configuration from WorldModelOptimConfig."""
-    from .world_model_training.config import WorldModelOptimConfig, CosineRestartSchedule
-    
-    if not isinstance(config, WorldModelOptimConfig):
-        # Fallback for old configs
-        lr_schedule = config.create() if hasattr(config, 'create') else config
-        opt = optax.adamw(
-            learning_rate=lr_schedule,
-            weight_decay=0.04,
-            b1=0.9, b2=0.999, eps=1e-8,
-        )
-        return opt
-    
-    # Build LR schedule
-    lr_schedule = CosineRestartSchedule(
-        warmup_steps=config.warmup_steps,
-        peak_lr=config.peak_lr,
-        min_lr=config.min_lr,
-        cosine_cycle=config.cosine_cycle,
-    ).create()
-    
-    opt = optax.adamw(
-        learning_rate=lr_schedule,
-        weight_decay=config.weight_decay,
-        b1=0.9, b2=0.999, eps=1e-8,
-    )
-    return opt
 
 
 def create_optimizer(

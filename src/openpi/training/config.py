@@ -82,6 +82,18 @@ class DataConfig:
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantile_norm: bool = False
 
+    # History mode for the data loader.
+    history_mode: Literal[
+        "single_tstep_state", 
+        "naive_past_1s_interval_top_camera_state",
+    ] = "single_tstep_state"
+
+    history_horizon: int = 5 # only used when history_mode != "single_tstep_state"
+
+
+    history_sequence_keys: Sequence[str] = ("top_camera-images-rgb",)
+
+
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
@@ -342,6 +354,11 @@ class LeRobotXmiRbyDataConfig(DataConfigFactory):
     # If provided, will be injected into the input data if the "prompt" key is not present.
     default_prompt: str | None = None
     retarget_mode: Literal["20D-relative", "20D-intergripper-relative", "29D-relative", "29D-intergripper-relative"] = "29D-relative"
+    history_mode: Literal[
+        "single_tstep_state", 
+        "naive_past_1s_interval_top_camera_state",
+    ] = "single_tstep_state"
+    history_horizon: int = 5 # only used when history_mode != "single_tstep_state"
     use_top_camera: bool = False
     
     @override
@@ -404,6 +421,9 @@ class LeRobotXmiRbyDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+
+            history_mode=self.history_mode,
+            history_horizon=self.history_horizon,
         )
 
 @dataclasses.dataclass(frozen=True)
@@ -553,6 +573,7 @@ class TrainConfig:
     seed: int = 42
     # Global batch size.
     batch_size: int = 32
+    batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
@@ -564,7 +585,7 @@ class TrainConfig:
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
-    keep_period: int | None = 5000
+    keep_period: int | None = 10000
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -849,10 +870,14 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi0_xmi_rby",
-        model=pi0.Pi0Config(action_horizon=25),
+        model=pi0.Pi0Config(action_horizon=40),
         data=LeRobotXmiRbyDataConfig(
-            repo_id="uynitsuj/xmi_data_20250802",
-            default_prompt="pick up the soup can and place it in the bin",
+            # repo_id="uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250818",
+            # repo_id="uynitsuj/shelf_soup_in_domain_xmi_data_20250822",
+            repo_id="uynitsuj/dishrack_unload_20250823",
+            # repo_id="uynitsuj/xmi_rby_pretrain_data_20250811",
+            # default_prompt="pick up the soup can and place it in the bin",
+            default_prompt="unload the dishes from the dishrack",
 
             retarget_mode = "29D-intergripper-relative",
             
@@ -862,10 +887,16 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
         ),
-        batch_size=16,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_hummus_ee_finetune/64000/params"),
-        num_train_steps=120_000,
+        fsdp_devices=2,
+        batch_size=32,
+        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_hummus_ee_finetune/64000/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_soup_can_in_domain_xmi_data_center_cropped_20250813_20250813_163958/36000/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_shelf_soup_in_domain_xmi_data_20250822_20250822_161415/20000/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_xmi_rby_pretrain_data_20250811_20250813_162402/19000/params"),
+
+        num_train_steps=45_000,
     ),
+    
     TrainConfig(
         name="pi0_fast_xmi_rby_low_mem_finetune",
         model=pi0_fast.Pi0FASTConfig(action_dim=29, action_horizon=18, max_token_len=290, paligemma_variant="gemma_2b_lora"),
@@ -889,18 +920,26 @@ _CONFIGS = [
         ema_decay=None,
     ),
     TrainConfig(
-        exp_name="soup_can_in_domain_20D_relative",
+        exp_name="shelf_soup_can_in_domain_29D_relative",
 
         name="pi0_xmi_rby_low_mem_finetune",
         model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_horizon=40), #, action_expert_variant="gemma_300m_lora"),
         data=LeRobotXmiRbyDataConfig(
-            repo_id="uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250807",
-            default_prompt="pick up the soup can and place it in the bin",
+            repo_id="uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250818",
+            # repo_id="uynitsuj/shelf_soup_in_domain_xmi_data_20250825",
+
+            # default_prompt="pick up the soup can and place it in the bin",
+            default_prompt="put the soup can in the shopping basket",
 
             # retarget_mode = "20D-relative",
             # retarget_mode = "20D-intergripper-relative",
             retarget_mode = "29D-intergripper-relative",
             # retarget_mode = "29D-relative",
+
+
+            # history_mode = "single_tstep_state", # "default pi0 behavior"
+            history_mode = "naive_past_1s_interval_top_camera_state", # "naive" past 1s intervals
+            history_horizon = 2,
             
             use_top_camera=True,
 
@@ -909,9 +948,14 @@ _CONFIGS = [
             ),
         ),
         # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_hummus_ee_finetune/64000/params"),
-        weight_loader=weight_loaders.CheckpointWeightLoader("/home/justinyu/checkpoints/pi0_xmi_rby/sky_hummus_ee_finetune/64000/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("/home/justinyu/checkpoints/pi0_xmi_rby/sky_hummus_ee_finetune/64000/params"),
 
-        num_train_steps=40_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_soup_can_in_domain_xmi_data_center_cropped_20250813_20250813_163958/36000/params"), # SOTA Tabletop ee finetune
+        
+        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_shelf_soup_in_domain_xmi_data_20250822_20250822_161415/21000/params"), # SOTA Shelf ee finetune
+
+        num_train_steps=80_000,
+        batch_size=16,
         freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora" #, action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,

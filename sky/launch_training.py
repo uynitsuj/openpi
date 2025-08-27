@@ -41,8 +41,10 @@ class SkyPilotTrainingConfig:
     service_provider: Optional[List[str]] = field(default_factory=lambda: ["lambda"]) #, "aws"]) # Default will search for cheapest service provider in the list
     s3_bucket: str = "s3://xdof-internal-research"
     s3_checkpoint_base: str = "s3://xdof-internal-research/model_ckpts"
-    accelerators: str = "A100:8"
-    region: str = "us-west-2"
+    accelerators: str = "A100-80GB:8"
+    # region: str = "us-west-2"
+    # region: str = "us-east-1"
+    region: str = "us-midwest-1"
     cluster_name: Optional[str] = None
     disable_wandb: bool = False 
     dry_run: bool = False # If true, will not launch training, but will generate the config to viewable temporary file and exit

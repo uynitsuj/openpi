@@ -820,10 +820,10 @@ class XMITrajectoryViewer:
                     finally:
                         self._updating_episode_controls = False
 
-            # time.sleep(0.1)
+            time.sleep(0.05)
 
 def main(
-    data_dir = "/nfs_us/data/us_xmi_01/20250804",
+    data_dir = "/home/justinyu/openpi/problematic_episodes_uynitsuj_shelf_soup_in_domain_xmi_data_20250818/Jerky_motion_detected_(rotation)",
     enable_stereo: bool = False,
     stereo_baseline: float = 0.12,
     intrinsics_path: str = "/nfs_us/justinyu/us_xmi_calib/SN39962371.conf",

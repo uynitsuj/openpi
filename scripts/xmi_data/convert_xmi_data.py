@@ -50,7 +50,7 @@ except ImportError:
     HAS_LEROBOT = False
 
 # TODO: remove this once we have a better way to handle this
-DEG30_MOUNTS = ["20250725", "20250724", "20250727", "20250728", "20250801", "20250804"]
+DEG30_MOUNTS = ["20250725", "20250724", "20250727", "20250728", "20250801", "20250804", "20250811", "20250812", "20250815", "20250818", "20250820", "20250822", "20250825"]
 
 @dataclass
 class XMIConfig:
@@ -78,12 +78,28 @@ class XMIConfig:
         # "/nfs_us/data/us_xmi_01/20250717/hand_off",
         # "/nfs_us/data/us_xmi_01/20250717/missed_grasps", # Hmmm maybe don't include this causes gripper to prematurely predict close gripper action in deployment which has the opposite intended effect
         # "/nfs_us/data/us_xmi_01/20250724", 
+        # "/nfs_us/data/us_xmi_01/20250725", 
+        # "/nfs_us/data/us_xmi_01/20250728",
 
-        "/nfs_us/data/us_xmi_01/20250725", # Better head data than prior data
-        "/nfs_us/data/us_xmi_01/20250727",
-        "/nfs_us/data/us_xmi_01/20250728",
-        "/nfs_us/data/us_xmi_01/20250801",
-        "/nfs_us/data/us_xmi_01/20250804",
+        # "/nfs_us/data/us_xmi_01/20250727",# Better head data than prior data
+        # "/nfs_us/data/us_xmi_01/20250801",
+        # "/nfs_us/data/us_xmi_01/20250804",
+        # "/nfs_us/data/us_xmi_01/20250811_tabletop_soup_can",
+
+        # Shelf Soup Can Data
+        # "/nfs_us/data/us_xmi_01/20250806_shelf_soup",
+        # "/nfs_us/data/us_xmi_01/20250807_shelf_soup",
+
+        "/nfs_us/data/us_xmi_01/20250812_shelf_soup", # Better head data than prior data
+        "/nfs_us/data/us_xmi_01/20250815_shelf_soup",
+        "/nfs_us/data/us_xmi_01/20250818_shelf_soup",
+        "/nfs_us/data/us_xmi_01/20250820_shelf_soup",
+        "/nfs_us/data/us_xmi_01/20250822_shelf_soup",
+        "/nfs_us/data/us_xmi_01/20250825_shelf_soup",
+
+        # Dishrack unload data
+        "/nfs_us/data/us_xmi_01/20250801_dishrack_unload",
+        "/nfs_us/data/us_xmi_01/20250823_dishrack_unload",
 
         # ## Oreo data
         # # "/nfs_us/data/oreo_xmi/clean_whiteboard", 
@@ -104,13 +120,8 @@ class XMIConfig:
         # "/nfs_us/data/oreo_xmi/zip_up_a_jacket",
 
         ## SZ XMI-RBY OOD Data
-        # "/nfs_us/data/sz_xmi_02/20250731",
-        # "/nfs_us/data/sz_xmi_02/20250801",
-        # "/nfs_us/data/sz_xmi_02/20250802",
-        # "/nfs_us/data/sz_xmi_02/20250803",
-        # "/nfs_us/data/sz_xmi_02/20250804",
-        # "/nfs_us/data/sz_xmi_02/20250805",
-        # "/nfs_us/data/sz_xmi_02/20250806",
+        # "/nfs_us/data/sz_xmi_02/pick_place_cleaning_sponge",
+        # "/home/justinyu/nfs_us/data/sz_xmi_02/pick_place_soup_can",
 
     ])
     
@@ -138,13 +149,29 @@ class XMIConfig:
         # "pick up the soup can and place it in the bin",
         # "pick up the soup can and place it in the bin",
         # "pick up the soup can and place it in the bin",
-        
-        "pick up the soup can and place it in the bin",
-        "pick up the soup can and place it in the bin",
-        "pick up the soup can and place it in the bin",
-        "pick up the soup can and place it in the bin",
-        "pick up the soup can and place it in the bin",
+        # "pick up the soup can and place it in the bin",
+        # "pick up the soup can and place it in the bin",
 
+        # "pick up the soup can and place it in the bin",
+        # "pick up the soup can and place it in the bin",
+        # "pick up the soup can and place it in the bin",
+        # "pick up the soup can and place it in the bin",
+
+
+        # Shelf Soup Can Data
+        # "put the soup can in the shopping basket",
+        # "put the soup can in the shopping basket",
+
+        "put the soup can in the shopping basket",
+        "put the soup can in the shopping basket",
+        "put the soup can in the shopping basket",
+        "put the soup can in the shopping basket",
+        "put the soup can in the shopping basket",
+        "put the soup can in the shopping basket",
+
+        # Dishrack Unload Data
+        "unload the dishes from the dishrack",
+        "unload the dishes from the dishrack",
 
         # ## Oreo data
         # # "clean the whiteboard with the eraser",
@@ -163,11 +190,14 @@ class XMIConfig:
         # "sort the stationery into the containers",
         # "untangle the cables and put them in the bin",
         # "zip up the jacket",
+
+        ## SZ XMI-RBY OOD Data
+        # "pick up the cleaning sponge and place it in the bin",
+        # "pick up the soup can and place it in the bin",
     ])
     
     # Repository name for output dataset
-    # repo_name: str = "uynitsuj/hummus_xmi_data_20250722_test_sz_to_us"
-    repo_name: str = "uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250807"
+    repo_name: str = "uynitsuj/shelf_soup_in_domain_xmi_data_20250825"
     
     # Camera settings
     camera_keys: List[str] = field(default_factory=lambda: [
@@ -185,7 +215,7 @@ class XMIConfig:
     # Calibration files TODO: very bad, going forward calibration data should be attached to and extracted from episode metadata
     left_controller_calib: str = "/nfs_us/justinyu/us_xmi_calib/Left_Controller_20250603_15/calib_results/controller2franka.npy"
     right_controller_calib: str = "/nfs_us/justinyu/us_xmi_calib/Right_Controller_20250603_15/calib_results/controller2franka.npy"
-    quest_to_zed_calib: str = "/home/justinyu/nfs_us/justinyu/us_xmi_calib/Head_Franka_20250604_12/calib_results/head2cam.npy"
+    quest_to_zed_calib: str = "/nfs_us/justinyu/us_xmi_calib/Head_Franka_20250604_12/calib_results/head2cam.npy"
     
     # Processing settings
     resize_size: int = 224
@@ -194,26 +224,30 @@ class XMIConfig:
     crop_images_to_square: bool = True # Whether to crop images to square (if False, will keep original aspect ratio and pad with black instead)
     chunk_size: int = 1000
     max_workers: int = 10
+    max_workers: int = 10
     max_episodes: Optional[int] = None
     skip_videos: bool = False
     first_frame_head_reorient: bool = False
     no_filter_quality: bool = True  # If True, will not filter out low quality episodes
     include_head_pose: bool = True # Whether to include head state in the lerobot proprio state and action (for head / active vision retargeting) NOTE: makes state dim and action dim 29 instead of 20 (adds 6d rot 3d pos)
 
-    gripper_action_delay_tsteps: int = 8 # Number of timesteps to delay the gripper action by
+    gripper_action_delay_tsteps: int = 7 # Number of timesteps to delay the gripper action by
+    move_old_handoffs: bool = False # Whether to move old handoffs from the dataset to a separate folder named old_handoffs (detected by checking if gripper action minimum is low for both grippers in one trajectory)
 
     perturb_z_height: bool = True # Whether to perturb the z height of the head and hands around average tabletop height
     perturb_z_height_range: Tuple[float, float] = (0.59, 1.0) # Range of z height of hands perturbation (uniformly sampled)
 
     perturb_xy_position: bool = True # Whether to perturb the xy position of the head and hands around average tabletop position
-    perturb_x_position_range: Tuple[float, float] = (0.05, 0.2) # Range of x position perturbation (uniformly sampled)
-    perturb_y_position_range: Tuple[float, float] = (-0.1, 0.1) # Range of y position perturbation (uniformly sampled)
+    perturb_x_position_range: Tuple[float, float] = (-0.08, 0.08) # Range of x position perturbation (uniformly sampled)
+    perturb_y_position_range: Tuple[float, float] = (-0.03, 0.03) # Range of y position perturbation (uniformly sampled)
 
     delta_proprio_keys: str = None # Makes the proprioceptive state for this axis delta. Can set to None to keep both state and action absolute
 
     # Validation settings
-    max_se3_diff_in_meters: float = 0.20  # Maximum allowed SE3 difference in meters
-    max_se3_diff_in_degrees: float = 11  # Maximum allowed SE3 difference in degrees
+    # max_se3_diff_in_meters: float = 0.20  # Maximum allowed SE3 difference in meters
+    max_se3_diff_in_meters: float = 0.45  # Maximum allowed SE3 difference in meters
+    # max_se3_diff_in_degrees: float = 11  # Maximum allowed SE3 difference in degrees
+    max_se3_diff_in_degrees: float = 40  # Maximum allowed SE3 difference in degrees
     video_timestamp_tolerance_s: float = 0.0001  # Maximum allowed deviation from expected frame interval for video validation (seconds)
     
     # Hub settings
@@ -504,7 +538,7 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     action_data = episode_data['action_data'] # (oculus gripper action)
     joint_data = episode_data['joint_data'] # (robotiq gripper proprio)
     
-    # Load controller calibration transformations
+    # Load controller calibration transformations TODO: search for calibration data in metadata, fallback to this if not found for backward compatibility
     left_controller_calib_tf = vtf.SE3.from_matrix(np.load(cfg.left_controller_calib)).inverse()
     right_controller_calib_tf = vtf.SE3.from_matrix(np.load(cfg.right_controller_calib)).inverse()
     quest_to_zed_calib_tf = vtf.SE3.from_matrix(np.load(cfg.quest_to_zed_calib)).inverse()
@@ -515,7 +549,6 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     )
 
     # HEAD PROCESSING
-    # Determine direction that head z axis is pointing in the first frame to reorient the RBY1 base frame
     
     head_z_tf = vtf.SE3.from_matrix(action_data["action-left-head"][0])
     head_data_all = vtf.SE3.from_matrix(action_data["action-left-head"])
@@ -523,36 +556,45 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     head_data_all = q2w @ head_data_all
     head_z_tf = q2w @ head_z_tf
 
-    # average head height
-    head_height = np.mean(head_data_all.wxyz_xyz[:, -1])
-    # print(f"Average head height: {head_height}m")
+    # Some hardcoded hacks for old data TODO: remove these hacks eventually
+    #########################################################
 
     metadata_file = episode_path / "metadata.json"
+    metadata = None
     if metadata_file.exists():
         with open(metadata_file, 'r') as f:
             metadata = json.load(f)
-    else:
-        raise FileNotFoundError(f"Metadata file not found: {metadata_file}")
+    # else:
+    #     raise FileNotFoundError(f"Metadata file not found: {metadata_file}")
         
-    if "config_path" in metadata.keys() and 'sz' in metadata["config_path"][0]:
-        sz_to_us_tf = vtf.SE3.from_matrix(np.array([ # TODO: very bad temporary hack for hummus data, going forward calibration data should extracted in the metadata
-            [1.0,      0.0,        0.0,        0.0],
-            [0.0,  0.956304,  0.292371,  0.02955328],
-            [0.0,  -0.292371,   0.956304,  0.00117534],
-            [0.0,      0.0,        0.0,        1.0]
-        ]))
-        quest_to_zed_calib_tf = quest_to_zed_calib_tf @ sz_to_us_tf.inverse()
-
-    if "start_datetime" in metadata.keys() and any(mount in metadata["start_datetime"] for mount in DEG30_MOUNTS):
+        if "config_path" in metadata.keys() and 'sz' in metadata["config_path"][0]:
+            sz_to_us_tf = vtf.SE3.from_matrix(np.array([ # TODO: very bad temporary hack for hummus data, going forward calibration data should extracted in the metadata
+                [1.0,      0.0,        0.0,        0.0],
+                [0.0,  0.956304,  0.292371,  0.02955328],
+                [0.0,  -0.292371,   0.956304,  0.00117534],
+                [0.0,      0.0,        0.0,        1.0]
+            ]))
+            quest_to_zed_calib_tf = quest_to_zed_calib_tf @ sz_to_us_tf.inverse()
+    if metadata is not None:
+        if "start_datetime" in metadata.keys() and any(mount in metadata["start_datetime"] for mount in DEG30_MOUNTS):
+            old_mount_to_new_mount_tf = vtf.SE3.from_rotation_and_translation(
+                vtf.SO3.from_rpy_radians(-25 * np.pi/180, 0.0, 0.0), np.array([0.0, 0.0, 0.0])
+            )
+            quest_to_zed_calib_tf = quest_to_zed_calib_tf @ old_mount_to_new_mount_tf.inverse() # TODO: REMOVE HACK EVENTUALLY
+    else:
         old_mount_to_new_mount_tf = vtf.SE3.from_rotation_and_translation(
             vtf.SO3.from_rpy_radians(-25 * np.pi/180, 0.0, 0.0), np.array([0.0, 0.0, 0.0])
         )
         quest_to_zed_calib_tf = quest_to_zed_calib_tf @ old_mount_to_new_mount_tf.inverse() # TODO: REMOVE HACK EVENTUALLY
 
+    #########################################################
+
+
     head_translation = np.mean(head_data_all.wxyz_xyz[:, -3:], axis=0)
     head_translation[1] = -head_translation[1]
     head_translation[2] = 0.0
     if cfg.first_frame_head_reorient:
+        # Determine direction that head z axis is pointing in the first frame to reorient the RBY1 base frame
         head_z_axis_rot = vtf.SO3.from_rpy_radians(
             -head_z_tf.rotation().as_rpy_radians().roll,
             head_z_tf.rotation().as_rpy_radians().pitch,
@@ -569,18 +611,25 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
         head_z_axis_angle = np.arctan2(head_z_axis_xy[1], head_z_axis_xy[0])
 
         rby1_base_frame_wxyz = vtf.SO3.from_rpy_radians(0.0, 0.0, head_z_axis_angle).wxyz
-        # print(f"Head z axis angle: {head_z_axis_angle}")
     else:
-        # Default to the direction of left gripper z axis (worried that randomly oriented world frame proprio input could mess up normalization statistics)
-        # Make the current hand z axis point toward world negative x axis
+        # If first frame head reorientation is not enabled, use the average of the two controller orientations to reorient the RBY1 base frame
         def mean_angle(thetas):
             """Circular mean of a list/array of angles in radians."""
             return np.angle(np.exp(1j * np.asarray(thetas)).mean())
 
-        left_hand_matrix = action_data["action-left-hand_in_quest_world_frame"][0]
-        world_frame = action_data["action-left-quest_world_frame"][0]
-        left_hand_tf = vtf.SE3.from_matrix(left_hand_matrix)
-        left_hand_tf = q2w @ vtf.SE3.from_matrix(world_frame) @ left_hand_tf
+        if "action-left-hand" in action_data.keys():
+            left_hand_matrix = action_data["action-left-hand"][0]
+            left_hand_tf = vtf.SE3.from_matrix(left_hand_matrix)
+            left_hand_tf = q2w @ left_hand_tf
+        elif "action-left-hand_in_quest_world_frame" in action_data.keys():
+            left_hand_matrix = action_data["action-left-hand_in_quest_world_frame"][0]
+            world_frame = action_data["action-left-quest_world_frame"][0]
+            left_hand_tf = vtf.SE3.from_matrix(left_hand_matrix)
+            left_hand_tf = q2w @ vtf.SE3.from_matrix(world_frame) @ left_hand_tf
+        else:
+            raise ValueError("No left hand data found")
+
+        left_hand_tf.wxyz_xyz[:4] = left_hand_tf.rotation().normalize().wxyz
 
         left_hand_tf_pos = left_hand_tf.wxyz_xyz[-3:]
         left_hand_tf_pos[1] = -left_hand_tf_pos[1]
@@ -602,11 +651,20 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
         hand_z_axis = tf_left_ee_ik_target.as_matrix()[:, 2] 
         hand_z_axis_angle_left = np.arctan2(hand_z_axis[1], hand_z_axis[0])
 
-        right_hand_matrix = action_data["action-right-hand_in_quest_world_frame"][0]
-        right_world_frame = action_data["action-right-quest_world_frame"][0]
-        right_hand_in_world = np.linalg.inv(world_frame) @ right_world_frame @ right_hand_matrix
-        right_hand_tf = vtf.SE3.from_matrix(right_hand_in_world)
-        right_hand_tf = q2w @ vtf.SE3.from_matrix(right_world_frame) @ right_hand_tf
+        if "action-right-hand" in action_data.keys():
+            right_hand_matrix = action_data["action-right-hand"][0]
+            right_hand_tf = vtf.SE3.from_matrix(right_hand_matrix)
+            right_hand_tf = q2w @ right_hand_tf
+        elif "action-right-hand_in_quest_world_frame" in action_data.keys():
+            right_hand_matrix = action_data["action-right-hand_in_quest_world_frame"][0]
+            right_world_frame = action_data["action-right-quest_world_frame"][0]
+            right_hand_in_world = np.linalg.inv(world_frame) @ right_world_frame @ right_hand_matrix
+            right_hand_tf = vtf.SE3.from_matrix(right_hand_in_world)
+            right_hand_tf = q2w @ vtf.SE3.from_matrix(right_world_frame) @ right_hand_tf
+        else:
+            raise ValueError("No right hand data found")
+
+        right_hand_tf.wxyz_xyz[:4] = right_hand_tf.rotation().normalize().wxyz
 
         right_hand_tf_pos = right_hand_tf.wxyz_xyz[-3:]
         right_hand_tf_pos[1] = -right_hand_tf_pos[1]
@@ -629,10 +687,20 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     rby1_base_frame_position = head_translation
 
     # LEFT HAND PROCESSING
-    left_hand_matrix = action_data["action-left-hand_in_quest_world_frame"]
-    world_frame = action_data["action-left-quest_world_frame"]
-    left_hand_tf = vtf.SE3.from_matrix(left_hand_matrix)
-    left_hand_tf = q2w @ vtf.SE3.from_matrix(world_frame) @ left_hand_tf
+    world_frame = None
+    if "action-left-hand" in action_data.keys():
+        left_hand_matrix = action_data["action-left-hand"]
+        left_hand_tf = vtf.SE3.from_matrix(left_hand_matrix)
+        left_hand_tf = q2w @ left_hand_tf
+    elif "action-left-hand_in_quest_world_frame" in action_data.keys():
+        left_hand_matrix = action_data["action-left-hand_in_quest_world_frame"]
+        world_frame = action_data["action-left-quest_world_frame"]
+        left_hand_tf = vtf.SE3.from_matrix(left_hand_matrix)
+        left_hand_tf = q2w @ vtf.SE3.from_matrix(world_frame) @ left_hand_tf
+    else:
+        raise ValueError("No left hand data found")
+
+    left_hand_tf.wxyz_xyz[:, :4] = left_hand_tf.rotation().normalize().wxyz
 
     left_hand_tf_pos = left_hand_tf.wxyz_xyz[:, -3:]
     left_hand_tf_pos[:, 1] = -left_hand_tf_pos[:, 1]
@@ -655,12 +723,21 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     left_ee_ik_target_handle_wxyz = tf_left_ee_ik_target.wxyz_xyz[:, :4]
 
     # RIGHT HAND PROCESSING
-    left_quest_world_frame = action_data["action-left-quest_world_frame"]
-    right_hand_matrix = action_data["action-right-hand_in_quest_world_frame"]
-    right_world_frame = action_data["action-right-quest_world_frame"]
-    right_hand_in_world = np.linalg.inv(left_quest_world_frame) @ right_world_frame @ right_hand_matrix
-    right_hand_tf = vtf.SE3.from_matrix(right_hand_in_world)
-    right_hand_tf = q2w @ vtf.SE3.from_matrix(right_world_frame) @ right_hand_tf
+    
+    if "action-right-hand" in action_data.keys():
+        right_hand_matrix = action_data["action-right-hand"]
+        right_hand_tf = vtf.SE3.from_matrix(right_hand_matrix)
+        right_hand_tf = q2w @ right_hand_tf
+    elif "action-right-hand_in_quest_world_frame" in action_data.keys():
+        right_hand_matrix = action_data["action-right-hand_in_quest_world_frame"]
+        right_world_frame = action_data["action-right-quest_world_frame"]
+        right_hand_in_world = np.linalg.inv(world_frame) @ right_world_frame @ right_hand_matrix
+        right_hand_tf = vtf.SE3.from_matrix(right_hand_in_world)
+        right_hand_tf = q2w @ vtf.SE3.from_matrix(right_world_frame) @ right_hand_tf
+    else:
+        raise ValueError("No right hand data found")
+
+    right_hand_tf.wxyz_xyz[:, :4] = right_hand_tf.rotation().normalize().wxyz
 
     right_hand_tf_pos = right_hand_tf.wxyz_xyz[:, -3:]
     right_hand_tf_pos[:, 1] = -right_hand_tf_pos[:, 1]
@@ -724,6 +801,15 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
 
     left_gripper_action = action_data['action-left-pos']
     right_gripper_action = action_data['action-right-pos']
+
+
+    if cfg.move_old_handoffs and left_gripper_action.min() < 0.5 and right_gripper_action.min() < 0.5:
+        print(f"Handoff detected, moving episode to old_handoffs folder{episode_path}")
+        os.makedirs("old_handoffs", exist_ok=True)
+        shutil.move(episode_path, os.path.join("old_handoffs", os.path.basename(episode_path)))
+
+        return None, None
+
 
     # Check array lengths are consistent  
     assert len(left_gripper_pos) == len(right_gripper_pos)

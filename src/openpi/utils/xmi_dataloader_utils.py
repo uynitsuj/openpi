@@ -14,10 +14,12 @@ def load_episode_data(episode_path: Path, cfg: dict, base_dir: Path, ep_idx: int
             "action-left-head.npy", 
             "action-left-pos.npy",
             "action-left-quest_world_frame.npy",
+            "action-left-hand.npy",
             "action-right-hand_in_quest_world_frame.npy",
             "action-right-head.npy",
             "action-right-pos.npy", 
-            "action-right-quest_world_frame.npy"
+            "action-right-quest_world_frame.npy",
+            "action-right-hand.npy"
         ]
         
         for action_file in action_files:
@@ -130,14 +132,14 @@ def validate_episode_data(episode_data: dict) -> tuple[bool, str]:
     # Check required action_data keys
     required_action_keys = [
         'action-left-head',
-        'action-left-hand_in_quest_world_frame',
-        'action-left-quest_world_frame',
-        'action-right-hand_in_quest_world_frame',
-        'action-right-quest_world_frame',
+        # 'action-left-hand_in_quest_world_frame', or 'action-left-hand'
+        # 'action-left-quest_world_frame',
+        # 'action-right-hand_in_quest_world_frame', or 'action-right-hand'
+        # 'action-right-quest_world_frame',
         'action-left-pos',
         'action-right-pos'
     ]
-    
+
     action_data = episode_data['action_data']
     for key in required_action_keys:
         if key not in action_data:
@@ -145,6 +147,11 @@ def validate_episode_data(episode_data: dict) -> tuple[bool, str]:
         if action_data[key] is None:
             return False, f"action_data['{key}'] is None"
     
+    # Check that either (action-left-hand and action-right-hand) or (action-left-hand_in_quest_world_frame and action-right-hand_in_quest_world_frame) are in action_data
+    if 'action-left-hand' not in action_data and 'action-right-hand' not in action_data:
+        if 'action-left-hand_in_quest_world_frame' not in action_data and 'action-right-hand_in_quest_world_frame' not in action_data:
+            return False, "Either (action-left-hand and action-right-hand) or (action-left-hand_in_quest_world_frame and action-right-hand_in_quest_world_frame) must be in action_data"
+
     # Check required joint_data keys
     required_joint_keys = ['left-joint_pos', 'right-joint_pos']
     joint_data = episode_data['joint_data']

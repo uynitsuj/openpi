@@ -29,7 +29,7 @@ def create_dataset(config: _config.TrainConfig) -> tuple[_config.DataConfig, _da
     data_config = config.data.create(config.assets_dirs, config.model)
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
-    dataset = _data_loader.create_torch_dataset(data_config, config.model.action_horizon, config.model)
+    dataset = _data_loader.create_torch_dataset(data_config, config.model.action_horizon, config.model, return_video_frames=False)
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
@@ -247,6 +247,23 @@ class FastRunningStats:
 
 def main(config_name: str, max_frames: int | None = None, *, use_fast_stats: bool = True):
     """Main function that computes and saves normalization statistics."""
+    # Monkey-patch to fix 'List' feature type error in old datasets
+    try:
+        import datasets.features.features as features
+
+        _OLD_GENERATE_FROM_DICT = features.generate_from_dict
+
+        def _new_generate_from_dict(obj):
+            if isinstance(obj, dict) and obj.get("_type") == "List":
+                obj["_type"] = "Sequence"
+            return _OLD_GENERATE_FROM_DICT(obj)
+
+        features.generate_from_dict = _new_generate_from_dict
+    except (ImportError, AttributeError):
+        # If datasets or the function doesn't exist, do nothing.
+        pass
+    # End of monkey-patch
+    
     max_time_minutes = 60 * 24  # Maximum runtime in minutes
     start_time = time.time()
 
@@ -284,7 +301,7 @@ def main(config_name: str, max_frames: int | None = None, *, use_fast_stats: boo
     data_loader = _data_loader.TorchDataLoader(
         dataset,
         local_batch_size=batch_size,
-        num_workers=16,  # More workers for faster loading
+        num_workers=32,  # More workers for faster loading
         shuffle=shuffle,
         num_batches=num_frames,
     )

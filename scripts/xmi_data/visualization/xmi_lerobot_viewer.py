@@ -25,10 +25,12 @@ from openpi.utils.matrix_utils import rot_6d_to_quat
 
 # DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250818"
 # DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/xmi_rby_pretrain_data_20250811"
-DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/shelf_soup_in_domain_xmi_data_20250825"
+DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/shelf_soup_in_domain_xmi_data_20250902"
+# DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/sort_item_shopping_basket_memory_xmi_data_20250909"
+# DATASET_PATH = "/home/justinyu/.cache/huggingface/lerobot/uynitsuj/sort_fruit_plate_memory_xmi_data_20250909"
 
 class XMILeRobotViewer:
-    def __init__(self, dataset_path: str, action_horizon: int = 20):
+    def __init__(self, dataset_path: str, action_horizon: int = 50):
         """
         Initialize XMI LeRobot trajectory viewer.
         
@@ -304,13 +306,13 @@ class XMILeRobotViewer:
         
         # Add end-effector frames
         self.left_ee_frame = self.viser_server.scene.add_frame(
-            "/left_ee", axes_length=0.1, axes_radius=0.005, origin_radius=0.02
+            "/left_ee", axes_length=0.1, axes_radius=0.005, origin_radius=0.02, show_axes=False
         )
         self.right_ee_frame = self.viser_server.scene.add_frame(
-            "/right_ee", axes_length=0.1, axes_radius=0.005, origin_radius=0.02
+            "/right_ee", axes_length=0.1, axes_radius=0.005, origin_radius=0.02, show_axes=False
         )
         self.top_ee_frame = self.viser_server.scene.add_frame(
-            "/top_ee", axes_length=0.1, axes_radius=0.005, origin_radius=0.02
+            "/top_ee", axes_length=0.1, axes_radius=0.005, origin_radius=0.02, show_axes=False
         )
 
         self.left_ee_action_frames = []
@@ -318,13 +320,13 @@ class XMILeRobotViewer:
         self.top_ee_action_frames = []
         for i in range(self.action_horizon):
             self.left_ee_action_frames.append(self.viser_server.scene.add_frame(
-                f"/left_ee_action_{i}", axes_length=0.07, axes_radius=0.003, origin_radius=0.01
+                f"/left_ee_action_{i}", axes_length=0.07, axes_radius=0.002, origin_radius=0.008
             ))
             self.right_ee_action_frames.append(self.viser_server.scene.add_frame(
-                f"/right_ee_action_{i}", axes_length=0.07, axes_radius=0.003, origin_radius=0.01
+                f"/right_ee_action_{i}", axes_length=0.07, axes_radius=0.002, origin_radius=0.008
             ))
             self.top_ee_action_frames.append(self.viser_server.scene.add_frame(
-                f"/top_ee_action_{i}", axes_length=0.07, axes_radius=0.003, origin_radius=0.01
+                f"/top_ee_action_{i}", axes_length=0.07, axes_radius=0.002, origin_radius=0.008
             ))
 
         # Add camera frustums for visualization
@@ -351,8 +353,8 @@ class XMILeRobotViewer:
                 frustum = self.viser_server.scene.add_camera_frustum(
                     frustum_label,
                     fov=np.pi / 3,
-                    aspect=4 / 3,
-                    scale=0.1,
+                    aspect=1,
+                    scale=0.05,
                     line_width=2.0,
                     wxyz = vtf.SO3.from_rpy_radians(0.0, np.pi, -np.pi).wxyz,
                 )
@@ -361,8 +363,8 @@ class XMILeRobotViewer:
                 frustum = self.viser_server.scene.add_camera_frustum(
                     frustum_label,
                     fov=np.pi / 3,
-                    aspect=4 / 3,
-                    scale=0.1,
+                    aspect=1,
+                    scale=0.05,
                     line_width=2.0,
                     wxyz = vtf.SO3.from_rpy_radians(0.0, np.pi, -np.pi).wxyz,
                 )
@@ -371,8 +373,8 @@ class XMILeRobotViewer:
                 frustum = self.viser_server.scene.add_camera_frustum(
                     frustum_label,
                     fov=np.pi / 3,
-                    aspect=4 / 3,
-                    scale=0.1,
+                    aspect=1,
+                    scale=0.05,
                     line_width=2.0,
                 )
             self.camera_frustums[camera_key] = frustum
@@ -598,7 +600,7 @@ class XMILeRobotViewer:
                 action_horizon = np.concatenate([action_horizon, action_horizon[-1:].repeat(self.action_horizon - len(action_horizon), axis=0)], axis=0)
                 assert len(action_horizon) == self.action_horizon
 
-            for i in range(self.action_horizon):
+            for i in range(0, self.action_horizon, 5):
                 left_se3_action, left_gripper_action, right_se3_action, right_gripper_action, head_se3_action = self._parse_xmi_state(action_horizon[i])
 
                 left_ee_action_frame = self.left_ee_action_frames[i]

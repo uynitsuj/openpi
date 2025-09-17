@@ -78,6 +78,8 @@ from lerobot.datasets.video_utils import (
     get_safe_default_codec,
     get_video_info,
 )
+from collections import deque
+from openpi.utils.key_frame_select_utils import zed_tf_intrinsics, select_keyframes_helper
 
 CODEBASE_VERSION = "v2.1"
 
@@ -352,7 +354,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         history_mode: Literal[
             "single_tstep_state", 
             "naive_past_5s_top_camera_state",
+            "keyframe_select_top_camera_state",
         ] = "single_tstep_state",
+        history_horizon: int = 1,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -473,6 +477,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.pre_decode_video_frames = pre_decode_video_frames
 
         self.history_mode = history_mode
+        self.history_horizon = history_horizon
 
         # Unused attributes
         self.image_writer = None
@@ -516,24 +521,39 @@ class LeRobotDataset(torch.utils.data.Dataset):
             ep_indices = list(range(self.meta.total_episodes))
 
             manifest_entries: List[Dict] = []
-            with ProcessPoolExecutor(max_workers=10) as ex: # TODO: maybe make this not hardcoded to 10 workers
-                futures = [
-                    ex.submit(
-                        self._episode_worker,
-                        ep,
-                    )
-                    for ep in ep_indices
-                ]
-                for fut in tqdm(as_completed(futures), total=len(futures), desc="Pre-Decoding Videos", leave=True):
-                    manifest_entries.append(fut.result())
+            if not self.root.joinpath("jpg/manifest.json").is_file():
+                with ProcessPoolExecutor(max_workers=10) as ex: # TODO: maybe make this not hardcoded to 10 workers
+                    futures = [
+                        ex.submit(
+                            self._episode_worker,
+                            ep,
+                        )
+                        for ep in ep_indices
+                    ]
+                    for fut in tqdm(as_completed(futures), total=len(futures), desc="Pre-Decoding Videos", leave=True):
+                        manifest_entries.append(fut.result())
 
-            manifest = {
-                "repo_id": repo_id,
-                "output_dir": str(self.root / "jpg"),
-                "episodes": sorted(manifest_entries, key=lambda x: x["dir"]),
-            }
-            (self.root / "jpg" / "manifest.json").write_text(json.dumps(manifest, indent=2))
+                manifest = {
+                    "repo_id": repo_id,
+                    "output_dir": str(self.root / "jpg"),
+                    "episodes": sorted(manifest_entries, key=lambda x: x["dir"]),
+                }
+                (self.root / "jpg" / "manifest.json").write_text(json.dumps(manifest, indent=2))
+            else:
+                print("Pre-Decoded videos appears to already exist, skipping")
 
+        if self.history_mode == "keyframe_select_top_camera_state":
+            self.past_idxs = deque(maxlen=self.history_horizon)
+            self.top_cam_factory_intrinsics = np.array([ # Currently hardcoded TODO: move to metadata (both raw data and LeRobot data)
+                [532.395, 0, 638.22],
+                [0, 532.325, 363.7015],
+                [0, 0, 1]
+            ])
+            self.capture_resolution = (1280, 720) # Currently hardcoded TODO: move to metadata (both raw data and LeRobot data)
+            self.new_resolution = (224, 224) # Currently hardcoded TODO: move to metadata (both raw data and LeRobot data)
+
+            self.zed_post_crop_intrinsics = zed_tf_intrinsics(self.top_cam_factory_intrinsics, capture_resolution=self.capture_resolution, new_resolution=self.new_resolution)
+            self.top_camera_fov = 2 * np.arctan(self.new_resolution[0] / (2 * self.zed_post_crop_intrinsics[0, 0]))
 
     def _episode_worker(self, episode_idx: int) -> None:
         out_root = Path(self.root) / "jpg"
@@ -545,8 +565,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if vid_path.is_file():
                 cam_dir = out_root / f"episode_{episode_idx:06d}" / vkey
                 cam_dir.mkdir(parents=True, exist_ok=True)
-                if not any(cam_dir.iterdir()): # if the directory is empty, extract the frames
-                    self._ffmpeg_extract_jpgs(vid_path, cam_dir)
+                # if not any(cam_dir.iterdir()): # if the directory is empty, extract the frames
+                self._ffmpeg_extract_jpgs(vid_path, cam_dir)
         return {
             "dir": f"episode_{episode_idx:06d}",
             "videos": video_keys,
@@ -838,6 +858,31 @@ class LeRobotDataset(torch.utils.data.Dataset):
             item = {**item, **padding}
             for key, val in query_result.items():
                 item[key] = val
+
+            if self.history_mode == "keyframe_select_top_camera_state":
+                # import pdb; pdb.set_trace()
+                # item["keyframe_idx"]
+                top_camera_key = self.meta.video_keys[-1] # TODO: make this not hardcoded
+                ep_start = self.episode_data_index["from"][ep_idx]
+                # ep_end = self.episode_data_index["to"][ep_idx]
+                # if idx == ep_end: # Handle last frame of episode
+                #     self.past_idxs.clear()
+                #     import pdb; pdb.set_trace()
+                # if idx == ep_start: # Handle first frame of episode
+                #     self.past_idxs.clear()
+
+                # state_query_indices = {"state": list(range(ep_start.item(), idx+1))} # TODO: maybe state key should not be hardcoded
+                # state_query_result = self._query_hf_dataset(state_query_indices)
+
+                # self.past_idxs = select_keyframes_helper(state_query_result["state"].numpy()[:, 20:], self.top_camera_fov, self.past_idxs)
+                # while len(self.past_idxs) < self.history_horizon:
+                #     self.past_idxs.append(self.past_idxs[-1])
+
+                # import pdb; pdb.set_trace()
+
+                query_indices = {top_camera_key: [idx-ep_start.item()] + item["keyframe_idx"].tolist()}
+
+                # import pdb; pdb.set_trace()
 
         if len(self.meta.video_keys) > 0 and self.return_video_frames:
             # t2 = time.time()

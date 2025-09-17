@@ -56,6 +56,7 @@ def init_logging():
 def save_debug_images(observation: _model.Observation, step: int, checkpoint_dir: epath.Path, 
                       data_config: _config.DataConfig = None):
     """Save sample images from the observation for debugging purposes."""
+    # checkpoint_dir.mkdir(exist_ok=True)
     debug_dir = checkpoint_dir / "debug_images"
     debug_dir.mkdir(exist_ok=True)
     
@@ -117,50 +118,69 @@ def save_debug_images(observation: _model.Observation, step: int, checkpoint_dir
                     f.write(f"\nNOTE: Images are NOT normalized in this config.\n")
                     f.write(f"The training pipeline preserves original image intensity values.\n")
                     f.write(f"Raw LeRobot data: float32 [0,1] -> Training data: uint8 [0,255]\n")
-    
+    past_head_images_normalized = []
+
+    if past_head_images is not None:
+        for t, past_head_image in enumerate(past_head_images[sample_idx]):
+            if past_head_image.dtype == np.float32:
+                past_head_images_normalized.append((np.clip(past_head_image, -1, 1) * 127.5 + 127.5).astype(np.uint8))
+            past_head_image_path = step_dir / f"past_head_image_{t}.npy"
+            np.save(past_head_image_path, past_head_image)
+            past_head_image_path = step_dir / f"past_head_image_{t}_stats.txt"
+            with open(past_head_image_path, 'w') as f:
+                f.write(f"Past head image {t}\n")
+                f.write(f"Step: {step}\n")
+                f.write(f"Sample index: {sample_idx}\n")
+                f.write(f"Image dtype: {past_head_image.dtype}\n")
+                f.write(f"Image min: {past_head_image.min()}\n")
+                f.write(f"Image max: {past_head_image.max()}\n")
+                f.write(f"Image mean: {past_head_image.mean():.4f}\n")
+                f.write(f"Image std: {past_head_image.std():.4f}\n")
+                f.write(f"Non-zero pixels: {np.count_nonzero(past_head_image)}/{past_head_image.size} ({100 * np.count_nonzero(past_head_image) / past_head_image.size:.2f}%)\n")
+
+
     # Create visualization if matplotlib is available
     if MATPLOTLIB_AVAILABLE and camera_images:
-        try:
-            camera_names = list(camera_images.keys())
-            num_cameras = len(camera_names)
-            if past_head_images is not None:
-                num_cameras += past_head_images.shape[1]
-            
-            fig, axes = plt.subplots(1, num_cameras, figsize=(5 * num_cameras, 5))
-            if num_cameras == 1:
-                axes = [axes]  # Make it a list for consistency
-            
-            for i, camera_name in enumerate(camera_names):
-                img = camera_images[camera_name]
-                axes[i].imshow(img)
-                axes[i].set_title(f"{camera_name}\nStep {step}\nMean: {img.mean():.1f}, Std: {img.std():.1f}")
-                axes[i].axis('off')
-            
-            if past_head_images is not None:
-                for t in range(past_head_images.shape[1], 0, -1):
-                    img = past_head_images[0, past_head_images.shape[1] - t]
-                    if img.dtype == np.float32:
-                        img = (np.clip(img, -1, 1) * 127.5 + 127.5).astype(np.uint8)
-                    axes[-t].imshow(img)
-                    axes[-t].set_title(f"Past Head {t}\nStep {step}\nMean: {img.mean():.1f}, Std: {img.std():.1f}")
-                    axes[-t].axis('off')
+        # try:
+        camera_names = list(camera_images.keys())
+        num_cameras = len(camera_names)
+        # import pdb; pdb.set_trace()
+        if past_head_images is not None:
+            num_cameras += past_head_images.shape[1]
+        
+        fig, axes = plt.subplots(1, num_cameras, figsize=(5 * num_cameras, 5))
+        if num_cameras == 1:
+            axes = [axes]  # Make it a list for consistency
+        
+        for i, camera_name in enumerate(camera_names):
+            img = camera_images[camera_name]
+            axes[i].imshow(img)
+            axes[i].set_title(f"{camera_name}\nStep {step}\nMean: {img.mean():.1f}, Std: {img.std():.1f}")
+            axes[i].axis('off')
+        
+        if past_head_images is not None:
+            for t in range(len(past_head_images_normalized)):
+                img = past_head_images_normalized[t]
+                axes[-t-1].imshow(img)
+                axes[-t-1].set_title(f"Past Head {t}\nStep {step}\nMean: {img.mean():.1f}, Std: {img.std():.1f}")
+                axes[-t-1].axis('off')
+        plt.tight_layout()
+        
+        # Save visualization
+        viz_path = step_dir / f"step_{step:06d}_visualization.png"
+        plt.savefig(viz_path, dpi=150, bbox_inches='tight')
+        plt.close()  # Close to free memory
+        
+        logging.info(f"Saved debug images and visualization for step {step} to {step_dir}")
+    #     except Exception as e:
+    #         logging.warning(f"Failed to create visualization for step {step}: {e}")
+    #         logging.info(f"Saved debug images for step {step} to {step_dir}")
+    # else:
+    #     if not MATPLOTLIB_AVAILABLE:
+    #         logging.info(f"Saved debug images for step {step} to {step_dir} (matplotlib not available for visualization)")
+    #     else:
+    #         logging.info(f"Saved debug images for step {step} to {step_dir}")
 
-            plt.tight_layout()
-            
-            # Save visualization
-            viz_path = step_dir / f"step_{step:06d}_visualization.png"
-            plt.savefig(viz_path, dpi=150, bbox_inches='tight')
-            plt.close()  # Close to free memory
-            
-            logging.info(f"Saved debug images and visualization for step {step} to {step_dir}")
-        except Exception as e:
-            logging.warning(f"Failed to create visualization for step {step}: {e}")
-            logging.info(f"Saved debug images for step {step} to {step_dir}")
-    else:
-        if not MATPLOTLIB_AVAILABLE:
-            logging.info(f"Saved debug images for step {step} to {step_dir} (matplotlib not available for visualization)")
-        else:
-            logging.info(f"Saved debug images for step {step} to {step_dir}")
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
 
@@ -333,6 +353,11 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
+    # if config.data.history_mode == "keyframe_select_top_camera_state":
+    #     shuffle = False
+    # else:
+    #     shuffle = True
+
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
@@ -345,10 +370,15 @@ def main(config: _config.TrainConfig):
 
     # Log images from first batch to sanity check.
     if config.wandb_enabled:
-        images_to_log = [
-            wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-            for i in range(min(5, len(next(iter(batch[0].images.values())))))
-        ]
+        if config.data.history_mode != "single_tstep_state":
+            images_to_log = [
+                wandb.Image(np.concatenate([np.array(img[0]) for img in batch[0].images.values()] + [np.array(img) for img in batch[0].past_head_images[0]], axis=1))
+            ]
+        else:
+            images_to_log = [
+                wandb.Image(np.concatenate([np.array(img[0]) for img in batch[0].images.values()], axis=1))
+            ]
+
         wandb.log({"camera_views": images_to_log}, step=0)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)

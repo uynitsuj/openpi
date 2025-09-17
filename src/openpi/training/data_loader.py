@@ -148,6 +148,10 @@ def create_torch_dataset(
     if data_config.history_mode == "naive_past_1s_interval_top_camera_state":
         for key in data_config.history_sequence_keys:
             delta_timestamps[key] = [-t for t in range(data_config.history_horizon)]
+    # elif data_config.history_mode == "keyframe_select_top_camera_state":
+    #     import pdb; pdb.set_trace()
+    #     for key in data_config.history_sequence_keys:
+    #         delta_timestamps[key] = [t for t in range(data_config.history_horizon)]
 
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
@@ -155,10 +159,9 @@ def create_torch_dataset(
         video_backend=video_backend,
         tolerance_s=1e-1,
         return_video_frames=return_video_frames,
-
         history_mode=data_config.history_mode,
+        history_horizon=data_config.history_horizon,
     )
-    # import pdb; pdb.set_trace()
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

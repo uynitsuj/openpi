@@ -88,7 +88,7 @@ class DataConfig:
         "naive_past_1s_interval_top_camera_state",
     ] = "single_tstep_state"
 
-    history_horizon: int = 5 # only used when history_mode != "single_tstep_state"
+    history_horizon: int = 1 # only used when history_mode != "single_tstep_state"
 
 
     history_sequence_keys: Sequence[str] = ("top_camera-images-rgb",)
@@ -358,7 +358,7 @@ class LeRobotXmiRbyDataConfig(DataConfigFactory):
         "single_tstep_state", 
         "naive_past_1s_interval_top_camera_state",
     ] = "single_tstep_state"
-    history_horizon: int = 5 # only used when history_mode != "single_tstep_state"
+    history_horizon: int = 1 # only used when history_mode != "single_tstep_state"
     use_top_camera: bool = False
     
     @override
@@ -572,7 +572,6 @@ class TrainConfig:
     # Random seed that will be used by random generators during training.
     seed: int = 42
     # Global batch size.
-    batch_size: int = 32
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
@@ -872,29 +871,44 @@ _CONFIGS = [
         name="pi0_xmi_rby",
         model=pi0.Pi0Config(action_horizon=40),
         data=LeRobotXmiRbyDataConfig(
-            # repo_id="uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250818",
-            # repo_id="uynitsuj/shelf_soup_in_domain_xmi_data_20250822",
-            repo_id="uynitsuj/dishrack_unload_20250823",
+            # repo_id="uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250828",
+            # repo_id="uynitsuj/shelf_soup_in_domain_xmi_data_20250902",
+            # repo_id="uynitsuj/sort_fruit_plate_memory_xmi_data_20250909",
+            repo_id="uynitsuj/sort_item_memory_xmi_data_20250911_w_negative_trajs",
+
+            # repo_id="uynitsuj/dishrack_unload_20250823",
             # repo_id="uynitsuj/xmi_rby_pretrain_data_20250811",
             # default_prompt="pick up the soup can and place it in the bin",
-            default_prompt="unload the dishes from the dishrack",
+            # default_prompt="put the soup can in the shopping basket",
+            # default_prompt="identify the fruit to your left and transfer it to the plate",
+            default_prompt="Identify the item to your left and transfer it to the shopping basket",
+            # default_prompt="unload the dishes from the dishrack",
 
             retarget_mode = "29D-intergripper-relative",
             
             use_top_camera=True,
+
+            # history_mode = "single_tstep_state",
+            
+            history_mode = "keyframe_select_top_camera_state",
+            history_horizon = 2,
 
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
         ),
         fsdp_devices=2,
-        batch_size=32,
+        
+        batch_size=128,
+        # batch_size=256,
+
         # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_hummus_ee_finetune/64000/params"),
         # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_soup_can_in_domain_xmi_data_center_cropped_20250813_20250813_163958/36000/params"),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_shelf_soup_in_domain_xmi_data_20250822_20250822_161415/20000/params"),
-        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_xmi_rby_pretrain_data_20250811_20250813_162402/19000/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_sort_fruit_memory_xmi_data_20250905_20250905_153550/65000/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_shelf_soup_in_domain_xmi_data_20250822_20250822_161415/20000/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_xmi_rby_pretrain_data_20250811_20250813_162402/71000/params"),
 
-        num_train_steps=45_000,
+        num_train_steps=80_000,
     ),
     
     TrainConfig(
@@ -920,16 +934,19 @@ _CONFIGS = [
         ema_decay=None,
     ),
     TrainConfig(
-        exp_name="shelf_soup_can_in_domain_29D_relative",
+        exp_name="item_sort_29D_relative",
 
         name="pi0_xmi_rby_low_mem_finetune",
         model=pi0.Pi0Config(paligemma_variant="gemma_2b_lora", action_horizon=40), #, action_expert_variant="gemma_300m_lora"),
         data=LeRobotXmiRbyDataConfig(
-            repo_id="uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250818",
+            # repo_id="uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250818",
+            # repo_id="uynitsuj/soup_can_in_domain_xmi_data_center_cropped_20250811",
             # repo_id="uynitsuj/shelf_soup_in_domain_xmi_data_20250825",
+            repo_id="uynitsuj/sort_item_memory_xmi_data_20250910",
 
             # default_prompt="pick up the soup can and place it in the bin",
-            default_prompt="put the soup can in the shopping basket",
+            # default_prompt="put the soup can in the shopping basket",
+            default_prompt="Identify the item to your left and transfer it to the shopping basket",
 
             # retarget_mode = "20D-relative",
             # retarget_mode = "20D-intergripper-relative",
@@ -938,7 +955,8 @@ _CONFIGS = [
 
 
             # history_mode = "single_tstep_state", # "default pi0 behavior"
-            history_mode = "naive_past_1s_interval_top_camera_state", # "naive" past 1s intervals
+            # history_mode = "naive_past_1s_interval_top_camera_state", # "naive" past 1s intervals
+            history_mode = "keyframe_select_top_camera_state",
             history_horizon = 2,
             
             use_top_camera=True,
@@ -947,15 +965,15 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
         ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_hummus_ee_finetune/64000/params"),
-        # weight_loader=weight_loaders.CheckpointWeightLoader("/home/justinyu/checkpoints/pi0_xmi_rby/sky_hummus_ee_finetune/64000/params"),
-
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_soup_can_in_domain_xmi_data_center_cropped_20250813_20250813_163958/36000/params"), # SOTA Tabletop ee finetune
-        
-        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_shelf_soup_in_domain_xmi_data_20250822_20250822_161415/21000/params"), # SOTA Shelf ee finetune
+        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_soup_can_in_domain_xmi_data_center_cropped_20250813_20250813_163958/36000/params"), # SOTA Tabletop ee finetune
+        # weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_shelf_soup_in_domain_xmi_data_20250822_20250822_161415/29000/params"), # SOTA Shelf ee finetune
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_xmi_rby_pretrain_data_20250811_20250813_162402/71000/params"), # ee finetune on some general XMI data
 
         num_train_steps=80_000,
         batch_size=16,
+        num_workers=0,
         freeze_filter=pi0.Pi0Config(paligemma_variant="gemma_2b_lora" #, action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,

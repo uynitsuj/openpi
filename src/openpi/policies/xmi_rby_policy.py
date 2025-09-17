@@ -78,14 +78,10 @@ class XmiRbyInputs(transforms.DataTransformFn):
                     images = (np.zeros_like(top_image), exterior_left_image, exterior_right_image)
                     image_masks = (np.False_, np.True_, np.True_) # For now skip top camera (XMI head and RBY head visual gap)
                 else:
-                    # import pdb; pdb.set_trace()
                     if len(top_image.shape) == 3:
                         images = (top_image, exterior_left_image, exterior_right_image)
-                    elif len(top_image.shape) == 4:
+                    elif len(top_image.shape) == 4: # multi tstep history for top camera
                         images = (top_image[0], exterior_left_image, exterior_right_image)
-                        # for i in range(top_image.shape[0] - 1):
-                        #     top_image[i] = top_image[i + 1]
-                        # import pdb; pdb.set_trace()
                         past_head_images = top_image[1:]
 
                     else:

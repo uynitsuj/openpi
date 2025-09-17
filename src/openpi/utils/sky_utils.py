@@ -192,7 +192,7 @@ def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_
     print(f"📤 Uploading dataset from {dataset_path} to {s3_path}")
     
     # Upload to S3
-    upload_cmd = f"aws s3 sync '{dataset_path}' '{s3_path}' --delete"
+    upload_cmd = f"aws s3 sync {dataset_path} {s3_path} --exclude 'dp_dataset/*' --exclude 'jpg/*'" # --delete"
     run_command(upload_cmd)
     
     # Verify upload
@@ -228,7 +228,8 @@ def generate_sky_config_aws(
     wandb_api_key: Optional[str] = None,
     accelerators: str = "A100:8",
     region: str = "us-west-2",
-    image_id: str = "ami-067cc81f948e50e06",
+    # image_id: str = "ami-067cc81f948e50e06", # for us-west-2
+    image_id: str = "ami-0365bff494b18bf93", # for us-east-1
 ) -> dict:
     """Generate SkyPilot YAML configuration."""
     

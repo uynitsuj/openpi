@@ -39,8 +39,8 @@ import openpi.training.weight_loaders as _weight_loaders
 import orbax.checkpoint as ocp
 import torch
 import torch.utils.data
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.constants import HF_LEROBOT_HOME
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.constants import HF_LEROBOT_HOME
 
 
 def init_logging():
@@ -600,7 +600,7 @@ def main(config: _config.TrainConfig, num_eval_batches: int = 10, checkpoint_ste
         num_workers=config.num_workers,
         shuffle=True, 
         num_batches=num_eval_batches,
-        skip_norm_stats=True,  # Skip norm stats loading for evaluation
+        skip_norm_stats=False,  # Skip norm stats loading for evaluation
     )
     
     # Setup evaluation
@@ -816,7 +816,7 @@ def main(config: _config.TrainConfig, num_eval_batches: int = 10, checkpoint_ste
         str(eval_output_dir / "action_comparison.png"),
         plot_action_dim=plot_action_dim,
         action_names=action_names,
-        action_stats=dataset_stats,
+        # action_stats=dataset_stats,
     )
     
     # Error heatmap

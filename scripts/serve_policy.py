@@ -93,14 +93,34 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     EnvMode.XDOF_XMI_RBY: Checkpoint(
         # config="pi0_xmi_rby_low_mem_finetune",
         config="pi0_xmi_rby",
-        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_soup_can_in_domain_xmi_data_center_cropped_20250818_20250818_123408/23000" # SOTA tabletop
-        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_shelf_soup_in_domain_xmi_data_20250822_20250822_161415/19000" # SOTA shelf
-        dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_dishrack_unload_20250823_20250823_233046/16000" # SOTA dishrack (?)
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_soup_can_in_domain_xmi_data_center_cropped_20250818_20250818_123408/44999" # SOTA tabletop 29D Evaled 36/40
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_soup_can_in_domain_xmi_data_center_cropped_20250828_20250831_203302/13000" # SOTA tabletop 20D Evaled 29/40
+
+        
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_shelf_soup_in_domain_xmi_data_20250822_20250822_161415/32000" # SOTA shelf old data
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_shelf_soup_in_domain_xmi_data_20250902_20250902_162910/34000" # SOTA shelf 29D Evaled 35/40
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_shelf_soup_in_domain_xmi_data_20250902_20250902_161443/10000" # SOTA shelf 20D Evaling
+
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_sort_fruit_memory_xmi_data_20250905_20250905_153550/61000" # Fruit Picking Memory
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_sort_fruit_tabletop_memory_xmi_data_20250908_20250908_204351/11000" # Fruit Picking Memory
+
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_sort_fruit_plate_memory_xmi_data_20250909_20250909_201239/13000" # Fruit Picking Memory v2
+
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_sort_item_shopping_basket_memory_xmi_data_20250909_20250909_124612/18000" # Item Picking Single Tstep State
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_sort_item_shopping_basket_memory_xmi_data_20250909_20250909_151858/14000" # Item Picking Keyframe SelectMemory Horizon 2
+
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_sort_item_memory_xmi_data_20250910_20250910_221954/28000" # Item Picking Single Tstep State
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_sort_item_memory_xmi_data_20250910_20250910_231735/34000" # Item Picking Keyframe Select Memory Horizon 2
+
+        dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_sort_item_memory_xmi_data_20250911_20250911_161526/36000" # Item Picking Keyframe Select Memory Horizon 2 v2
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_sort_item_memory_xmi_data_20250911_w_negative_trajs_20250911_222815/12000" # Item Picking Keyframe Select Memory Horizon 2 v2 w negative trajs
+
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_dishrack_unload_20250823_20250823_233046/16000" # SOTA dishrack (?)
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby_low_mem_finetune/whismy_shelf_soup_can_in_domain_29D_intergripper_relative_20250825/24000" # shelf last-mile finetune
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby_low_mem_finetune/ruin_mean_flow_soup_can_in_domain_29D_intergripper_relative_20250827/35000" # Mean Flow Tabletop Soup Can
+        # dir="/home/justinyu/checkpoints/pi0_xmi_rby_low_mem_finetune/ruin_tabletop_soup_can_20D_20250825/34000" # 20D Tabletop Soup Can
+
     ),
-    # EnvMode.XDOF_XMI_RBY: Checkpoint(
-    #     config="pi0_xmi_rby",
-    #     dir="/home/justinyu/checkpoints/pi0_xmi_rby/sky_hummus_ee_finetune/40000",
-    # ),
 }
 
 

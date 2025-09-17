@@ -257,6 +257,7 @@ class Bimanual_InterGripperProprio_DeltaActions(DataTransformFn):
     # See `make_bool_mask` for more details.
     mask: Sequence[bool] | None
     action_dim: int
+    perturb_z: bool = True
     
     def __call__(self, data: DataDict) -> DataDict:
         if "actions" not in data or self.mask is None:
@@ -290,6 +291,9 @@ class Bimanual_InterGripperProprio_DeltaActions(DataTransformFn):
 
         data["state"][:6] = torch.from_numpy(left_in_right_6d_rot)
         data["state"][6:9] = torch.from_numpy(left_in_right.wxyz_xyz[..., -3:])
+
+        if self.perturb_z:
+            data["state"][18:19] = torch.from_numpy(state[18:19]) + torch.randn(1) * 0.2 # perturb z normally distributed
 
         # viser_server.scene.add_frame(f"left_t0_in_world", position=left_t0_in_world.wxyz_xyz[-3:], wxyz=left_t0_in_world.wxyz_xyz[:4])
         # viser_server.scene.add_frame(f"right_t0_in_world", position=right_t0_in_world.wxyz_xyz[-3:], wxyz=right_t0_in_world.wxyz_xyz[:4])

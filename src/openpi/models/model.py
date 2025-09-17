@@ -211,34 +211,36 @@ def preprocess_observation(
             image = image_tools.resize_with_pad(image, *image_resolution)
         # import pdb; pdb.set_trace()
         # jax.debug.breakpoint()
-        image = image / 2.0 + 0.5
+        if train:
+            # Convert from [-1, 1] to [0, 1] for augmax.
+            image = image / 2.0 + 0.5
 
-        transforms = []
-        # if "wrist" not in key:
-        #     height, width = image.shape[1:3]
-        #     transforms += [
-        #         augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
-        #         augmax.Resize(width, height),
-        #         augmax.Rotate((-5, 5)),
-        #     ]
-        transforms += [
-            augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
-            augmax.Rotate((-5, 5)),
-        ]
+            transforms = []
+            # if "wrist" not in key:
+            #     height, width = image.shape[1:3]
+            #     transforms += [
+            #         augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
+            #         augmax.Resize(width, height),
+            #         augmax.Rotate((-5, 5)),
+            #     ]
+            transforms += [
+                augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
+                augmax.Rotate((-5, 5)),
+            ]
 
-        B, T, H, W, C = image.shape  # e.g. (32, 2, 224, 224, 3)
-        image = image.reshape(B * T, H, W, C)
+            B, T, H, W, C = image.shape  # e.g. (32, 2, 224, 224, 3)
+            image = image.reshape(B * T, H, W, C)
 
-        # Apply augmax on [B*T, H, W, 3]
-        sub_rngs = jax.random.split(rng, image.shape[0])
-        image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
+            # Apply augmax on [B*T, H, W, 3]
+            sub_rngs = jax.random.split(rng, image.shape[0])
+            image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
 
-        # Reshape back to [B, T, H, W, C]
-        image = image.reshape(B, T, H, W, C)
+            # Reshape back to [B, T, H, W, C]
+            image = image.reshape(B, T, H, W, C)
 
-        # Back to [-1, 1].
-        image = image * 2.0 - 1.0
-        past_head_images = image
+            # Back to [-1, 1].
+            image = image * 2.0 - 1.0
+            past_head_images = image
 
     # obtain mask
     out_masks = {}

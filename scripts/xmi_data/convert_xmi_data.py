@@ -28,6 +28,9 @@ import shutil
 import viser.transforms as vtf
 from openpi.utils.xmi_dataloader_utils import load_episode_data, validate_episode_data, validate_array_data, validate_records, validate_images
 from openpi.utils.matrix_utils import *
+from openpi.utils.key_frame_select_utils import zed_tf_intrinsics, select_keyframes_helper
+from copy import deepcopy
+from collections import deque
 
 # Video processing imports for timestamp validation
 try:
@@ -50,7 +53,7 @@ except ImportError:
     HAS_LEROBOT = False
 
 # TODO: remove this once we have a better way to handle this
-DEG30_MOUNTS = ["20250725", "20250724", "20250727", "20250728", "20250801", "20250804", "20250811", "20250812", "20250815", "20250818", "20250820", "20250822", "20250825"]
+DEG30_MOUNTS = ["20250725", "20250724", "20250727", "20250728", "20250801", "20250804", "20250811", "20250812", "20250815", "20250818", "20250820", "20250822", "20250825", "20250905", "20250908", "20250909", "20250910", "20250911"]
 
 @dataclass
 class XMIConfig:
@@ -90,16 +93,28 @@ class XMIConfig:
         # "/nfs_us/data/us_xmi_01/20250806_shelf_soup",
         # "/nfs_us/data/us_xmi_01/20250807_shelf_soup",
 
-        "/nfs_us/data/us_xmi_01/20250812_shelf_soup", # Better head data than prior data
-        "/nfs_us/data/us_xmi_01/20250815_shelf_soup",
-        "/nfs_us/data/us_xmi_01/20250818_shelf_soup",
-        "/nfs_us/data/us_xmi_01/20250820_shelf_soup",
-        "/nfs_us/data/us_xmi_01/20250822_shelf_soup",
-        "/nfs_us/data/us_xmi_01/20250825_shelf_soup",
+        # "/nfs_us/data/us_xmi_01/20250812_shelf_soup", # Better head data than prior data
+        # "/nfs_us/data/us_xmi_01/20250815_shelf_soup",
+        # "/nfs_us/data/us_xmi_01/20250818_shelf_soup",
+        # "/nfs_us/data/us_xmi_01/20250820_shelf_soup",
+        # "/nfs_us/data/us_xmi_01/20250822_shelf_soup",
+        # "/nfs_us/data/us_xmi_01/20250825_shelf_soup",
 
         # Dishrack unload data
-        "/nfs_us/data/us_xmi_01/20250801_dishrack_unload",
-        "/nfs_us/data/us_xmi_01/20250823_dishrack_unload",
+        # "/nfs_us/data/us_xmi_01/20250801_dishrack_unload",
+        # "/nfs_us/data/us_xmi_01/20250823_dishrack_unload",
+
+        # Identify the fruit to your left and transfer it from the shelf to the bowl
+        # "/nfs_us/data/us_xmi_01/20250905_sort_fruit_memory",
+        # "/nfs_us/data/us_xmi_01/20250908_sort_fruit_memory_tabletop",
+
+        # Identify the fruit to your left and transfer it to the plate
+        # "/nfs_us/data/us_xmi_01/20250909_sort_fruit_memory_plate",
+
+        # Identify the item to your left and transfer it to the shopping basket
+        "/nfs_us/data/us_xmi_01/20250909_sort_item_memory_shopping_basket",
+        "/nfs_us/data/us_xmi_01/20250910",
+        "/nfs_us/data/us_xmi_01/20250911",
 
         # ## Oreo data
         # # "/nfs_us/data/oreo_xmi/clean_whiteboard", 
@@ -162,16 +177,28 @@ class XMIConfig:
         # "put the soup can in the shopping basket",
         # "put the soup can in the shopping basket",
 
-        "put the soup can in the shopping basket",
-        "put the soup can in the shopping basket",
-        "put the soup can in the shopping basket",
-        "put the soup can in the shopping basket",
-        "put the soup can in the shopping basket",
-        "put the soup can in the shopping basket",
+        # "put the soup can in the shopping basket",
+        # "put the soup can in the shopping basket",
+        # "put the soup can in the shopping basket",
+        # "put the soup can in the shopping basket",
+        # "put the soup can in the shopping basket",
+        # "put the soup can in the shopping basket",
 
         # Dishrack Unload Data
-        "unload the dishes from the dishrack",
-        "unload the dishes from the dishrack",
+        # "unload the dishes from the dishrack",
+        # "unload the dishes from the dishrack",
+
+        # Identify the fruit to your left and transfer it from the shelf to the bowl
+        # "Identify the fruit to your left and transfer it from the shelf to the bowl",
+
+        # Identify the fruit to your left and transfer it to the plate
+        # "Identify the fruit to your left and transfer it to the plate",
+
+        # Identify the item to your left and transfer it to the shopping basket
+        "Identify the item to your left and transfer it to the shopping basket",
+        "Identify the item to your left and transfer it to the shopping basket",
+        "Identify the item to your left and transfer it to the shopping basket",
+
 
         # ## Oreo data
         # # "clean the whiteboard with the eraser",
@@ -197,7 +224,7 @@ class XMIConfig:
     ])
     
     # Repository name for output dataset
-    repo_name: str = "uynitsuj/shelf_soup_in_domain_xmi_data_20250825"
+    repo_name: str = "uynitsuj/sort_item_memory_xmi_data_20250911_w_negative_trajs"
     
     # Camera settings
     camera_keys: List[str] = field(default_factory=lambda: [
@@ -224,28 +251,29 @@ class XMIConfig:
     crop_images_to_square: bool = True # Whether to crop images to square (if False, will keep original aspect ratio and pad with black instead)
     chunk_size: int = 1000
     max_workers: int = 10
-    max_workers: int = 10
     max_episodes: Optional[int] = None
     skip_videos: bool = False
     first_frame_head_reorient: bool = False
     no_filter_quality: bool = True  # If True, will not filter out low quality episodes
     include_head_pose: bool = True # Whether to include head state in the lerobot proprio state and action (for head / active vision retargeting) NOTE: makes state dim and action dim 29 instead of 20 (adds 6d rot 3d pos)
 
-    gripper_action_delay_tsteps: int = 7 # Number of timesteps to delay the gripper action by
+    keyframe_max_len: int = 2 # Number of past keyframes to log for keyframe history model training
+
+    gripper_action_delay_tsteps: int = 9 # Number of timesteps to delay the gripper action by
     move_old_handoffs: bool = False # Whether to move old handoffs from the dataset to a separate folder named old_handoffs (detected by checking if gripper action minimum is low for both grippers in one trajectory)
 
     perturb_z_height: bool = True # Whether to perturb the z height of the head and hands around average tabletop height
-    perturb_z_height_range: Tuple[float, float] = (0.59, 1.0) # Range of z height of hands perturbation (uniformly sampled)
+    perturb_z_height_range: Tuple[float, float] = (0.6, 1.0) # Range of z height of hands perturbation (uniformly sampled)
 
     perturb_xy_position: bool = True # Whether to perturb the xy position of the head and hands around average tabletop position
-    perturb_x_position_range: Tuple[float, float] = (-0.08, 0.08) # Range of x position perturbation (uniformly sampled)
-    perturb_y_position_range: Tuple[float, float] = (-0.03, 0.03) # Range of y position perturbation (uniformly sampled)
+    perturb_x_position_range: Tuple[float, float] = (-0.01, 0.01) # Range of x position perturbation (uniformly sampled)
+    perturb_y_position_range: Tuple[float, float] = (-0.02, 0.02) # Range of y position perturbation (uniformly sampled)
 
     delta_proprio_keys: str = None # Makes the proprioceptive state for this axis delta. Can set to None to keep both state and action absolute
 
     # Validation settings
     # max_se3_diff_in_meters: float = 0.20  # Maximum allowed SE3 difference in meters
-    max_se3_diff_in_meters: float = 0.45  # Maximum allowed SE3 difference in meters
+    max_se3_diff_in_meters: float = 0.5  # Maximum allowed SE3 difference in meters
     # max_se3_diff_in_degrees: float = 11  # Maximum allowed SE3 difference in degrees
     max_se3_diff_in_degrees: float = 40  # Maximum allowed SE3 difference in degrees
     video_timestamp_tolerance_s: float = 0.0001  # Maximum allowed deviation from expected frame interval for video validation (seconds)
@@ -1023,12 +1051,47 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     
     return states, actions
 
+def keyframes_precompute(actions: np.ndarray, cfg: XMIConfig):
+    zed_factory_intrinsics = np.array([ # Currently hardcoded TODO: move to metadata (both raw data and LeRobot data)
+        [532.395, 0, 638.22],
+        [0, 532.325, 363.7015],
+        [0, 0, 1]
+    ])
+
+    capture_resolution = (1280, 720) # Currently hardcoded TODO: move to metadata (both raw data and LeRobot data)
+    new_resolution = (224, 224) # Currently hardcoded TODO: move to metadata (both raw data and LeRobot data)
+
+    zed_post_crop_intrinsics = zed_tf_intrinsics(zed_factory_intrinsics, capture_resolution=capture_resolution, new_resolution=new_resolution)
+    top_camera_fov = 2 * np.arctan(new_resolution[0] / (2 * zed_post_crop_intrinsics[0, 0]))    
+    
+    keyframe_idxs_for_this_traj = []
+    past_idxs = deque(maxlen=cfg.keyframe_max_len)
+    if actions is None:
+        return []
+    for traj_idx in range(actions.shape[0]):
+        past_head_traj = actions[0:traj_idx+1][:, 20:29] # Causal 9D head trajectory (index -1 is current head pose index 0 is t0)
+        
+        past_idxs = select_keyframes_helper(past_head_traj, top_camera_fov, past_idxs)
+
+        if len(past_idxs) < past_idxs.maxlen:
+            while len(past_idxs) < past_idxs.maxlen:
+                past_idxs.append(past_idxs[-1])
+
+        keyframe_idxs_for_this_traj.append(deepcopy(list(past_idxs)))
+
+    # print(f"Keyframe idxs for this traj: {keyframe_idxs_for_this_traj}")
+    # import pdb; pdb.set_trace()
+    return keyframe_idxs_for_this_traj
 
 def process_episode_in_chunks(episode_data: dict, cfg: XMIConfig, max_chunk_frames: int = 1000, episode_path: Path = None, episode_idx: int = None) -> list:
     """Process episode data in memory-efficient chunks to handle long episodes."""
     
     # Process XMI transforms first
     states, actions = process_xmi_transforms(episode_data, cfg, episode_path, episode_idx)
+
+    keyframe_idxs_for_this_traj = keyframes_precompute(actions, cfg)
+
+    
     if states is None or actions is None:
         return []
     
@@ -1061,10 +1124,12 @@ def process_episode_in_chunks(episode_data: dict, cfg: XMIConfig, max_chunk_fram
             global_step = chunk_start + step
             state = chunk_states[step]
             action = chunk_actions[step]
-            
+            keyframe_idx = keyframe_idxs_for_this_traj[step]
+
             record = {
                 "state": state.tolist(),
                 "actions": action.tolist(),
+                "keyframe_idx": keyframe_idx,
                 "timestamp": [global_step / (cfg.fps / cfg.temporal_subsample_factor)],
                 "frame_index": [global_step],
                 "episode_index": [0],  # Will be updated later

@@ -29,7 +29,7 @@ def create_dataset(config: _config.TrainConfig) -> tuple[_config.DataConfig, _da
     data_config = config.data.create(config.assets_dirs, config.model)
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
-    dataset = _data_loader.create_torch_dataset(data_config, config.model.action_horizon, config.model, return_video_frames=False)
+    dataset = _data_loader.create_torch_dataset(data_config, config.model.action_horizon, config.model)
     dataset = _data_loader.TransformedDataset(
         dataset,
         [

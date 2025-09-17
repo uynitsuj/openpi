@@ -17,6 +17,63 @@ import openpi.shared.nnx_utils as nnx_utils
 logger = logging.getLogger("openpi")
 import time
 
+def sample_tr_pairs(
+    B: int,
+    rng: jax.Array,
+    *,
+    mode: str = "logit_normal",   # "uniform_pair" | "logit_normal" | "factorized"
+    mu: float = -0.4,             # for logit_normal
+    sigma: float = 1.0,           # for logit_normal
+    beta_a: float = 2.0,          # for factorized step size h ~ Beta(a,b)
+    beta_b: float = 8.0,          # for factorized step size
+    p_fm: float = 0.25,           # probability to set r=t (FM target, no JVP term effect)
+    p_end: float = 0.05           # probability to force (t,r)=(1,0) (endpoint emphasis)
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Returns (t, r) with shape (B,), always t >= r, both in [0,1]."""
+    rng1, rng2, rng3, rng4 = jax.random.split(rng, 4)
+
+    if mode == "uniform_pair":
+        a = jax.random.uniform(rng1, (B,))
+        b = jax.random.uniform(rng2, (B,))
+        t = jnp.maximum(a, b)
+        r = jnp.minimum(a, b)
+
+    elif mode == "logit_normal":
+        z1 = jax.random.normal(rng1, (B,))
+        z2 = jax.random.normal(rng2, (B,))
+        a  = jax.nn.sigmoid(mu + sigma * z1)
+        b  = jax.nn.sigmoid(mu + sigma * z2)
+        t  = jnp.maximum(a, b)
+        r  = jnp.minimum(a, b)
+
+    elif mode == "factorized":
+        # sample target time t, then a step size h, and set r = max(0, t - h)
+        z  = jax.random.normal(rng1, (B,))
+        t  = jax.nn.sigmoid(mu + sigma * z)
+        h  = jax.random.beta(rng2, beta_a, beta_b, (B,))   # typically small steps
+        r  = jnp.clip(t - h, 0.0, 1.0)
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    # Mix in FM-style pairs r=t (useful for stability / lower JVP variance)
+    use_fm = jax.random.bernoulli(rng3, p_fm, (B,))
+    r = jnp.where(use_fm, t, r)
+
+    # Mix in a small fraction of exact endpoint pairs (1,0)
+    use_end = jax.random.bernoulli(rng4, p_end, (B,))
+    t = jnp.where(use_end, jnp.ones_like(t), t)
+    r = jnp.where(use_end, jnp.zeros_like(r), r)
+
+    return t, r
+
+
+
+# ---- constants for MeanFlow ----
+TIME_EMB_SCALE = 0.05     # amplitude scale (reduces du/dt ~×0.05; dudt2 ~×0.0025)
+T_MIN_PERIOD   = 0.1      # was 4e-3; increase to low-pass the spectrum
+T_MAX_PERIOD   = 2.0
+
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
 
@@ -300,6 +357,151 @@ class Pi0(_model.BaseModel):
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
+    # @override
+    # def compute_loss(
+    #     self,
+    #     rng: at.KeyArrayLike,
+    #     observation: _model.Observation,
+    #     actions: _model.Actions,
+    #     *,
+    #     train: bool = False,
+    # ) -> at.Float[at.Array, "*b ah"]:
+    #     """
+    #     MeanFlow:  L = || u_theta(z_t, r, t) - stopgrad( v_t - (t-r) * d/dt u_theta(z_t, r, t) ) ||^2
+    #     with z_t = (1-t) * x + t * e,  v_t = e - x.  JVP uses suffix-only + detached kv-cache.
+    #     """
+    #     preprocess_rng, noise_rng, tr_rng, mf_rng = jax.random.split(rng, 4)
+    #     observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+
+    #     B, S, A = actions.shape
+    #     width = self.action_in_proj.out_features
+    #     assert (width % 2) == 0
+
+    #     # ----- construct flow path and times -----
+    #     e = jax.random.normal(noise_rng, actions.shape)      # prior sample
+    #     # t_raw = jax.random.uniform(t_rng_a, (B,))
+    #     # r_raw = jax.random.uniform(t_rng_b, (B,))
+    #     # t = jnp.maximum(t_raw, r_raw)
+    #     # r = jnp.minimum(t_raw, r_raw)
+
+    #     t, r = sample_tr_pairs(
+    #         B, tr_rng,
+    #         mode="logit_normal",  # try "factorized" or "uniform_pair"
+    #         mu=-0.4, sigma=1.0, # follows implementation in https://github.com/Gsunshine/meanflow/blob/main/meanflow.py
+    #         beta_a=2.0, beta_b=8.0,
+    #         p_fm=0.25,            # ~25% FM-style targets
+    #         p_end=0.15            # a few endpoint pairs
+    #     )
+
+    #     # mix-in FM (r=t) updates to reduce JVP frequency (paper finds ~25% good)
+    #     mf_ratio = 0.75 # 0.25 flow-matching instantaneous velocity targets
+    #     use_mf = jax.random.bernoulli(mf_rng, mf_ratio, (B,))
+    #     r = jnp.where(use_mf, r, t)
+
+    #     t_exp = t[:, None, None]
+    #     z_t = (1.0 - t_exp) * actions + t_exp * e
+    #     v_t = e - actions
+
+    #     prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+    #     prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+    #     positions_pref = jnp.cumsum(prefix_mask, axis=1) - 1
+
+    #     llm_call = jax.checkpoint(self.PaliGemma.llm)
+
+    #     (_, _), kv_cache = llm_call([prefix_tokens, None],
+    #                                 mask=prefix_attn_mask,
+    #                                 positions=positions_pref)
+
+    #     def _suffix_tokens(obs, z_in, r_in, t_in):
+    #         # state token
+    #         state_token = self.state_proj(obs.state)[:, None, :]                 # (B,1,W)
+    #         # action tokens
+    #         act_tok = self.action_in_proj(z_in)                                  # (B,S,W)
+    #         # embed (t, del_t)
+    #         dt_in = t_in - r_in
+    #         half = width // 2
+    #         t_emb  = posemb_sincos(t_in,  half, T_MIN_PERIOD, T_MAX_PERIOD).astype(jnp.float32)                       # (B, W/2)
+    #         dt_emb = posemb_sincos(dt_in, half, T_MIN_PERIOD, T_MAX_PERIOD).astype(jnp.float32)                       # (B, W/2)
+    #         time_emb = TIME_EMB_SCALE * jnp.concatenate([t_emb, dt_emb], axis=-1)                 # (B, W)
+    #         time_tok = einops.repeat(time_emb, "b w -> b s w", s=S)              # (B,S,W)
+    #         # fuse
+    #         atok = jnp.concatenate([act_tok, time_tok], axis=-1)                 # (B,S,2W)
+    #         atok = self.action_time_mlp_in(atok)
+    #         atok = nnx.swish(atok)
+    #         atok = self.action_time_mlp_out(atok)                                # (B,S,W)
+    #         toks = jnp.concatenate([state_token, atok], axis=1)                  # (B,1+S,W)
+    #         mask = jnp.ones((B, 1 + S), dtype=jnp.bool_)                         # (B,1+S)
+    #         # AR: state True; first action True; rest False
+    #         ar = jnp.array([True] + [True] + [False] * (S - 1))
+    #         return toks, mask, ar
+
+    #     def _u_with_cache(z_in, r_in, t_in, kv):
+    #         suf_toks, suf_mask, suf_ar = _suffix_tokens(observation, z_in, r_in, t_in)
+    #         suf_suf_mask  = make_attn_mask(suf_mask, suf_ar)                     # (B, Suf, Suf)
+    #         suf_pref_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suf_toks.shape[1])
+    #         full_mask = jnp.concatenate([suf_pref_mask, suf_suf_mask], axis=-1)  # (B, Suf, P+Suf)
+    #         positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suf_mask, axis=-1) - 1
+    #         (p_out, s_out), _ = llm_call([None, suf_toks],
+    #                                     mask=full_mask,
+    #                                     positions=positions,
+    #                                     kv_cache=kv)
+    #         assert p_out is None
+    #         return self.action_out_proj(s_out[:, -S:])                           # (B,S,A)
+
+    #     u_val = _u_with_cache(z_t, r, t, kv_cache)
+
+    #     # JVP path: detach kv_cache so JVP doesn’t drag the prefix graph along
+    #     kv_detached = jax.lax.stop_gradient(kv_cache)
+    #     u_jvp_fun = lambda zz, rr, tt: _u_with_cache(zz, rr, tt, kv_detached)
+
+    #     u_val_j, du_dt = jax.jvp(
+    #         u_jvp_fun,
+    #         primals=(z_t, r, t),
+    #         tangents=(v_t, jnp.zeros_like(r), jnp.ones_like(t)),
+    #     )
+
+    #     # MeanFlow target and loss
+    #     scale = (t - r)[:, None, None]
+    #     u_tgt = v_t - scale * du_dt
+    #     err = u_val - jax.lax.stop_gradient(u_tgt)
+
+    #     resid = u_val - jax.lax.stop_gradient(u_tgt)
+    #     l_ex  = jnp.mean(resid**2, axis=(1,2))
+    #     loss  = (l_ex / jax.lax.stop_gradient((l_ex + 1e-2)**1.0)).mean()
+
+    #     # Scalars to inspect
+    #     vt2     = jnp.mean(jnp.square(v_t))          # ~ 1 + Var(actions)
+    #     dudt2   = jnp.mean(jnp.square(du_dt))        # magnitude of time derivative
+    #     mean_dt = jnp.mean(jnp.abs(t - r))           # ~0.33 if U(0,1) ordered
+    #     u2      = jnp.mean(jnp.square(u_val))
+    #     loss    = jnp.mean(jnp.square(err))          # final per-example mean already reduced
+        
+    #     v_hat   = u_val + ((t - r)[..., None, None]) * du_dt   # implied instantaneous velocity
+    #     fm_proxy = jnp.mean(jnp.square(v_hat - v_t))
+        
+    #     # # Optional NaN/Inf check
+    #     # nan_flags = jnp.array([
+    #     #     jnp.isnan(loss), jnp.isinf(loss),
+    #     #     jnp.isnan(vt2),  jnp.isinf(vt2),
+    #     #     jnp.isnan(dudt2),jnp.isinf(dudt2)
+    #     # ])
+    #     num = jnp.sum(u_val * (v_t - ((t - r)[..., None, None]) * du_dt), axis=(-2,-1))
+    #     den = jnp.sqrt(jnp.sum(u_val**2, axis=(-2,-1)) *
+    #                 jnp.sum((v_t - ((t - r)[..., None, None]) * du_dt)**2, axis=(-2,-1)) + 1e-8)
+    #     cos_u_utgt = jnp.mean(num / (den + 1e-8))
+
+    #     do_print = jnp.array(True)
+
+    #     def _printer(_):
+    #         return jax.debug.print(
+    #             ("loss={:.4f} vt2={:.4f} dudt2={:.4f} |dt|={:.4f} u2={:.4f} fm_proxy={:.4f} cos_u_utgt={:.4f}"),
+    #             loss, vt2, dudt2, mean_dt, u2, fm_proxy, cos_u_utgt
+    #         )
+
+    #     jax.lax.cond(do_print, _printer, lambda _: None, operand=None)
+        
+    #     return loss
+
     @override
     def sample_actions(
         self,
@@ -358,3 +560,81 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    # @override
+    # def sample_actions(
+    #     self,
+    #     rng: at.KeyArrayLike,
+    #     observation: _model.Observation,
+    #     *,
+    #     num_steps: int | at.Int[at.Array, ""] = 3,
+    # ) -> _model.Actions:
+    #     observation = _model.preprocess_observation(None, observation, train=False)
+    #     B = observation.state.shape[0]
+    #     S = self.action_horizon
+    #     W = self.action_in_proj.out_features
+    #     assert (W % 2) == 0
+
+    #     # initial noise at t=1
+    #     e = jax.random.normal(rng, (B, S, self.action_dim))
+
+    #     # prefix once + KV cache
+    #     prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+    #     prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+    #     positions_pref = jnp.cumsum(prefix_mask, axis=1) - 1
+    #     _, kv_cache = self.PaliGemma.llm([prefix_tokens, None],
+    #                                     mask=prefix_attn_mask, positions=positions_pref)
+
+    #     def _suffix_tokens_meanflow_step(z_in, r_in, t_in):
+    #         state_token = self.state_proj(observation.state)[:, None, :]
+    #         action_tokens = self.action_in_proj(z_in)
+    #         dt_in = t_in - r_in
+    #         half = W // 2
+    #         t_emb  = posemb_sincos(t_in,  half, min_period=T_MIN_PERIOD, max_period=T_MAX_PERIOD)
+    #         dt_emb = posemb_sincos(dt_in, half, min_period=T_MIN_PERIOD, max_period=T_MAX_PERIOD)
+    #         time_emb = TIME_EMB_SCALE * jnp.concatenate([t_emb, dt_emb], axis=-1)
+    #         time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=S)
+    #         atok = jnp.concatenate([action_tokens, time_tokens], axis=-1)
+    #         atok = self.action_time_mlp_in(atok)
+    #         atok = nnx.swish(atok)
+    #         atok = self.action_time_mlp_out(atok)
+    #         toks = jnp.concatenate([state_token, atok], axis=1)                    # (B,1+S,W)
+    #         mask = jnp.ones((B, 1 + S), dtype=jnp.bool_)
+    #         ar = jnp.array([True] + [True] + [False] * (S - 1))                    # (1+S,)
+    #         return toks, mask, ar
+
+    #     def _u_step(z_in, r_in, t_in):
+    #         suf_toks, suf_mask, suf_ar = _suffix_tokens_meanflow_step(z_in, r_in, t_in)
+    #         # how suffix attends to prefix + suffix
+    #         suf_suf_mask = make_attn_mask(suf_mask, suf_ar)                        # (B, Suf, Suf)
+    #         suf_pref_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suf_toks.shape[1])
+    #         full_mask = jnp.concatenate([suf_pref_mask, suf_suf_mask], axis=-1)    # (B, Suf, P+Suf)
+    #         positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suf_mask, axis=-1) - 1
+    #         (p_out, s_out), _ = self.PaliGemma.llm([None, suf_toks],
+    #                                             mask=full_mask,
+    #                                             positions=positions,
+    #                                             kv_cache=kv_cache)
+    #         assert p_out is None
+    #         return self.action_out_proj(s_out[:, -S:])  # (B,S,A)
+
+    #     steps = int(num_steps)
+    #     if steps <= 1:
+    #         t_vec = jnp.ones((B,), dtype=jnp.float32)
+    #         r_vec = jnp.zeros((B,), dtype=jnp.float32)
+    #         u_e = _u_step(e, r_vec, t_vec)
+    #         return e - u_e
+
+    #     dt = 1.0 / steps
+
+    #     def body(i, carry):
+    #         z, t_scalar = carry
+    #         r_scalar = t_scalar - dt
+    #         # broadcast scalar times to (B,)
+    #         t_vec = jnp.full((B,), t_scalar, dtype=jnp.float32)
+    #         r_vec = jnp.full((B,), r_scalar, dtype=jnp.float32)
+    #         u = _u_step(z, r_vec, t_vec)
+    #         z_next = z - dt * u
+    #         return (z_next, r_scalar)
+
+    #     z_final, _ = jax.lax.fori_loop(0, steps, body, (e, jnp.array(1.0, dtype=jnp.float32)))
+    #     return z_final

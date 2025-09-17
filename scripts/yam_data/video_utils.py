@@ -11,7 +11,7 @@ import tempfile
 import warnings
 
 import cv2
-import ffmpeg
+# import ffmpeg
 import numpy as np
 
 warnings.filterwarnings("ignore")

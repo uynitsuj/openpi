@@ -551,7 +551,6 @@ def process_xmi_transforms(episode_data: dict, cfg: XMIConfig, episode_path: Pat
     """
     Process XMI episode data and apply all coordinate transformations.
     Returns (states, actions) as numpy arrays with shape (seq_length, 20).
-    
     """
     
     # VALIDATION: Check episode data structure

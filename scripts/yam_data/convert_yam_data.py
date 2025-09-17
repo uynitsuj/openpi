@@ -14,15 +14,15 @@ huggingface-cli upload-large-folder <repo-id> <local-path> --repo-type=dataset
 """
 
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
 import gc
 import json
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional, List, Tuple
+import shutil
 
-from lerobot.common.constants import HF_LEROBOT_HOME
+from lerobot.constants import HF_LEROBOT_HOME
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -34,18 +34,19 @@ import tyro
 class YAMSConfig:
     yam_data_path: str | list[str] = field(
         default_factory=lambda: [
-            # "/nfs_us/philipp/sz_test_01_sim/20250619" # Red Cube Pick Mujoco Sim DATA
-            "/nfs_us/datasets/sim_red_cube_20250630"  # new Red Cube Pick Mujoco Sim DATA saved in local
-            # "/home/david_chen/local_dataset/sim_red_cube" # extended Red Cube Pick Mujoco Sim DATA saved in local
-            # "/home/david_chen/test_sim_data" # Red Cube Pick Mujoco Sim DATA one episode for testing
+            # "/nfs_us/sz_test_01_sim/20250619" # Red Cube Pick Mujoco Sim DATA
+            # "/nfs_us/datasets/sim_red_cube_20250630"  # new Red Cube Pick Mujoco Sim DATA saved in local
+            # "/home/local_dataset/sim_red_cube" # extended Red Cube Pick Mujoco Sim DATA saved in local
+            # "/home/test_sim_data" # Red Cube Pick Mujoco Sim DATA one episode for testing
+            "/nfs_us/data/sz_02/20250908" # Random YAM test data
         ]
     )
 
     repo_name: str = (
-        "Qianzhong-Chen/yam_pick_up_cube_sim_policy_pi0_joint_image_flip_new_0630"  # TODO: Change this before running
+        "uynitsuj/yam_random_test_data"  # TODO: Change this before running
     )
 
-    language_instruction: str = "Pick up the red cube"  # Gets overwritten by the task name in episode metadata # TODO: Change this before running
+    language_instruction: str = "Test"  # Gets overwritten by the task name in episode metadata # TODO: Change this before running
 
     # YAMS camera keys
     camera_keys: list[str] = field(
@@ -66,8 +67,8 @@ class YAMSConfig:
     no_filter_quality: bool = True  # If True, will not filter out low quality episodes
     max_episodes: int | None = None  # If specified, will only process this many episodes
     skip_videos: bool = False  # If True, will not process videos
-    single_arm: bool = True  # If True, expect only left arm data (7 DoF), if False expect bimanual data (14 DoF)
-
+    single_arm: bool = False  # If True, expect only left arm data (7 DoF), if False expect bimanual data (14 DoF)
+    overwrite_existing_data: bool = True  # If True, will overwrite existing data if repo_id exists
 
     """
     Huggingface hub settings:
@@ -81,17 +82,29 @@ class YAMSConfig:
 
     # Memory management settings
     max_frames_per_chunk: int = 1000  # Process episodes in chunks to avoid OOM on long episodes
-
-    # Video encoding settings
-    benchmark_encoders: bool = True  # Benchmark encoders on first episode
-    encoder_name: str | None = None  # Force specific encoder, or None for auto-selection
-    encoding_quality: str = "fast"  # 'fastest' or 'fast'
+    
+    # Video processing settings
+    temporal_subsample_factor: int = 1  # Subsample every N frames (1 = no subsampling)
+    crop_images_to_square: bool = True  # Whether to crop images to square
+    
+    # Validation settings
+    max_se3_diff_in_meters: float = 0.5  # Maximum allowed SE3 difference in meters
+    max_se3_diff_in_degrees: float = 40  # Maximum allowed SE3 difference in degrees
+    video_timestamp_tolerance_s: float = 0.0001  # Maximum allowed deviation from expected frame interval
+    
+    # Debug settings
+    debug: bool = False
+    problematic_data_dir: Optional[str] = None  # Directory to move problematic episodes
 
     robot: object | None = field(
         default=None, repr=False
     )  # YAMSBaseInterface object (Used for FK in the case of abs_cartesian)
     use_hugging_face: bool = False
-
+    
+    def __post_init__(self):
+        # Set default problematic data directory if not specified
+        if self.problematic_data_dir is None:
+            self.problematic_data_dir = f"./problematic_episodes_{self.repo_name.replace('/', '_')}"
 
 # Import utility modules
 try:
@@ -108,6 +121,14 @@ except ImportError:
     from data_utils import is_episode_good_quality
     from data_utils import load_yams_episode_data_fast
     from data_utils import process_joint_data
+
+# Import video processing
+try:
+    from openpi.utils.video_processor import resize_and_pad_video, get_video_resolution
+except ImportError:
+    print("Warning: Video processing utilities not available. Video processing will be limited.")
+    resize_and_pad_video = None
+    get_video_resolution = None
 
 
 def extract_task_name_from_episode(episode_data: dict, episode_path: Path) -> str:
@@ -172,6 +193,208 @@ def convert_to_uint8(img: np.ndarray) -> np.ndarray:
     if np.issubdtype(img.dtype, np.floating):
         img = (255 * img).astype(np.uint8)
     return img
+
+
+def validate_episode_data(episode_data: dict) -> tuple[bool, str]:
+    """
+    Validate that episode data contains all required fields and has valid structure.
+    
+    Returns:
+        tuple[bool, str]: (is_valid, error_message)
+    """
+    if not isinstance(episode_data, dict):
+        return False, "Episode data is not a dictionary"
+    
+    # Check required top-level keys
+    required_keys = ['joint_data']
+    for key in required_keys:
+        if key not in episode_data:
+            return False, f"Missing required key: {key}"
+        if not isinstance(episode_data[key], dict):
+            return False, f"Key '{key}' is not a dictionary"
+    
+    # Check that arrays have reasonable lengths
+    try:
+        joint_data = episode_data['joint_data']
+        
+        # Check for at least some joint data
+        joint_keys = list(joint_data.keys())
+        import pdb; pdb.set_trace()
+        if not joint_keys:
+            return False, "No joint data found"
+            
+        # Get lengths of key arrays
+        joint_lengths = []
+        for key, data in joint_data.items():
+            if hasattr(data, '__len__'):
+                joint_lengths.append(len(data))
+            else:
+                return False, f"joint_data['{key}'] is not array-like"
+        
+        # Check if all arrays have reasonable and consistent lengths
+        if len(set(joint_lengths)) > 1:  # All arrays must have same length
+            return False, f"Inconsistent array lengths: {joint_lengths}"
+        
+        min_length = min(joint_lengths) if joint_lengths else 0
+        if min_length < 2:
+            return False, f"Episode too short: {min_length} frames"
+            
+    except Exception as e:
+        return False, f"Error checking array lengths: {str(e)}"
+    
+    return True, "Valid"
+
+
+def validate_array_data(data: np.ndarray, name: str, expected_shape: tuple = None) -> tuple[bool, str]:
+    """
+    Validate numpy array data for common issues.
+    
+    Args:
+        data: numpy array to validate
+        name: name of the data for error messages
+        expected_shape: optional expected shape (None means any shape is acceptable)
+    
+    Returns:
+        tuple[bool, str]: (is_valid, error_message)
+    """
+    if data is None:
+        return False, f"{name} is None"
+    
+    if not isinstance(data, np.ndarray):
+        return False, f"{name} is not a numpy array (type: {type(data)})"
+    
+    # Check for NaN values
+    if np.any(np.isnan(data)):
+        nan_count = np.sum(np.isnan(data))
+        return False, f"{name} contains {nan_count} NaN values"
+    
+    # Check for infinite values
+    if np.any(np.isinf(data)):
+        inf_count = np.sum(np.isinf(data))
+        return False, f"{name} contains {inf_count} infinite values"
+    
+    # Check dtype
+    if not np.issubdtype(data.dtype, np.number):
+        return False, f"{name} has non-numeric dtype: {data.dtype}"
+    
+    # Check shape if specified
+    if expected_shape is not None:
+        if data.shape != expected_shape:
+            return False, f"{name} has incorrect shape: {data.shape}, expected: {expected_shape}"
+    
+    # Check for reasonable value ranges (detect obvious data corruption)
+    if np.any(np.abs(data) > 1e6):  # Very large values might indicate corruption
+        max_val = np.max(np.abs(data))
+        return False, f"{name} contains suspiciously large values (max: {max_val})"
+    
+    return True, "Valid"
+
+
+def validate_records(records: list) -> tuple[bool, str]:
+    """
+    Validate final records before saving to ensure they're ready for LeRobot format.
+    
+    Args:
+        records: list of record dictionaries
+        
+    Returns:
+        tuple[bool, str]: (is_valid, error_message)
+    """
+    if not records:
+        return False, "No records provided"
+    
+    if not isinstance(records, list):
+        return False, f"Records is not a list (type: {type(records)})"
+    
+    required_keys = ["state", "actions", "timestamp", "frame_index", "episode_index", "index", "task_index"]
+    
+    for i, record in enumerate(records):
+        if not isinstance(record, dict):
+            return False, f"Record {i} is not a dictionary"
+        
+        # Check required keys
+        for key in required_keys:
+            if key not in record:
+                return False, f"Record {i} missing required key: {key}"
+            
+            if record[key] is None:
+                return False, f"Record {i}['{key}'] is None"
+        
+        # Validate state and actions arrays
+        try:
+            state = record["state"]
+            actions = record["actions"]
+            
+            if not isinstance(state, list) or not isinstance(actions, list):
+                return False, f"Record {i}: state and actions must be lists"
+            
+            # Check for None values in state/actions
+            for j, val in enumerate(state):
+                if val is None:
+                    return False, f"Record {i}: state[{j}] is None"
+                if not isinstance(val, (int, float)) or np.isnan(val) or np.isinf(val):
+                    return False, f"Record {i}: state[{j}] has invalid value: {val}"
+            
+            for j, val in enumerate(actions):
+                if val is None:
+                    return False, f"Record {i}: actions[{j}] is None"
+                if not isinstance(val, (int, float)) or np.isnan(val) or np.isinf(val):
+                    return False, f"Record {i}: actions[{j}] has invalid value: {val}"
+        
+        except Exception as e:
+            return False, f"Record {i}: Error validating arrays: {str(e)}"
+    
+    return True, "Valid"
+
+
+def move_problematic_episode(episode_path: Path, error_msg: str, cfg: YAMSConfig, episode_idx: int = None) -> bool:
+    """
+    Move a problematic episode to a separate directory for analysis.
+    
+    Args:
+        episode_path: Path to the problematic episode
+        error_msg: Error message describing the problem
+        cfg: Configuration object
+        episode_idx: Optional episode index for logging
+        
+    Returns:
+        bool: True if move was successful, False otherwise
+    """
+    try:
+        # Create problematic data directory
+        problematic_dir = Path(cfg.problematic_data_dir)
+        problematic_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create subdirectory based on error type
+        error_type = error_msg.split(':')[0].replace(' ', '_').replace('❌', '').strip()
+        error_subdir = problematic_dir / error_type
+        error_subdir.mkdir(parents=True, exist_ok=True)
+        
+        # Generate destination path
+        dest_path = error_subdir / episode_path.name
+        
+        # Move the episode directory
+        if episode_path.exists():
+            shutil.move(str(episode_path), str(dest_path))
+            
+            # Create error log file
+            error_log_path = dest_path / "error_log.txt"
+            with open(error_log_path, 'w') as f:
+                f.write(f"Episode Index: {episode_idx}\n")
+                f.write(f"Original Path: {episode_path}\n")
+                f.write(f"Error: {error_msg}\n")
+                f.write(f"Moved At: {pd.Timestamp.now()}\n")
+            
+            episode_str = f"episode {episode_idx}" if episode_idx is not None else "episode"
+            print(f"  📁 Moved problematic {episode_str} to: {dest_path}")
+            return True
+        else:
+            print(f"  ⚠️  Episode path does not exist: {episode_path}")
+            return False
+            
+    except Exception as e:
+        print(f"  ❌ Failed to move problematic episode: {e}")
+        return False
 
 
 def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BILINEAR) -> np.ndarray:
@@ -712,62 +935,83 @@ def write_episode_metadata_immediately(episode_data: dict, tasks: list[str], bas
     return existing_tasks
 
 
-def process_episode_in_chunks(episode_data: dict, cfg: YAMSConfig, max_chunk_frames: int = 1000) -> tuple[list, dict]:
+def process_episode_in_chunks(episode_data: dict, cfg: YAMSConfig, max_chunk_frames: int = 1000, episode_path: Path = None, episode_idx: int = None) -> list:
     """Process episode data in memory-efficient chunks to handle long episodes."""
+    
+    # VALIDATION: Check episode data structure
+    is_valid, error_msg = validate_episode_data(episode_data)
+    if not is_valid:
+        print(f"❌ Episode data validation failed: {error_msg}")
+        if episode_path is not None:
+            move_problematic_episode(episode_path, f"Episode data validation failed: {error_msg}", cfg, episode_idx)
+        return []
 
     # Process joint data first (this is relatively small)
     full_joint_state, full_joint_action = process_joint_data(episode_data["joint_data"], cfg.single_arm)
     if full_joint_state is None:
-        return [], {}
+        if episode_path is not None:
+            move_problematic_episode(episode_path, "Failed to process joint data", cfg, episode_idx)
+        return []
 
     # Determine sequence length
     total_length = len(full_joint_state) - 1  # -1 because we need next state for actions
     if total_length <= 0:
-        return [], {}
+        if episode_path is not None:
+            move_problematic_episode(episode_path, f"Episode too short: {total_length} frames", cfg, episode_idx)
+        return []
 
     # Calculate actions for the full episode (joint data is manageable)
-    if cfg.action_space == "abs_joint":
-        states, actions = calculate_actions(full_joint_state, full_joint_action, total_length)
-    elif cfg.action_space == "abs_cartesian":
-        states, actions = calculate_actions_cartesian(full_joint_state, full_joint_action, total_length, cfg.robot)
-    else:
-        raise ValueError(f"Invalid action space: {cfg.action_space}, or not implemented yet")
+    try:
+        if cfg.action_space == "abs_joint":
+            states, actions = calculate_actions(full_joint_state, full_joint_action, total_length)
+        elif cfg.action_space == "abs_cartesian":
+            states, actions = calculate_actions_cartesian(full_joint_state, full_joint_action, total_length, cfg.robot)
+        else:
+            raise ValueError(f"Invalid action space: {cfg.action_space}, or not implemented yet")
+    except Exception as e:
+        error_msg = f"Failed to calculate actions: {str(e)}"
+        print(f"❌ {error_msg}")
+        if episode_path is not None:
+            move_problematic_episode(episode_path, error_msg, cfg, episode_idx)
+        return []
+
+    # VALIDATION: Check processed arrays
+    state_dim = 7 if cfg.single_arm else 14
+    if cfg.action_space == "abs_cartesian":
+        state_dim = 20
+        
+    is_valid, error_msg = validate_array_data(states, "states", expected_shape=(total_length, state_dim))
+    if not is_valid:
+        print(f"❌ States validation failed: {error_msg}")
+        if episode_path is not None:
+            move_problematic_episode(episode_path, f"States validation failed: {error_msg}", cfg, episode_idx)
+        return []
+    
+    is_valid, error_msg = validate_array_data(actions, "actions", expected_shape=(total_length, state_dim))
+    if not is_valid:
+        print(f"❌ Actions validation failed: {error_msg}")
+        if episode_path is not None:
+            move_problematic_episode(episode_path, f"Actions validation failed: {error_msg}", cfg, episode_idx)
+        return []
+
+    # Apply temporal subsampling if configured
+    original_total_length = total_length
+    if cfg.temporal_subsample_factor > 1:
+        global_subsample_indices = list(range(0, original_total_length, cfg.temporal_subsample_factor))
+        states = states[global_subsample_indices]
+        actions = actions[global_subsample_indices]
+        total_length = len(states)
 
     all_records = []
-    all_image_data = {}
 
     # Process in chunks to avoid OOM
     for chunk_start in range(0, total_length, max_chunk_frames):
         chunk_end = min(chunk_start + max_chunk_frames, total_length)
         chunk_length = chunk_end - chunk_start
 
-        # print(f"  Processing frames {chunk_start}-{chunk_end-1} ({chunk_length} frames)")
-
         # Process joint data for this chunk
         chunk_states = states[chunk_start:chunk_end]
         chunk_actions = actions[chunk_start:chunk_end]
-
-        # Process images for this chunk if not skipping videos
-        chunk_image_data = {}
-        if not cfg.skip_videos and "images" in episode_data:
-            for cam_key in cfg.camera_keys:
-                if cam_key in episode_data["images"]:
-                    # Get images for this chunk
-                    images = episode_data["images"][cam_key][chunk_start:chunk_end]
-
-                    # Resize images for this chunk
-                    resized_images = []
-                    for img in images:
-                        if isinstance(img, np.ndarray):
-                            resized_img = resize_with_pad(img, cfg.resize_size, cfg.resize_size)
-                            resized_images.append(convert_to_uint8(resized_img))
-
-                    if cam_key not in all_image_data:
-                        all_image_data[cam_key] = []
-                    all_image_data[cam_key].extend(resized_images)
-
-                    # Clear chunk data to free memory
-                    del resized_images
 
         # Create records for this chunk
         for step in range(chunk_length):
@@ -778,7 +1022,7 @@ def process_episode_in_chunks(episode_data: dict, cfg: YAMSConfig, max_chunk_fra
             record = {
                 "state": state.tolist(),
                 "actions": action.tolist(),
-                "timestamp": [global_step / cfg.fps],
+                "timestamp": [global_step / (cfg.fps / cfg.temporal_subsample_factor)],
                 "frame_index": [global_step],
                 "episode_index": [0],  # Will be updated later
                 "index": [global_step],
@@ -789,7 +1033,15 @@ def process_episode_in_chunks(episode_data: dict, cfg: YAMSConfig, max_chunk_fra
         # Force garbage collection after each chunk
         gc.collect()
 
-    return all_records, all_image_data
+    # VALIDATION: Check final records before returning
+    is_valid, error_msg = validate_records(all_records)
+    if not is_valid:
+        print(f"❌ Records validation failed: {error_msg}")
+        if episode_path is not None:
+            move_problematic_episode(episode_path, f"Records validation failed: {error_msg}", cfg, episode_idx)
+        return []
+
+    return all_records
 
 
 def process_yam_episode(
@@ -799,8 +1051,6 @@ def process_yam_episode(
     episode_base: Path,
     base_dir: Path,
     encoder_name: str = None,
-    encoding_quality: str = "fast",
-    rotate_left_right_image: bool = False,
 ):
     """Process a single YAM episode and save it directly to LeRobot format."""
 
@@ -812,59 +1062,93 @@ def process_yam_episode(
         return None
 
     # Load episode data
-    episode_data = load_yams_episode_data_fast(episode_path)
+    episode_data = load_yams_episode_data_fast(episode_path, cfg, idx)
     if not episode_data:
-        print(f"  Failed to load episode {idx}")
+        print(f"  ❌ Failed to load episode {idx}")
+        move_problematic_episode(episode_path, "Failed to load episode data", cfg, idx)
         return None
 
     # Extract task name from episode metadata instead of using hardcoded value
     task_name = extract_task_name_from_episode(episode_data, episode_path)
 
     # Process episode in memory-efficient chunks
-    # try:
-    records, image_data = process_episode_in_chunks(episode_data, cfg, max_chunk_frames=cfg.max_frames_per_chunk)
+    records = process_episode_in_chunks(episode_data, cfg, max_chunk_frames=cfg.max_frames_per_chunk, episode_path=episode_path, episode_idx=idx)
     if not records:
-        print(f"  No valid data in episode {idx}")
+        print(f"  ❌ No valid data in episode {idx}")
+        # Episode already moved by process_episode_in_chunks if it was a validation failure
         return None
 
     seq_length = len(records)
     print(f"  Episode {idx}: {seq_length} frames total")
-
-    # except Exception as e:
-    #     print(f"  Error processing episode {idx}: {e}")
-    #     return None
 
     # Update episode and task indices in records
     for record in records:
         record["episode_index"] = [idx]
         record["index"] = [record["frame_index"][0]]  # Global frame index will be updated later
 
+    # VALIDATION: Final check before saving
+    is_valid, error_msg = validate_records(records)
+    if not is_valid:
+        print(f"  ❌ Final validation failed for episode {idx}: {error_msg}")
+        move_problematic_episode(episode_path, f"Final validation failed: {error_msg}", cfg, idx)
+        return None
+
     # Save parquet (joint positions + actions per frame)
     episode_path_out = episode_base / f"episode_{idx:06d}.parquet"
     episode_path_out.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(records).to_parquet(episode_path_out)
+    
+    try:
+        pd.DataFrame(records).to_parquet(episode_path_out)
+    except Exception as e:
+        print(f"  ❌ Failed to save parquet for episode {idx}: {e}")
+        move_problematic_episode(episode_path, f"Failed to save parquet: {e}", cfg, idx)
+        return None
 
-    # Save videos if not skipping
-    if not cfg.skip_videos and image_data:
-        chunk_id = idx // cfg.chunk_size
-        for cam_key in cfg.camera_keys:
-            if cam_key in image_data:
-                video_dir = base_dir / "videos" / f"chunk-{chunk_id:03d}" / cam_key
-                video_dir.mkdir(parents=True, exist_ok=True)
-                save_path = video_dir / f"episode_{idx:06d}.mp4"
-
-                if rotate_left_right_image and ("left" in cam_key or "right" in cam_key):
-                    # rotate 180 degrees for left/right cameras
-                    frames = [np.rot90(frame, 2) for frame in image_data[cam_key]]
-                else:
-                    frames = image_data[cam_key]
-
-                if frames:
-                    # print(f"  Encoding video {cam_key}: {len(frames)} frames")
-                    if encoder_name:
-                        encode_video_optimized(frames, save_path, cfg.fps, encoder_name, encoding_quality)
-                    else:
-                        encode_video_simple(frames, save_path, cfg.fps)
+    # Process videos if not skipping
+    # if not cfg.skip_videos and resize_and_pad_video is not None:
+    #     chunk_id = idx // cfg.chunk_size
+        
+    #     # Process each camera video
+    #     for cam_key in cfg.camera_keys:
+    #         # Look for video files in the episode directory
+    #         video_patterns = [
+    #             episode_path / f"{cam_key}.mp4",
+    #             episode_path / f"{cam_key}.avi",
+    #             episode_path / f"{cam_key}.mov"
+    #         ]
+            
+    #         input_video_path = None
+    #         for pattern in video_patterns:
+    #             if pattern.exists():
+    #                 input_video_path = pattern
+    #                 break
+            
+    #         if input_video_path is None:
+    #             continue  # Skip if no video file found for this camera
+            
+    #         # Set up output path
+    #         video_dir = base_dir / "videos" / f"chunk-{chunk_id:03d}" / cam_key
+    #         video_dir.mkdir(parents=True, exist_ok=True)
+    #         output_video_path = video_dir / f"episode_{idx:06d}.mp4"
+            
+            # try:
+            #     # Use the improved video processing from XMI
+            #     success = resize_and_pad_video(
+            #         input_path=str(input_video_path),
+            #         output_path=str(output_video_path),
+            #         target_size=cfg.resize_size,
+            #         fps=cfg.fps // cfg.temporal_subsample_factor,
+            #         frame_stride=cfg.temporal_subsample_factor,
+            #         crop_to_square=cfg.crop_images_to_square,
+            #         encoder=encoder_name or "h264_nvenc",
+            #         overwrite=True
+            #     )
+                
+            #     if not success:
+            #         print(f"  ⚠️  Video processing failed for {cam_key} in episode {idx}")
+                    
+            # except Exception as e:
+            #     print(f"  ⚠️  Video processing error for {cam_key} in episode {idx}: {e}")
 
     # Compute and write episode stats immediately
     episode_stats = compute_basic_episode_stats(idx, {"length": seq_length}, cfg, base_dir)
@@ -876,6 +1160,8 @@ def process_yam_episode(
         "episode_index": idx,
         "tasks": [task_name],
         "length": seq_length,
+        "original_episode_name": episode_path.name,  # Add original episode directory name
+        "original_episode_path": str(episode_path),  # Add full original path for reference
     }
 
     task_mapping = write_episode_metadata_immediately(episode_metadata, [task_name], base_dir)
@@ -885,10 +1171,10 @@ def process_yam_episode(
     episode_metadata["task_index"] = task_index
 
     # Clean up memory
-    del episode_data, records, image_data
+    del episode_data, records
     gc.collect()
 
-    # print(f"  Completed episode {idx}: {seq_length} frames, task '{task_name}'")
+    # print(f"  ✅ Completed episode {idx}: {seq_length} frames, task '{task_name}'")
 
     # Return metadata for final statistics
     return episode_metadata
@@ -1163,7 +1449,7 @@ def main(cfg: YAMSConfig):
 
     # Check for resume capability
     resume_mode = False
-    if base_dir.exists():
+    if base_dir.exists() and not cfg.overwrite_existing_data:
         print("Dataset directory already exists - checking for resume capability...")
         remaining_dirs, remaining_indices = filter_episodes_for_resume(episode_dirs, base_dir, cfg.chunk_size)
 
@@ -1203,42 +1489,6 @@ def main(cfg: YAMSConfig):
 
     # We'll create tasks.jsonl after processing episodes to get actual task names
 
-    # Select best encoder for video encoding
-    best_encoder = None
-    encoding_quality = cfg.encoding_quality
-
-    if not cfg.skip_videos:
-        print("\n=== Video Encoder Setup ===")
-        if cfg.encoder_name:
-            best_encoder = cfg.encoder_name
-            print(f"Using forced encoder: {best_encoder}")
-        # Auto-detect best encoder
-        elif cfg.benchmark_encoders and len(episode_dirs) > 0:
-            print("Loading first episode for encoder benchmarking...")
-            # Load first episode to get sample frames for benchmarking
-            first_episode_data = load_yams_episode_data_fast(episode_dirs[0])
-            if first_episode_data and "images" in first_episode_data:
-                sample_frames = []
-                for cam_key in cfg.camera_keys:
-                    if cam_key in first_episode_data["images"]:
-                        images = first_episode_data["images"][cam_key][:10]  # First 10 frames
-                        for img in images:
-                            if isinstance(img, np.ndarray):
-                                resized_img = resize_with_pad(img, cfg.resize_size, cfg.resize_size)
-                                sample_frames.append(convert_to_uint8(resized_img))
-                        break  # Use first available camera for benchmarking
-
-                if sample_frames:
-                    best_encoder, encoding_quality = select_best_encoder(sample_frames, cfg.fps)
-                else:
-                    best_encoder, encoding_quality = select_best_encoder()
-            else:
-                best_encoder, encoding_quality = select_best_encoder()
-        else:
-            best_encoder, encoding_quality = select_best_encoder()
-
-        print(f"Using encoder: {best_encoder} with {encoding_quality} quality")
-
     # Process episodes
     all_episodes = []
 
@@ -1258,8 +1508,6 @@ def main(cfg: YAMSConfig):
                         cfg,
                         episode_base / f"chunk-{chunk_id:03d}",
                         base_dir,
-                        best_encoder,
-                        encoding_quality,
                         cfg.rotate_left_right_image,
                     )
                 )
@@ -1278,8 +1526,6 @@ def main(cfg: YAMSConfig):
                 cfg,
                 episode_base / f"chunk-{chunk_id:03d}",
                 base_dir,
-                best_encoder,
-                encoding_quality,
                 cfg.rotate_left_right_image,
             )
             if result is not None:
@@ -1366,7 +1612,7 @@ def main(cfg: YAMSConfig):
                 "shape": [cfg.resize_size, cfg.resize_size, 3],
                 "names": ["height", "width", "channel"],
                 "info": {
-                    "video.fps": cfg.fps,
+                    "video.fps": cfg.fps / cfg.temporal_subsample_factor,
                     "video.height": cfg.resize_size,
                     "video.width": cfg.resize_size,
                     "video.channels": 3,
@@ -1386,7 +1632,7 @@ def main(cfg: YAMSConfig):
         "total_videos": len(cfg.camera_keys) * len(all_combined_episodes) if not cfg.skip_videos else 0,
         "total_chunks": actual_chunks,
         "chunks_size": cfg.chunk_size,
-        "fps": cfg.fps,
+        "fps": cfg.fps / cfg.temporal_subsample_factor,
         "splits": {"train": f"0:{len(all_combined_episodes)}"},
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
@@ -1405,6 +1651,10 @@ def main(cfg: YAMSConfig):
         print(f"Total episodes: {len(all_combined_episodes)}")
     print(f"Total frames: {total_frames}")
     print(f"Total chunks: {actual_chunks}")
+    
+    # Print summary of problematic episodes
+    print_problematic_episodes_summary(cfg)
+    
     if not cfg.use_hugging_face:
         exit()
 
@@ -1506,6 +1756,30 @@ def main(cfg: YAMSConfig):
     elif cfg.push_to_hub and not HAS_LEROBOT:
         print("❌ Cannot push to hub: LeRobot not available")
         print("Install lerobot package to enable hub push functionality")
+
+
+def print_problematic_episodes_summary(cfg: YAMSConfig):
+    """Print a summary of problematic episodes that were moved."""
+    problematic_dir = Path(cfg.problematic_data_dir)
+    
+    if not problematic_dir.exists():
+        return
+    
+    print(f"\n=== Problematic Episodes Summary ===")
+    print(f"Problematic data directory: {problematic_dir}")
+    
+    total_problematic = 0
+    for error_subdir in problematic_dir.iterdir():
+        if error_subdir.is_dir():
+            episode_count = len([d for d in error_subdir.iterdir() if d.is_dir()])
+            if episode_count > 0:
+                print(f"  {error_subdir.name}: {episode_count} episodes")
+                total_problematic += episode_count
+    
+    print(f"Total problematic episodes: {total_problematic}")
+    
+    if total_problematic > 0:
+        print(f"💡 You can investigate these episodes manually in: {problematic_dir}")
 
 
 if __name__ == "__main__":

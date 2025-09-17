@@ -70,7 +70,7 @@ def load_episode_data(episode_path: Path, cfg: dict, base_dir: Path, ep_idx: int
         # Process video files
         video_files = {}
         camera_names = []
-                
+        
         if not cfg.skip_videos:
             chunk_id = ep_idx // cfg.chunk_size
             for video_file in episode_path.glob("*.mp4"):

@@ -1,4 +1,4 @@
-# Finetune `pi0`
+# Finetune `pi0` for I2RT YAMs
 
 ## Step 1: Clone and Set Up the Repository
 
@@ -10,20 +10,12 @@ GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 ```
 
-## Step 2: Check Video Info
-
-```bash
-python scripts/sim_video_info_check.py --yam_data_path <dpath_to_dataset>
-```
-
-- **TODO BY USER**: Note down the `video_mean_fps` from the output.
-
-## Step 3: Convert Simulation Data
+## Step 3: Convert Data (You may have to write your own depending on source format)
 - **TODO BY USER**: Open `scripts/yam_data/convert_yam_data.py` and update:
   - `yam_data_path`
   - `repo_name`
   - `language_instruction`
-  - `fps` (use the `video_mean_fps`)
+  - `fps`
 
 ```bash
 python scripts/yam_data/convert_yam_data.py

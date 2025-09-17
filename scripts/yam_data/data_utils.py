@@ -12,11 +12,14 @@ from typing import Any
 import numpy as np
 
 try:
-    from .video_utils import extract_video_frames_fast
+    # from .video_utils import extract_video_frames_fast
+    from openpi.utils.video_processor import resize_and_pad_video, get_video_resolution
     from .video_utils import resize_frames_vectorized
 except ImportError:
-    from video_utils import extract_video_frames_fast
+    # from video_utils import extract_video_frames_fast
+    from openpi.utils.video_processor import resize_and_pad_video, get_video_resolution
     from video_utils import resize_frames_vectorized
+from lerobot.constants import HF_LEROBOT_HOME
 
 # YAMS data configuration
 CAMERA_KEYS = ["left_camera-images-rgb", "right_camera-images-rgb", "top_camera-images-rgb"]
@@ -82,7 +85,7 @@ def is_episode_good_quality(episode_path: Path) -> bool:
     return False
 
 
-def load_yams_episode_data_fast(episode_path: Path) -> dict | None:
+def load_yams_episode_data_fast(episode_path: Path, cfg, ep_idx: int) -> dict | None:
     """Load data for a specific YAMS episode with maximum optimizations."""
     episode_data = {"metadata": {}, "joint_data": {}, "images": {}}
 
@@ -117,15 +120,25 @@ def load_yams_episode_data_fast(episode_path: Path) -> dict | None:
         video_priorities = ["_crf18.mp4", ".mp4", "_low_res.mp4"]
         camera_prefixes = ["left_camera-images-rgb", "right_camera-images-rgb", "top_camera-images-rgb"]
 
+        base_dir = HF_LEROBOT_HOME / cfg.repo_name
         # Process videos in parallel within the episode
         for camera_prefix in camera_prefixes:
+            chunk_id = ep_idx // cfg.chunk_size
             for priority_suffix in video_priorities:
                 video_file = episode_path / f"{camera_prefix}{priority_suffix}"
                 if video_file.exists():
-                    frames = extract_video_frames_fast(video_file)
-                    if len(frames) > 0:
-                        episode_data["images"][camera_prefix] = frames
-                    break  # Found video for this camera, move to next
+                    # frames = extract_video_frames_fast(video_file)
+                    ret = resize_and_pad_video(
+                        input_path=video_file, 
+                        output_path=str(base_dir / "videos" / f"chunk-{chunk_id:03d}" / f"{camera_prefix}" / f"episode_{ep_idx:06d}.mp4"), 
+                        target_size=cfg.resize_size,
+                        fps=cfg.fps//cfg.temporal_subsample_factor, # type: ignore
+                        frame_stride=cfg.temporal_subsample_factor, # type: ignore
+                        keep_left_half = True if "top" in camera_prefix and get_video_resolution(str(video_file))[0]/get_video_resolution(str(video_file))[1] > 3 else False, # if top camera is 3x wider than tall, it's highly likely to be a concat of two videos
+                        crop_to_square = cfg.crop_images_to_square # type: ignore
+                    )
+                    if not ret:
+                        raise ValueError(f"Failed to resize and pad video {video_file}")
 
         # Force garbage collection after loading large video data
         gc.collect()

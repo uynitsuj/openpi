@@ -3,7 +3,7 @@
 ## Step 1: Clone and Set Up the Repository
 
 ```bash
-git clone git@github.com:xdofai/openpi.git
+git clone https://github.com/uynitsuj/openpi.git
 cd openpi
 curl -LsSf https://astral.sh/uv/install.sh | sh
 GIT_LFS_SKIP_SMUDGE=1 uv sync

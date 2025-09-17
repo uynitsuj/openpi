@@ -179,8 +179,8 @@ def extract_task_name_from_episode(episode_data: dict, episode_path: Path) -> st
 
 # Import LeRobotDataset for hub operations
 try:
-    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-    from lerobot.common.datasets.utils import write_episode_stats
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.datasets.utils import write_episode_stats
 
     HAS_LEROBOT = True
 except ImportError:
@@ -219,7 +219,6 @@ def validate_episode_data(episode_data: dict) -> tuple[bool, str]:
         
         # Check for at least some joint data
         joint_keys = list(joint_data.keys())
-        import pdb; pdb.set_trace()
         if not joint_keys:
             return False, "No joint data found"
             
@@ -1050,7 +1049,6 @@ def process_yam_episode(
     cfg: YAMSConfig,
     episode_base: Path,
     base_dir: Path,
-    encoder_name: str = None,
 ):
     """Process a single YAM episode and save it directly to LeRobot format."""
 
@@ -1508,7 +1506,6 @@ def main(cfg: YAMSConfig):
                         cfg,
                         episode_base / f"chunk-{chunk_id:03d}",
                         base_dir,
-                        cfg.rotate_left_right_image,
                     )
                 )
 
@@ -1526,7 +1523,6 @@ def main(cfg: YAMSConfig):
                 cfg,
                 episode_base / f"chunk-{chunk_id:03d}",
                 base_dir,
-                cfg.rotate_left_right_image,
             )
             if result is not None:
                 all_episodes.append(result)
@@ -1540,6 +1536,18 @@ def main(cfg: YAMSConfig):
             print("Updating dataset info for resume completion...")
         else:
             return
+
+    # Renumber episodes consecutively to fill gaps
+    all_episodes = renumber_episodes_consecutively(all_episodes, base_dir, cfg)
+    
+    # Rewrite metadata files with updated indices
+    rewrite_episode_metadata(all_episodes, base_dir)
+    
+    # Rewrite episode stats with updated indices
+    rewrite_episodes_stats(all_episodes, base_dir, cfg)
+    
+    # Write episode name mapping
+    write_episode_name_mapping(all_episodes, base_dir)
 
     # For resume mode or if we have processed episodes, read all metadata to get totals
     print("Reading all metadata to calculate final statistics...")
@@ -1756,6 +1764,218 @@ def main(cfg: YAMSConfig):
     elif cfg.push_to_hub and not HAS_LEROBOT:
         print("❌ Cannot push to hub: LeRobot not available")
         print("Install lerobot package to enable hub push functionality")
+
+
+def renumber_episodes_consecutively(all_episodes: list, base_dir: Path, cfg: YAMSConfig) -> list:
+    """
+    Renumber episodes consecutively to fill gaps from skipped episodes.
+    
+    Args:
+        all_episodes: List of successful episode metadata
+        base_dir: Base directory of the dataset
+        cfg: Configuration object
+        
+    Returns:
+        list: Updated episode metadata with consecutive indices
+    """
+    print(f"\n=== Renumbering Episodes Consecutively ===")
+    
+    # Sort episodes by original index to maintain order
+    all_episodes.sort(key=lambda x: x['episode_index'])
+    
+    # Create mapping from old to new indices
+    old_to_new_mapping = {}
+    updated_episodes = []
+    
+    for new_idx, episode_metadata in enumerate(all_episodes):
+        old_idx = episode_metadata['episode_index']
+        old_to_new_mapping[old_idx] = new_idx
+        
+        # Update the episode metadata
+        episode_metadata['episode_index'] = new_idx
+        updated_episodes.append(episode_metadata)
+        
+        print(f"  Episode {old_idx} → {new_idx}")
+    
+    # Now we need to rename all the files
+    print(f"Renaming files for {len(updated_episodes)} episodes...")
+    
+    # Rename parquet files
+    for episode_metadata in updated_episodes:
+        old_idx = None
+        new_idx = episode_metadata['episode_index']
+        
+        # Find the original index from the mapping
+        for old, new in old_to_new_mapping.items():
+            if new == new_idx:
+                old_idx = old
+                break
+        
+        if old_idx == new_idx:
+            continue  # No change needed
+        
+        # Rename parquet file
+        old_chunk_id = old_idx // cfg.chunk_size
+        new_chunk_id = new_idx // cfg.chunk_size
+        
+        old_parquet_path = base_dir / "data" / f"chunk-{old_chunk_id:03d}" / f"episode_{old_idx:06d}.parquet"
+        new_parquet_path = base_dir / "data" / f"chunk-{new_chunk_id:03d}" / f"episode_{new_idx:06d}.parquet"
+        
+        if old_parquet_path.exists():
+            # Create new chunk directory if needed
+            new_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old_parquet_path), str(new_parquet_path))
+        
+        # Rename video files
+        if not cfg.skip_videos:
+            for cam_key in cfg.camera_keys:
+                old_video_path = base_dir / "videos" / f"chunk-{old_chunk_id:03d}" / cam_key / f"episode_{old_idx:06d}.mp4"
+                new_video_path = base_dir / "videos" / f"chunk-{new_chunk_id:03d}" / cam_key / f"episode_{new_idx:06d}.mp4"
+                
+                if old_video_path.exists():
+                    # Create new video directory if needed
+                    new_video_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(old_video_path), str(new_video_path))
+    
+    # Update parquet files with new episode indices
+    print("Updating parquet files with new episode indices...")
+    for episode_metadata in updated_episodes:
+        new_idx = episode_metadata['episode_index']
+        new_chunk_id = new_idx // cfg.chunk_size
+        parquet_path = base_dir / "data" / f"chunk-{new_chunk_id:03d}" / f"episode_{new_idx:06d}.parquet"
+        
+        if parquet_path.exists():
+            # Load, update, and save the parquet file
+            df = pd.read_parquet(parquet_path)
+            # Preserve list format for scalar fields to maintain shape consistency
+            df['episode_index'] = [[new_idx] for _ in range(len(df))]
+            # Calculate global frame indices while preserving list format
+            global_indices = []
+            for _, row in df.iterrows():
+                frame_idx = row['frame_index'][0] if isinstance(row['frame_index'], list) else row['frame_index']
+                global_indices.append([frame_idx + new_idx * 10000])
+            df['index'] = global_indices
+            df.to_parquet(parquet_path)
+    
+    # Clean up empty chunk directories
+    for chunk_dir in (base_dir / "data").iterdir():
+        if chunk_dir.is_dir() and not any(chunk_dir.iterdir()):
+            shutil.rmtree(chunk_dir)
+    
+    if not cfg.skip_videos:
+        for chunk_dir in (base_dir / "videos").iterdir():
+            if chunk_dir.is_dir():
+                # Check if any camera subdirectories have files
+                has_files = False
+                for cam_dir in chunk_dir.iterdir():
+                    if cam_dir.is_dir() and any(cam_dir.iterdir()):
+                        has_files = True
+                        break
+                if not has_files:
+                    shutil.rmtree(chunk_dir)
+    
+    print(f"✅ Successfully renumbered {len(updated_episodes)} episodes")
+    return updated_episodes
+
+
+def rewrite_episode_metadata(all_episodes: list, base_dir: Path):
+    """
+    Rewrite episode and task metadata files with updated indices.
+    
+    Args:
+        all_episodes: List of episode metadata with updated indices
+        base_dir: Base directory of the dataset
+    """
+    print("Rewriting metadata files...")
+    
+    # Clear existing metadata files
+    episodes_file = base_dir / "meta" / "episodes.jsonl"
+    tasks_file = base_dir / "meta" / "tasks.jsonl"
+    
+    if episodes_file.exists():
+        episodes_file.unlink()
+    if tasks_file.exists():
+        tasks_file.unlink()
+    
+    # Collect all unique tasks
+    all_tasks = set()
+    for episode in all_episodes:
+        all_tasks.update(episode['tasks'])
+    
+    # Write tasks file
+    task_mapping = {}
+    with open(tasks_file, 'w') as f:
+        for task_index, task in enumerate(sorted(all_tasks)):
+            task_mapping[task] = task_index
+            f.write(json.dumps({"task_index": task_index, "task": task}) + "\n")
+    
+    # Write episodes file with updated task indices
+    with open(episodes_file, 'w') as f:
+        for episode in all_episodes:
+            # Update task_index to match the new mapping
+            episode['task_index'] = task_mapping.get(episode['tasks'][0], 0)
+            f.write(json.dumps(episode) + "\n")
+
+
+def rewrite_episodes_stats(all_episodes: list, base_dir: Path, cfg: YAMSConfig):
+    """
+    Rewrite episode stats files with updated indices.
+    
+    Args:
+        all_episodes: List of episode metadata with updated indices
+        base_dir: Base directory of the dataset
+        cfg: Configuration object
+    """
+    if not HAS_LEROBOT:
+        return
+    
+    print("Rewriting episode stats...")
+    
+    # Clear existing stats files
+    stats_dir = base_dir / "meta" / "stats"
+    if stats_dir.exists():
+        shutil.rmtree(stats_dir)
+    
+    # Recreate stats for each episode with new indices
+    for episode in all_episodes:
+        new_idx = episode['episode_index']
+        episode_stats = compute_basic_episode_stats(new_idx, episode, cfg, base_dir)
+        write_episode_stats(new_idx, episode_stats, base_dir)
+
+
+def write_episode_name_mapping(all_episodes: list, base_dir: Path):
+    """
+    Write a JSON file that maps original episode names to LeRobot episode indices.
+    
+    Args:
+        all_episodes: List of episode metadata with original names and new indices
+        base_dir: Base directory of the dataset
+    """
+    print("Writing episode name mapping...")
+    
+    # Create mapping dictionary
+    episode_mapping = {}
+    
+    for episode in all_episodes:
+        lerobot_episode_name = f"episode_{episode['episode_index']:06d}"
+        original_name = episode.get('original_episode_name', 'unknown')
+        original_path = episode.get('original_episode_path', 'unknown')
+        
+        episode_mapping[original_name] = {
+            "lerobot_episode_index": episode['episode_index'],
+            "lerobot_episode_name": lerobot_episode_name,
+            "original_episode_path": original_path,
+            "task": episode['tasks'][0] if episode['tasks'] else 'unknown',
+            "length": episode['length']
+        }
+    
+    # Write to JSON file
+    mapping_file = base_dir / "meta" / "episode_name_mapping.json"
+    with open(mapping_file, 'w') as f:
+        json.dump(episode_mapping, f, indent=2, sort_keys=True)
+    
+    print(f"✅ Episode name mapping written to: {mapping_file}")
+    print(f"   Mapped {len(episode_mapping)} episodes")
 
 
 def print_problematic_episodes_summary(cfg: YAMSConfig):

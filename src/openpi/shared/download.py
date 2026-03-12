@@ -109,9 +109,9 @@ def _download_gsutil(url: str, local_path: pathlib.Path, **kwargs) -> None:
         logger.warning("gsutil not found, falling back to gcsfs. This may fail if GCP credentials are not configured correctly.")
         _download_fsspec(url, local_path, **kwargs)
         return
-    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["gsutil", "-m", "cp", "-r", url, str(local_path)],
+        ["gsutil", "-m", "cp", "-r", f"{url}/*", str(local_path)],
         check=True,
     )
 

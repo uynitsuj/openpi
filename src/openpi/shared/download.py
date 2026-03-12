@@ -87,7 +87,7 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
             # Route openpi-assets through gsutil to avoid gcsfs auth issues with this bucket.
             # All other gs:// URLs (e.g. big_vision) continue to use gcsfs as normal.
             if parsed.scheme == "gs" and parsed.netloc == "openpi-assets":
-                _download_gsutil(url, scratch_path)
+                _download_gsutil(url, scratch_path, **kwargs)
             else:
                 _download_fsspec(url, scratch_path, **kwargs)
 
@@ -103,8 +103,12 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
 
     return local_path
 
-def _download_gsutil(url: str, local_path: pathlib.Path) -> None:
-    """Download a file or directory from GCS using gsutil."""
+def _download_gsutil(url: str, local_path: pathlib.Path, **kwargs) -> None:
+    """Download a file or directory from GCS using gsutil if available, otherwise fall back to gcsfs."""
+    if shutil.which("gsutil") is None:
+        logger.warning("gsutil not found, falling back to gcsfs. This may fail if GCP credentials are not configured correctly.")
+        _download_fsspec(url, local_path, **kwargs)
+        return
     local_path.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["gsutil", "-m", "cp", "-r", url, str(local_path)],

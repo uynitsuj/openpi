@@ -8,6 +8,7 @@ import shutil
 import stat
 import time
 import urllib.parse
+import subprocess
 
 import filelock
 import fsspec
@@ -83,7 +84,12 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
             # Download the data to a local cache.
             logger.info(f"Downloading {url} to {local_path}")
             scratch_path = local_path.with_suffix(".partial")
-            _download_fsspec(url, scratch_path, **kwargs)
+            # Route openpi-assets through gsutil to avoid gcsfs auth issues with this bucket.
+            # All other gs:// URLs (e.g. big_vision) continue to use gcsfs as normal.
+            if parsed.scheme == "gs" and parsed.netloc == "openpi-assets":
+                _download_gsutil(url, scratch_path)
+            else:
+                _download_fsspec(url, scratch_path, **kwargs)
 
             shutil.move(scratch_path, local_path)
             _ensure_permissions(local_path)
@@ -97,6 +103,13 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
 
     return local_path
 
+def _download_gsutil(url: str, local_path: pathlib.Path) -> None:
+    """Download a file or directory from GCS using gsutil."""
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["gsutil", "-m", "cp", "-r", url, str(local_path)],
+        check=True,
+    )
 
 def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:
     """Download a file from a remote filesystem to the local cache, and return the local path."""

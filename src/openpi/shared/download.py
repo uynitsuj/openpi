@@ -6,9 +6,9 @@ import pathlib
 import re
 import shutil
 import stat
+import subprocess
 import time
 import urllib.parse
-import subprocess
 
 import filelock
 import fsspec
@@ -103,10 +103,13 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
 
     return local_path
 
+
 def _download_gsutil(url: str, local_path: pathlib.Path, **kwargs) -> None:
     """Download a file or directory from GCS using gsutil if available, otherwise fall back to gcsfs."""
     if shutil.which("gsutil") is None:
-        logger.warning("gsutil not found, falling back to gcsfs. This may fail if GCP credentials are not configured correctly.")
+        logger.warning(
+            "gsutil not found, falling back to gcsfs. This may fail if GCP credentials are not configured correctly."
+        )
         _download_fsspec(url, local_path, **kwargs)
         return
     local_path.mkdir(parents=True, exist_ok=True)
@@ -114,6 +117,7 @@ def _download_gsutil(url: str, local_path: pathlib.Path, **kwargs) -> None:
         ["gsutil", "-m", "cp", "-r", f"{url}/*", str(local_path)],
         check=True,
     )
+
 
 def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:
     """Download a file from a remote filesystem to the local cache, and return the local path."""

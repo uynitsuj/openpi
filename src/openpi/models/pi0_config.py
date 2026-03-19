@@ -40,7 +40,12 @@ class Pi0Config(_model.BaseModelConfig):
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
         if self.pytorch_compile_mode is not None:
-            assert self.pytorch_compile_mode in ["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]
+            assert self.pytorch_compile_mode in [
+                "default",
+                "reduce-overhead",
+                "max-autotune",
+                "max-autotune-no-cudagraphs",
+            ]
 
     @property
     @override

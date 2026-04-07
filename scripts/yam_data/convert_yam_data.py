@@ -24,17 +24,17 @@ import gc
 @dataclass
 class YAMSConfig:
     yam_data_path: str | List[str] = field(default_factory=lambda: [
-        # "/home/justinyu/nfs_us/nfs/data/sz_05/20250416", 
+        "/home/justinyu/nfs_us/nfs/data/sz_05/20250416", 
         "/home/justinyu/nfs_us/nfs/data/sz_05/20250425", 
-        # "/home/justinyu/nfs_us/nfs/data/sz_04/20250415",
-        # "/home/justinyu/nfs_us/nfs/data/sz_04/20250412",
-        # "/home/justinyu/nfs_us/nfs/data/sz_04/20250411",
-        # "/home/justinyu/nfs_us/nfs/data/sz_04/20250410",
-        # "/home/justinyu/nfs_us/nfs/data/sz_03/20250423",
-        # "/home/justinyu/nfs_us/nfs/data/sz_03/20250417"
+        "/home/justinyu/nfs_us/nfs/data/sz_04/20250415",
+        "/home/justinyu/nfs_us/nfs/data/sz_04/20250412",
+        "/home/justinyu/nfs_us/nfs/data/sz_04/20250411",
+        "/home/justinyu/nfs_us/nfs/data/sz_04/20250410",
+        "/home/justinyu/nfs_us/nfs/data/sz_03/20250423",
+        "/home/justinyu/nfs_us/nfs/data/sz_03/20250417"
     ])
     output_dir: Path = Path("/home/justinyu/nfs_us/justinyu/yam_lerobot_datasets")
-    repo_name: str = "uynitsuj/yam_bimanual_load_dishes"
+    repo_name: str = "uynitsuj/yam_bimanual_load_dishes_large_absolute"
     language_instruction: str = "Perform bimanual manipulation task" # Default task name; gets overwritten by task name in metadata
     
     # YAMS camera keys

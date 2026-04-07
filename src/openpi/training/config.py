@@ -6,7 +6,7 @@ import dataclasses
 import difflib
 import logging
 import pathlib
-from typing import Any, Literal, Protocol, TypeAlias
+from typing import Any, Literal, Protocol, TypeAlias, List
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.xmi_rby_policy as xmi_rby_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -463,6 +464,130 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotXmiRbyDataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms for the XMI RBY bimanual robot dataset.
+    
+    The XMI data uses end-effector poses with 6D rotation representation:
+    - State format: [left_6d_rot, left_3d_pos, left_1d_gripper, right_6d_rot, right_3d_pos, right_1d_gripper] = 20D
+    - Three camera views: left exterior, right exterior, and top
+    - Actions are delta end-effector poses with absolute gripper positions
+    """
+    
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+    
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack transform to map dataset keys to policy keys
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/exterior_image_2_right": "exterior_image_2_right",
+                        "observation/exterior_image_3_top": "exterior_image_3_top",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Data transforms using XMI RBY policy transforms
+        data_transforms = _transforms.Group(
+            inputs=[xmi_rby_policy.XmiRbyInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[xmi_rby_policy.XmiRbyOutputs()],
+        )
+
+        # XMI data uses delta actions for rotations/positions, but absolute gripper positions
+        # The conversion script already produces the correct format, but we may need delta conversion
+        # for the rotations and positions (indices 0:6, 6:9, 10:16, 16:19) while keeping
+        # grippers absolute (indices 9, 19)
+        delta_action_mask = _transforms.make_bool_mask(
+            6, 3, -1,  # left: 6d_rot (delta), 3d_pos (delta), gripper (absolute)
+            6, 3, -1   # right: 6d_rot (delta), 3d_pos (delta), gripper (absolute) 
+        )
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        # Model transforms for tokenization and image processing
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotXmiRbyDataConfig(DataConfigFactory):
+    """
+    This config is used to configure transforms for the XMI RBY bimanual robot dataset.
+    
+    The XMI data uses end-effector poses with 6D rotation representation:
+    - State format: [left_6d_rot, left_3d_pos, left_1d_gripper, right_6d_rot, right_3d_pos, right_1d_gripper] = 20D
+    - Three camera views: left exterior, right exterior, and top
+    - Actions are delta end-effector poses with absolute gripper positions
+    """
+    
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+    
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Repack transform to map dataset keys to policy keys
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/exterior_image_1_left": "exterior_image_1_left",
+                        "observation/exterior_image_2_right": "exterior_image_2_right",
+                        "observation/exterior_image_3_top": "exterior_image_3_top",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        # Data transforms using XMI RBY policy transforms
+        data_transforms = _transforms.Group(
+            inputs=[xmi_rby_policy.XmiRbyInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[xmi_rby_policy.XmiRbyOutputs()],
+        )
+
+        # XMI data uses delta actions for rotations/positions, but absolute gripper positions
+        # The conversion script already produces the correct format, but we may need delta conversion
+        # for the rotations and positions (indices 0:6, 6:9, 10:16, 16:19) while keeping
+        # grippers absolute (indices 9, 19)
+        delta_action_mask = _transforms.make_bool_mask(
+            6, 3, -1,  # left: 6d_rot (delta), 3d_pos (delta), gripper (absolute)
+            6, 3, -1   # right: 6d_rot (delta), 3d_pos (delta), gripper (absolute) 
+        )
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        # Model transforms for tokenization and image processing
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -498,7 +623,8 @@ class TrainConfig:
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
-    checkpoint_base_dir: str = "./checkpoints"
+    # checkpoint_base_dir: str = "./checkpoints"
+    checkpoint_base_dir: str = "/home/justinyu/nfs_us/justinyu/checkpoints"
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
@@ -563,19 +689,10 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi0_aloha",
-        model=pi0_config.Pi0Config(),
+        model=pi0.Pi0Config(),
         data=LeRobotAlohaDataConfig(
             assets=AssetsConfig(asset_id="trossen"),
         ),
-        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
-    ),
-    TrainConfig(
-        name="pi05_aloha",
-        model=pi0_config.Pi0Config(pi05=True),
-        data=LeRobotAlohaDataConfig(
-            assets=AssetsConfig(asset_id="trossen"),
-        ),
-        policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
     ),
     TrainConfig(
         name="pi0_aloha_towel",
@@ -929,6 +1046,55 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
+    ),
+    #
+    # Fine-tuning XMI RBY configs.
+    #
+    TrainConfig(
+        name="pi0_xmi_rby",
+        model=pi0.Pi0Config(action_dim=20, action_horizon=10),
+        data=LeRobotXmiRbyDataConfig(
+            repo_id="uynitsuj/xmi_bimanual_testing",
+            default_prompt="testing",
+            base_config=DataConfig(
+                local_files_only=True,
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_fast_xmi_rby",
+        model=pi0_fast.Pi0FASTConfig(action_dim=20, action_horizon=10, max_token_len=250),
+        data=LeRobotXmiRbyDataConfig(
+            repo_id="uynitsuj/xmi_bimanual_testing",
+            default_prompt="testing",
+            base_config=DataConfig(
+                local_files_only=True,
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_xmi_rby_low_mem_finetune",
+        model=pi0.Pi0Config(action_dim=20, action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotXmiRbyDataConfig(
+            repo_id="uynitsuj/xmi_bimanual_testing",
+            default_prompt="testing",
+            base_config=DataConfig(
+                local_files_only=True,
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        freeze_filter=pi0.Pi0Config(
+            action_dim=20, action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
     #
     # Debugging configs.

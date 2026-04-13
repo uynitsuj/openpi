@@ -111,12 +111,17 @@ def main(cfg: SkyPilotTrainingConfig):
     s3_dataset_prefix = dataset_path.parent.name
     repo_id = f"{s3_dataset_prefix}/{dataset_path.name}"
 
+    # Resolve norm stats directory: assets_dirs / asset_id
+    # asset_id is typically just the dataset name (no org prefix), unlike repo_id
+    asset_id = data_config.asset_id or data_config.repo_id
+    norm_stats_dir = Path(config.assets_dirs) / asset_id
+
     # Upload dataset to S3
     dataset_s3_path = upload_dataset_to_s3(
         dataset_path,
         cfg.s3_bucket,
         repo_id,
-        config.assets_dirs,
+        norm_stats_dir,
     )
 
     # Generate SkyPilot configuration (single function handles all providers)
@@ -133,6 +138,7 @@ def main(cfg: SkyPilotTrainingConfig):
         region=cfg.region,
         idle_minutes=cfg.idle_minutes,
         xla_mem_fraction=cfg.xla_mem_fraction,
+        managed=cfg.managed,
     )
 
     # Write config to temporary file

@@ -168,8 +168,15 @@ def query_sky_accelerators(accelerators: str, region: str, service_providers: Li
     }
 
 
-def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_stats_path: str) -> str:
-    """Upload dataset to S3 and return the full S3 path."""
+def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_stats_dir: str) -> str:
+    """Upload dataset and norm stats to S3 and return the full S3 path.
+
+    Args:
+        dataset_path: Local path to the dataset.
+        s3_bucket: S3 bucket URL (e.g. s3://bucket-name).
+        repo_id: Dataset repo id used as the S3 key prefix (e.g. lerobot/dataset_name).
+        norm_stats_dir: Local directory containing the norm_stats.json file.
+    """
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset path does not exist: {dataset_path}")
 
@@ -189,7 +196,11 @@ def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_
 
     print(f"[OK] Dataset successfully uploaded to {s3_path}")
 
-    upload_cmd = f"aws s3 sync '{norm_stats_path}/{repo_id}' '{s3_path}/norm_stats' --delete"
+    norm_stats_dir = Path(norm_stats_dir)
+    if not norm_stats_dir.exists():
+        raise FileNotFoundError(f"Norm stats directory does not exist: {norm_stats_dir}")
+
+    upload_cmd = f"aws s3 sync '{norm_stats_dir}' '{s3_path}/norm_stats' --delete"
     run_command(upload_cmd)
 
     print("[INFO] Verifying norm stats upload...")
@@ -203,11 +214,19 @@ def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_
 
 
 def _build_setup_script() -> str:
-    """Build the cloud-agnostic setup script."""
+    """Build the cloud-agnostic setup script.
+
+    Installs system-level FFmpeg libraries required by torchcodec for fast
+    video decoding (see docs/dataloader-optimization.md).
+    """
     lines = [
         'echo "[SETUP] Setting up openpi"',
         'conda deactivate 2>/dev/null; conda deactivate 2>/dev/null; true',
         'apt-get update && apt-get install -y git curl',
+        '',
+        '# Install FFmpeg libraries for torchcodec video decoding',
+        'apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev',
+        '',
         'curl -LsSf https://astral.sh/uv/install.sh | sh',
         'source $HOME/.local/bin/env 2>/dev/null || true',
         'uv venv --python 3.11',
@@ -293,15 +312,15 @@ def generate_sky_config(
     image_id: Optional[str] = None,
     idle_minutes: int = 10,
     xla_mem_fraction: float = 0.95,
+    managed: bool = True,
 ) -> dict:
     """Generate SkyPilot YAML configuration for any supported cloud provider.
 
-    Key differences from per-provider functions:
-    - Single function handles aws, lambda, gcp, etc.
-    - Uses ``secrets`` for WANDB_API_KEY (redacted in dashboard/logs).
-    - Autostop configured with ``wait_for: jobs`` and a checkpoint-sync hook.
-    - ``source /opt/pytorch/bin/activate`` only included for AWS.
-    - XLA_PYTHON_CLIENT_MEM_FRACTION properly exported (not on a bare line).
+    Args:
+        managed: If True (default), the config is intended for ``sky jobs launch``
+                 which auto-tears-down the cluster. Autostop is omitted since
+                 managed jobs handle cleanup. If False, autostop is configured
+                 as a safety net for ``sky launch``.
     """
     checkpoint_path = f"{s3_checkpoint_base}/{config_name}/{exp_name}"
     wandb_mode_arg = "" if wandb_api_key else "WANDB_MODE=disabled "
@@ -310,6 +329,20 @@ def generate_sky_config(
     secrets = {}
     if wandb_api_key:
         secrets['WANDB_API_KEY'] = wandb_api_key
+
+    resources = {
+        'cloud': cloud,
+        'accelerators': accelerators,
+        'region': region,
+    }
+
+    # Managed jobs (sky jobs launch) auto-teardown on completion and don't
+    # support the autostop field. Only add autostop for sky launch mode as
+    # a safety net against leaked instances.
+    if not managed:
+        resources['autostop'] = {
+            'down': True,
+        }
 
     config = {
         'workdir': '.',
@@ -323,22 +356,7 @@ def generate_sky_config(
             'WANDB_MODE_ARG': wandb_mode_arg,
             'XLA_MEM_FRACTION': str(xla_mem_fraction),
         },
-        'resources': {
-            'cloud': cloud,
-            'accelerators': accelerators,
-            'region': region,
-            'autostop': {
-                'idle_minutes': idle_minutes,
-                'down': True,
-                'wait_for': 'jobs',
-                'hook': (
-                    'echo "[HOOK] Syncing final checkpoints to S3..." && '
-                    f'aws s3 sync ./tmp_checkpoints {checkpoint_path} && '
-                    'echo "[HOOK] Done."'
-                ),
-                'hook_timeout': 600,
-            },
-        },
+        'resources': resources,
         'num_nodes': 1,
         'setup': _build_setup_script(),
         'run': _build_run_script(cloud),

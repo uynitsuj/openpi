@@ -25,12 +25,12 @@ should look something like:
 🎉 Enabled infra 🎉
   AWS [compute, storage]
   Lambda [compute]
+```
 
-To enable a cloud, follow the hints above and rerun: `uv sky check`
+To enable a cloud, follow the hints above and run: `uv sky check`
 If any problems remain, refer to detailed docs at: https://docs.skypilot.co/en/latest/getting-started/installation.html
 
-Using SkyPilot API server: http://127.0.0.1:46580
-```
+To use SkyPilot API server: http://127.0.0.1:46580
 
 ## PI0 Train Instructions
 

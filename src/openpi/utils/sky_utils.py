@@ -98,8 +98,12 @@ def parse_sky_gpu_output(output: str) -> pd.DataFrame:
     return pd.DataFrame(data_rows)
 
 
-def query_sky_accelerators(accelerators: str, region: str, service_providers: List[str]) -> dict:
-    """Query SkyPilot for the cheapest service provider for the requested accelerators."""
+def query_sky_accelerators(accelerators: str, service_providers: List[str]) -> dict:
+    """Query SkyPilot for available GPU options across all providers and regions.
+
+    Returns a dict with all options sorted by price, after the user confirms
+    their choice.
+    """
     print(f"[INFO] Checking available providers: {service_providers}")
 
     query_cmd = f"sky check {' '.join(service_providers)}"
@@ -115,56 +119,69 @@ def query_sky_accelerators(accelerators: str, region: str, service_providers: Li
 
     print(f"[OK] Available providers: {available_providers}")
 
+    # Query all regions for each provider (no --infra region filter)
     all_dataframes = []
     for provider in available_providers:
-        print(f"[INFO] Querying {provider} for {accelerators}...")
-        query_cmd = f"sky show-gpus {accelerators} --infra {provider}/{region}"
+        print(f"[INFO] Querying {provider} for {accelerators} (all regions)...")
+        query_cmd = f"sky show-gpus {accelerators} --infra {provider}"
         try:
             result = run_command(query_cmd, capture_output=True)
             if result.stdout.strip():
                 provider_df = parse_sky_gpu_output(result.stdout)
                 if not provider_df.empty:
                     all_dataframes.append(provider_df)
-                    print(f"[OK] Found {len(provider_df)} options from {provider}/{region}")
+                    print(f"[OK] Found {len(provider_df)} options from {provider}")
                 else:
-                    print(f"[WARN] No options found from {provider}/{region}")
+                    print(f"[WARN] No options found from {provider}")
             else:
-                print(f"[WARN] No output from {provider}/{region}")
+                print(f"[WARN] No output from {provider}")
         except Exception as e:
-            print(f"[ERROR] Error querying {provider}/{region}: {e}")
+            print(f"[ERROR] Error querying {provider}: {e}")
 
-    if all_dataframes:
-        df = pd.concat(all_dataframes, ignore_index=True)
+    if not all_dataframes:
+        raise RuntimeError(f"No GPU options found for {accelerators} across {available_providers}")
+
+    df = pd.concat(all_dataframes, ignore_index=True)
+
+    # Determine price column and sort
+    if 'HOURLY_SPOT_PRICE' in df.columns:
+        df['HOURLY_SPOT_PRICE'] = pd.to_numeric(df['HOURLY_SPOT_PRICE'], errors='coerce')
+    if 'HOURLY_PRICE' in df.columns:
+        df['HOURLY_PRICE'] = pd.to_numeric(df['HOURLY_PRICE'], errors='coerce')
+
+    price_col = 'HOURLY_SPOT_PRICE' if 'HOURLY_SPOT_PRICE' in df.columns and df['HOURLY_SPOT_PRICE'].notna().any() else 'HOURLY_PRICE'
+    df_sorted = df.sort_values(price_col, na_position='last').reset_index(drop=True)
+
+    # Display options table
+    print()
+    print(f"  Available options for {accelerators}:")
+    print(f"  {'#':<4} {'CLOUD':<10} {'REGION':<22} {'PRICE ($/hr)':<14}")
+    print(f"  {'-'*50}")
+    for i, row in df_sorted.iterrows():
+        price = row.get(price_col, 'N/A')
+        price_str = f"${price:.2f}" if isinstance(price, (int, float)) and pd.notna(price) else "N/A"
+        print(f"  {i:<4} {row.get('CLOUD', '?'):<10} {row.get('REGION', '?'):<22} {price_str:<14}")
+    print()
+
+    # Prompt user to choose
+    default_choice = 0
+    choice = input(f"  Select option [0-{len(df_sorted)-1}] (default: {default_choice}): ").strip()
+    if choice == "":
+        choice = default_choice
     else:
-        df = pd.DataFrame()
+        choice = int(choice)
 
-    if df.empty:
-        raise RuntimeError(f"No GPU options found for {accelerators}")
+    if choice < 0 or choice >= len(df_sorted):
+        raise ValueError(f"Invalid choice: {choice}")
 
-    if region:
-        df_filtered = df[df['REGION'] == region]
-        if df_filtered.empty:
-            print(f"[WARN] No options found in region {region}, showing all regions")
-            df_filtered = df
-    else:
-        df_filtered = df
-
-    df_filtered = df_filtered.copy()
-    if 'HOURLY_SPOT_PRICE' in df_filtered.columns:
-        df_filtered['HOURLY_SPOT_PRICE'] = pd.to_numeric(df_filtered['HOURLY_SPOT_PRICE'], errors='coerce')
-        cheapest_idx = df_filtered['HOURLY_SPOT_PRICE'].idxmin()
-        cheapest_option = df_filtered.loc[cheapest_idx].to_dict()
-        print(f"[INFO] Cheapest (spot): {cheapest_option['CLOUD']} in {cheapest_option['REGION']} at ${cheapest_option['HOURLY_SPOT_PRICE']}/hour")
-    else:
-        df_filtered['HOURLY_PRICE'] = pd.to_numeric(df_filtered['HOURLY_PRICE'], errors='coerce')
-        cheapest_idx = df_filtered['HOURLY_PRICE'].idxmin()
-        cheapest_option = df_filtered.loc[cheapest_idx].to_dict()
-        print(f"[INFO] Cheapest (on-demand): {cheapest_option['CLOUD']} in {cheapest_option['REGION']} at ${cheapest_option['HOURLY_PRICE']}/hour")
+    selected = df_sorted.iloc[choice].to_dict()
+    price = selected.get(price_col, '?')
+    print(f"[OK] Selected: {selected['CLOUD']} in {selected['REGION']} at ${price}/hr")
 
     return {
-        'cheapest_option': cheapest_option,
-        'all_options': list(df_filtered.to_dict('records')),
-        'dataframe': df_filtered,
+        'selected': selected,
+        'all_options': list(df_sorted.to_dict('records')),
+        'dataframe': df_sorted,
     }
 
 
@@ -375,6 +392,19 @@ def generate_sky_config(
     return config
 
 
+def _get_latest_job_id() -> Optional[str]:
+    """Get the job ID of the most recently submitted managed job."""
+    try:
+        result = subprocess.run(
+            "sky jobs queue | tail -n +2 | head -1 | awk '{print $1}'",
+            shell=True, capture_output=True, text=True, check=True,
+        )
+        job_id = result.stdout.strip()
+        return job_id if job_id.isdigit() else None
+    except subprocess.CalledProcessError:
+        return None
+
+
 def launch_training(config_file: Path, cluster_name: Optional[str] = None, managed: bool = False):
     """Launch the training job using SkyPilot.
 
@@ -397,3 +427,13 @@ def launch_training(config_file: Path, cluster_name: Optional[str] = None, manag
 
     run_command(launch_cmd)
     print("[OK] Training job launched successfully!")
+
+    # For managed jobs, tail the job logs so they stream to this terminal.
+    # This blocks until the job finishes (Ctrl+C detaches without cancelling).
+    if managed:
+        job_id = _get_latest_job_id()
+        if job_id:
+            print(f"[INFO] Streaming logs for managed job {job_id} (Ctrl+C to detach)...")
+            # Use check=False because sky jobs logs returns non-zero if the
+            # job fails, but we still want to see the output.
+            run_command(f"sky jobs logs {job_id}", check=False)

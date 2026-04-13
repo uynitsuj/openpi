@@ -37,7 +37,7 @@ from openpi.utils.sky_utils import (
 class SkyPilotTrainingConfig:
     config_name: str
     exp_name: Optional[str] = None
-    service_provider: Optional[List[str]] = field(default_factory=lambda: ["lambda"])
+    service_provider: Optional[List[str]] = field(default_factory=lambda: ["lambda", "aws"])
     s3_bucket: str = "s3://xdof-internal-research"
     s3_checkpoint_base: str = "s3://xdof-internal-research/model_ckpts"
     accelerators: str = "A100-80GB:8"
@@ -99,13 +99,11 @@ def main(cfg: SkyPilotTrainingConfig):
     if not check_prerequisites():
         sys.exit(1)
 
-    if len(cfg.service_provider) > 1:
-        cheapest_service_provider = query_sky_accelerators(cfg.accelerators, cfg.region, cfg.service_provider)
-        print(f"[INFO] Cheapest provider for {cfg.accelerators}: {cheapest_service_provider['cheapest_option']['CLOUD']}")
-        service_provider = cheapest_service_provider['cheapest_option']['CLOUD'].lower()
-    else:
-        service_provider = cfg.service_provider[0]
-        print(f"[INFO] Using {service_provider} as the service provider")
+    # Query GPU availability across all providers and regions, let user choose
+    result = query_sky_accelerators(cfg.accelerators, cfg.service_provider)
+    selected = result['selected']
+    service_provider = selected['CLOUD'].lower()
+    selected_region = selected.get('REGION')
 
     # Generate dataset name and S3 paths
     s3_dataset_prefix = dataset_path.parent.name
@@ -125,7 +123,7 @@ def main(cfg: SkyPilotTrainingConfig):
     )
 
     # Generate SkyPilot configuration (single function handles all providers)
-    print(f"[INFO] Generating SkyPilot configuration for {service_provider}...")
+    print(f"[INFO] Generating SkyPilot configuration for {service_provider}/{selected_region}...")
     sky_config = generate_sky_config(
         cloud=service_provider,
         dataset_s3_path=dataset_s3_path,
@@ -135,7 +133,7 @@ def main(cfg: SkyPilotTrainingConfig):
         s3_checkpoint_base=cfg.s3_checkpoint_base,
         wandb_api_key=wandb_api_key,
         accelerators=cfg.accelerators,
-        region=cfg.region,
+        region=selected_region,
         idle_minutes=cfg.idle_minutes,
         xla_mem_fraction=cfg.xla_mem_fraction,
         managed=cfg.managed,

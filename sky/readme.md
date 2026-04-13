@@ -12,7 +12,7 @@ uv run aws configure
 ### To configure Lambda access keys
 To configure credentials, go to: https://cloud.lambdalabs.com/api-keys to generate API key and add the line
 ```
-    api_key = [YOUR API KEY]
+api_key = [YOUR API KEY]
 ```
 to ~/.lambda_cloud/lambda_keys
 
@@ -20,12 +20,13 @@ Check sky enabled infra
 ```
 uv run sky check
 ```
-should look like:
+should look something like:
 ```
-Enabled infra:
+🎉 Enabled infra 🎉
   AWS [compute, storage]
+  Lambda [compute]
 
-To enable a cloud, follow the hints above and rerun: sky check
+To enable a cloud, follow the hints above and rerun: `uv sky check`
 If any problems remain, refer to detailed docs at: https://docs.skypilot.co/en/latest/getting-started/installation.html
 
 Using SkyPilot API server: http://127.0.0.1:46580

@@ -533,7 +533,14 @@ def train_loop(config: _config.TrainConfig):
             elif not isinstance(losses, torch.Tensor):
                 losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            loss = losses.mean()
+            # RABC: weight per-sample loss by integrated velocity over action horizon
+            if config.rabc_enabled and observation.sample_weights is not None:
+                per_sample_loss = losses.mean(dim=-1) if losses.dim() > 1 else losses  # [B] or [B, H]
+                while per_sample_loss.dim() > 1:
+                    per_sample_loss = per_sample_loss.mean(dim=-1)
+                loss = (per_sample_loss * observation.sample_weights).mean()
+            else:
+                loss = losses.mean()
 
             # Backward pass
             loss.backward()

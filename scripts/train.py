@@ -148,6 +148,11 @@ def train_step(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        # RABC: weight per-sample loss by integrated velocity over action horizon
+        if config.rabc_enabled and observation.sample_weights is not None:
+            per_sample_loss = jnp.mean(chunked_loss, axis=-1)  # [B]
+            weighted_loss = per_sample_loss * observation.sample_weights  # [B]
+            return jnp.mean(weighted_loss)
         return jnp.mean(chunked_loss)
 
     train_rng = jax.random.fold_in(rng, state.step)

@@ -102,6 +102,34 @@ class RepackTransform(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class ComputeRABCWeights(DataTransformFn):
+    """Compute per-sample RABC weights from rorm_velocity.
+
+    Integrates velocity over the action horizon (area under curve),
+    normalizes by horizon length, and clips to [clip_min, clip_max].
+
+    Expects `rorm_velocity` in the data dict as shape (action_horizon,).
+    Produces `sample_weights` as a scalar float.
+    """
+
+    clip_min: float = 0.0
+    clip_max: float = 1.0
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "rorm_velocity" not in data:
+            return data
+        vel = np.asarray(data["rorm_velocity"], dtype=np.float32)
+        # Integrate velocity over the action horizon and normalize
+        weight = float(np.sum(vel) / max(len(vel), 1))
+        # Clip to range
+        weight = float(np.clip(weight, self.clip_min, self.clip_max))
+        data = {**data, "sample_weights": np.float32(weight)}
+        # Remove raw velocity from dict (not needed downstream)
+        data.pop("rorm_velocity", None)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class InjectDefaultPrompt(DataTransformFn):
     prompt: str | None
 

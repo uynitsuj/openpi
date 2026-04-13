@@ -89,6 +89,10 @@ class DataConfig:
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
 
+    # Additional keys to fetch with the same delta_timestamps as actions (e.g., "rorm_velocity").
+    # These will be available in the data dict for transforms to consume.
+    extra_horizon_keys: Sequence[str] = ()
+
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
@@ -519,7 +523,7 @@ class LeRobotXmiRbyDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
         return dataclasses.replace(
-            self.create_base_config(assets_dirs),
+            self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -566,12 +570,60 @@ class LeRobotYamDataConfig(DataConfigFactory):
 
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
-            self.create_base_config(assets_dirs),
+            self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
 
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotYamRormDataConfig(DataConfigFactory):
+    """
+    YAM dataset with RORM reward weights for RABC / AWR training.
+
+    Same as LeRobotYamDataConfig but also loads `rorm_velocity` from the dataset
+    and computes per-sample RABC weights via the ComputeRABCWeights transform.
+    """
+
+    default_prompt: str | None = None
+    rabc_clip_min: float = 0.0
+    rabc_clip_max: float = 1.0
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "left_camera-images-rgb": "left_camera-images-rgb",
+                        "right_camera-images-rgb": "right_camera-images-rgb",
+                        "top_camera-images-rgb": "top_camera-images-rgb",
+                        "state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                        # rorm_weight is a pre-computed scalar per frame (clip(velocity, 0, inf))
+                        # It flows through as sample_weights for RABC loss weighting
+                        "sample_weights": "rorm_weight",
+                    }
+                )
+            ]
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        data_transforms = _transforms.Group(
+            inputs=[yam_policy.YamInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            outputs=[yam_policy.YamOutputs()],
+        )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -610,8 +662,7 @@ class TrainConfig:
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
-    # checkpoint_base_dir: str = "./checkpoints"
-    checkpoint_base_dir: str = "/home/justinyu/checkpoints"
+    checkpoint_base_dir: str = "/home/yujustin/checkpoints"
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
@@ -646,6 +697,14 @@ class TrainConfig:
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
+
+    # ── RABC / AWR weighting ─────────────────────────────────────────────
+    # When enabled, per-sample loss is weighted by the integrated RORM velocity
+    # over the action horizon. Requires `rorm_velocity` in the dataset.
+    rabc_enabled: bool = False
+    # Clip range for the per-sample RABC weight after integration + normalization.
+    rabc_clip_min: float = 0.0
+    rabc_clip_max: float = 1.0
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -1048,7 +1107,7 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi0_xmi_rby",
-        model=pi0.Pi0Config(action_horizon=10),
+        model=pi0_config.Pi0Config(action_horizon=10),
         data=LeRobotXmiRbyDataConfig(
             repo_id="uynitsuj/xmi_bimanual_testing",
             default_prompt="testing",
@@ -1074,7 +1133,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_xmi_rby_low_mem_finetune",
-        model=pi0.Pi0Config(action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0_config.Pi0Config(action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotXmiRbyDataConfig(
             repo_id="uynitsuj/xmi_bimanual_testing",
             default_prompt="testing",
@@ -1084,7 +1143,7 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=30_000,
-        freeze_filter=pi0.Pi0Config(action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        freeze_filter=pi0_config.Pi0Config(action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,
     ),
@@ -1092,7 +1151,7 @@ _CONFIGS = [
     # Fine-tuning YAM configs.
     TrainConfig(
         name="pi0_yam",
-        model=pi0.Pi0Config(action_horizon=10),
+        model=pi0_config.Pi0Config(action_horizon=10),
         data=LeRobotYamDataConfig(
             repo_id="uynitsuj/yam_bimanual_load_dishes_absolute",
             default_prompt="Load dishes onto tabletop dishrack",
@@ -1105,7 +1164,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_yam_low_mem_finetune",
-        model=pi0.Pi0Config(action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0_config.Pi0Config(action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotYamDataConfig(
             repo_id="uynitsuj/yam_bimanual_load_dishes_absolute",
             default_prompt="Load dishes onto tabletop dishrack",
@@ -1119,10 +1178,120 @@ _CONFIGS = [
         # We have a convenience function in the model config that returns the default freeze filter
         # for the given model config for LoRA finetuning. Just make sure it matches the model config
         # you chose above.
-        freeze_filter=pi0.Pi0Config(
+        freeze_filter=pi0_config.Pi0Config(
             paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+    ),
+    #
+    # RABC / AWR weighted YAM tshirt folding configs.
+    #
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_no_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_lora",
+        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamRormDataConfig(
+            repo_id="yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # Pi0.5 RABC / AWR weighted YAM tshirt folding configs.
+    #
+    TrainConfig(
+        name="pi05_yam_tshirt_rabc",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi05_yam_tshirt_no_rabc",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_yam_tshirt_rabc_lora",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamRormDataConfig(
+            repo_id="yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
         ema_decay=None,
     ),
     #

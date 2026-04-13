@@ -22,7 +22,7 @@ import tyro
 from dataclasses import dataclass, field
 
 import openpi.training.config as _config
-import lerobot.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 from datetime import datetime
 
 from openpi.utils.sky_utils import (

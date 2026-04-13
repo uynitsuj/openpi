@@ -308,7 +308,7 @@ def generate_sky_config(
     s3_checkpoint_base: str,
     wandb_api_key: Optional[str] = None,
     accelerators: str = "A100:8",
-    region: str = "us-west-2",
+    region: Optional[str] = None,
     image_id: Optional[str] = None,
     idle_minutes: int = 10,
     xla_mem_fraction: float = 0.95,
@@ -333,8 +333,12 @@ def generate_sky_config(
     resources = {
         'cloud': cloud,
         'accelerators': accelerators,
-        'region': region,
     }
+
+    # Only pin region if explicitly specified; otherwise SkyPilot picks
+    # the cheapest available region automatically.
+    if region:
+        resources['region'] = region
 
     # Managed jobs (sky jobs launch) auto-teardown on completion and don't
     # support the autostop field. Only add autostop for sky launch mode as

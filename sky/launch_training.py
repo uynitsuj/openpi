@@ -41,7 +41,7 @@ class SkyPilotTrainingConfig:
     s3_bucket: str = "s3://xdof-internal-research"
     s3_checkpoint_base: str = "s3://xdof-internal-research/model_ckpts"
     accelerators: str = "A100-80GB:8"
-    region: str = "us-west-2"
+    region: Optional[str] = None  # If None, SkyPilot picks the cheapest available region
     cluster_name: Optional[str] = None
     disable_wandb: bool = False
     dry_run: bool = False

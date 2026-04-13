@@ -1,19 +1,24 @@
 # SkyPilot Instructions
 
 ## Setup
-Install skypilot
+Install skypilot and awscli via the `sky` dependency group:
 ```
-pip install awscli
-pip install "skypilot-nightly[kubernetes,aws,gcp,azure,oci,lambda,runpod,fluidstack,paperspace,cudo,ibm,scp,nebius]"
+uv sync --group sky
 ```
-Configure aws access keys
+### To configure AWS access keys
 ```
-aws configure
+uv run aws configure
 ```
+### To configure Lambda access keys
+To configure credentials, go to: https://cloud.lambdalabs.com/api-keys to generate API key and add the line
+```
+    api_key = [YOUR API KEY]
+```
+to ~/.lambda_cloud/lambda_keys
 
 Check sky enabled infra
 ```
-sky check
+uv run sky check
 ```
 should look like:
 ```

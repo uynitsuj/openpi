@@ -22,7 +22,7 @@ import tyro
 from dataclasses import dataclass, field
 
 import openpi.training.config as _config
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+from lerobot.common.constants import HF_LEROBOT_HOME
 from datetime import datetime
 
 from openpi.utils.sky_utils import (
@@ -52,14 +52,16 @@ class SkyPilotTrainingConfig:
 
 def main(cfg: SkyPilotTrainingConfig):
 
-    # Load minimal dataset info to check that it exists in the first place
+    # Resolve dataset path without loading the full dataset (avoids hang)
     config = _config.get_config(cfg.config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-    )
-    dataset_path = dataset.root
+    dataset_path = HF_LEROBOT_HOME / data_config.repo_id
+    if not dataset_path.exists():
+        raise FileNotFoundError(
+            f"Dataset not found at {dataset_path}. "
+            f"Make sure the dataset for repo_id={data_config.repo_id} is downloaded."
+        )
 
     # Check for norm stats
     if data_config.norm_stats is None:

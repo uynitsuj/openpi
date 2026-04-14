@@ -66,7 +66,7 @@ rlds = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "av==14.2.0"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }

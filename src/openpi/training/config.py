@@ -1191,7 +1191,7 @@ _CONFIGS = [
         name="pi0_yam_tshirt_rabc",
         model=pi0_config.Pi0Config(action_horizon=30),
         data=LeRobotYamRormDataConfig(
-            repo_id="yam_tshirt_rorm_weighted",
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
             default_prompt="Folding tshirt pile and stacking",
             base_config=DataConfig(
                 prompt_from_task=True,
@@ -1207,7 +1207,7 @@ _CONFIGS = [
         name="pi0_yam_tshirt_no_rabc",
         model=pi0_config.Pi0Config(action_horizon=30),
         data=LeRobotYamRormDataConfig(
-            repo_id="yam_tshirt_rorm_weighted",
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
             default_prompt="Folding tshirt pile and stacking",
             base_config=DataConfig(
                 prompt_from_task=True,

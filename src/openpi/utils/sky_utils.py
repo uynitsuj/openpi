@@ -98,11 +98,22 @@ def parse_sky_gpu_output(output: str) -> pd.DataFrame:
     return pd.DataFrame(data_rows)
 
 
-def query_sky_accelerators(accelerators: str, service_providers: List[str]) -> dict:
-    """Query SkyPilot for available GPU options across all providers and regions.
+def query_sky_accelerators(
+    accelerators: List[str],
+    service_providers: List[str],
+    preferred_region: Optional[str] = None,
+) -> dict:
+    """Query SkyPilot for available GPU options across all providers, regions, and accelerator types.
 
-    Returns a dict with all options sorted by price, after the user confirms
-    their choice.
+    Args:
+        accelerators: List of accelerator specs to search, e.g. ["A100-80GB:8", "H100:8"].
+        service_providers: List of cloud providers to search, e.g. ["lambda", "aws"].
+        preferred_region: If set, also query this specific region per provider
+                          (sky show-gpus only returns the cheapest region by default).
+
+    Returns a dict with the user-selected option after displaying all results.
+    Note: ``sky show-gpus`` shows instance types that exist in a region, not
+    real-time availability. Provisioning may still fail if capacity is exhausted.
     """
     print(f"[INFO] Checking available providers: {service_providers}")
 
@@ -119,48 +130,83 @@ def query_sky_accelerators(accelerators: str, service_providers: List[str]) -> d
 
     print(f"[OK] Available providers: {available_providers}")
 
-    # Query all regions for each provider (no --infra region filter)
+    # Query all accelerator types across all providers.
+    # For each combo, query globally (cheapest region) and also the preferred
+    # region specifically, since sky show-gpus only returns one region.
     all_dataframes = []
-    for provider in available_providers:
-        print(f"[INFO] Querying {provider} for {accelerators} (all regions)...")
-        query_cmd = f"sky show-gpus {accelerators} --infra {provider}"
-        try:
-            result = run_command(query_cmd, capture_output=True)
-            if result.stdout.strip():
-                provider_df = parse_sky_gpu_output(result.stdout)
-                if not provider_df.empty:
-                    all_dataframes.append(provider_df)
-                    print(f"[OK] Found {len(provider_df)} options from {provider}")
-                else:
-                    print(f"[WARN] No options found from {provider}")
-            else:
-                print(f"[WARN] No output from {provider}")
-        except Exception as e:
-            print(f"[ERROR] Error querying {provider}: {e}")
+    seen_queries = set()
+
+    for accel in accelerators:
+        for provider in available_providers:
+            # Global query (returns cheapest region)
+            print(f"[INFO] Querying {provider} for {accel} (all regions)...")
+            query_cmd = f"sky show-gpus {accel} --infra {provider}"
+            try:
+                result = run_command(query_cmd, capture_output=True)
+                if result.stdout.strip():
+                    provider_df = parse_sky_gpu_output(result.stdout)
+                    if not provider_df.empty:
+                        all_dataframes.append(provider_df)
+                        print(f"[OK] Found {len(provider_df)} options from {provider}")
+            except Exception as e:
+                print(f"[ERROR] Error querying {provider} for {accel}: {e}")
+
+            # Also query the preferred region specifically
+            if preferred_region:
+                key = (accel, provider, preferred_region)
+                if key not in seen_queries:
+                    seen_queries.add(key)
+                    print(f"[INFO] Querying {provider} for {accel} in {preferred_region}...")
+                    query_cmd = f"sky show-gpus {accel} --infra {provider}/{preferred_region}"
+                    try:
+                        result = run_command(query_cmd, capture_output=True)
+                        if result.stdout.strip():
+                            provider_df = parse_sky_gpu_output(result.stdout)
+                            if not provider_df.empty:
+                                all_dataframes.append(provider_df)
+                                print(f"[OK] Found {len(provider_df)} options from {provider}/{preferred_region}")
+                    except Exception as e:
+                        print(f"[ERROR] Error querying {provider}/{preferred_region} for {accel}: {e}")
 
     if not all_dataframes:
         raise RuntimeError(f"No GPU options found for {accelerators} across {available_providers}")
 
+    # Deduplicate rows (same GPU/CLOUD/REGION/INSTANCE_TYPE)
+    df = pd.concat(all_dataframes, ignore_index=True)
+    dedup_cols = [c for c in ['GPU', 'QTY', 'CLOUD', 'REGION', 'INSTANCE_TYPE'] if c in df.columns]
+    if dedup_cols:
+        df = df.drop_duplicates(subset=dedup_cols).reset_index(drop=True)
+
     df = pd.concat(all_dataframes, ignore_index=True)
 
-    # Determine price column and sort
+    # Normalize price columns
     if 'HOURLY_SPOT_PRICE' in df.columns:
         df['HOURLY_SPOT_PRICE'] = pd.to_numeric(df['HOURLY_SPOT_PRICE'], errors='coerce')
     if 'HOURLY_PRICE' in df.columns:
         df['HOURLY_PRICE'] = pd.to_numeric(df['HOURLY_PRICE'], errors='coerce')
 
-    price_col = 'HOURLY_SPOT_PRICE' if 'HOURLY_SPOT_PRICE' in df.columns and df['HOURLY_SPOT_PRICE'].notna().any() else 'HOURLY_PRICE'
-    df_sorted = df.sort_values(price_col, na_position='last').reset_index(drop=True)
+    # Build a "best price" column: use spot price if available, else on-demand
+    def _best_price(row):
+        spot = row.get('HOURLY_SPOT_PRICE')
+        regular = row.get('HOURLY_PRICE')
+        if pd.notna(spot):
+            return spot
+        return regular
+    df['_BEST_PRICE'] = df.apply(_best_price, axis=1)
+    df_sorted = df.sort_values('_BEST_PRICE', na_position='last').reset_index(drop=True)
 
     # Display options table
     print()
-    print(f"  Available options for {accelerators}:")
-    print(f"  {'#':<4} {'CLOUD':<10} {'REGION':<22} {'PRICE ($/hr)':<14}")
-    print(f"  {'-'*50}")
+    print(f"  Available options (note: availability is not guaranteed):")
+    print(f"  {'#':<4} {'GPU':<16} {'CLOUD':<10} {'REGION':<22} {'ON-DEMAND':<12} {'SPOT':<12}")
+    print(f"  {'-'*76}")
     for i, row in df_sorted.iterrows():
-        price = row.get(price_col, 'N/A')
-        price_str = f"${price:.2f}" if isinstance(price, (int, float)) and pd.notna(price) else "N/A"
-        print(f"  {i:<4} {row.get('CLOUD', '?'):<10} {row.get('REGION', '?'):<22} {price_str:<14}")
+        gpu_label = f"{row.get('GPU', '?')}x{int(float(row.get('QTY', 1)))}"
+        regular = row.get('HOURLY_PRICE')
+        spot = row.get('HOURLY_SPOT_PRICE')
+        regular_str = f"${regular:.2f}" if pd.notna(regular) else "-"
+        spot_str = f"${spot:.2f}" if pd.notna(spot) else "-"
+        print(f"  {i:<4} {gpu_label:<16} {row.get('CLOUD', '?'):<10} {row.get('REGION', '?'):<22} {regular_str:<12} {spot_str:<12}")
     print()
 
     # Prompt user to choose
@@ -175,7 +221,7 @@ def query_sky_accelerators(accelerators: str, service_providers: List[str]) -> d
         raise ValueError(f"Invalid choice: {choice}")
 
     selected = df_sorted.iloc[choice].to_dict()
-    price = selected.get(price_col, '?')
+    price = selected.get('_BEST_PRICE', '?')
     print(f"[OK] Selected: {selected['CLOUD']} in {selected['REGION']} at ${price}/hr")
 
     return {
@@ -233,17 +279,25 @@ def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_
 def _build_setup_script() -> str:
     """Build the cloud-agnostic setup script.
 
-    Installs system-level FFmpeg libraries required by torchcodec for fast
-    video decoding (see docs/dataloader-optimization.md).
+    Installs FFmpeg 7 dev libraries required by both av>=14 (PyAV, needs
+    FFmpeg 7 headers to compile from sdist) and torchcodec (runtime linking).
+    Also installs awscli system-wide so ``aws`` is available before the
+    venv is activated in the run script.
     """
     lines = [
         'echo "[SETUP] Setting up openpi"',
         'conda deactivate 2>/dev/null; conda deactivate 2>/dev/null; true',
-        'apt-get update && apt-get install -y git curl',
         '',
-        '# Install FFmpeg libraries for torchcodec video decoding',
-        'apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev',
+        '# System dependencies',
+        'apt-get update && apt-get install -y git curl pkg-config software-properties-common awscli',
         '',
+        '# Install FFmpeg 7 dev libs (required by av>=14 sdist build and torchcodec)',
+        '# Ubuntu default repos only have FFmpeg 6; use the PPA for FFmpeg 7.',
+        'add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg7',
+        'apt-get update',
+        'apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavdevice-dev libavutil-dev libavfilter-dev libswscale-dev libswresample-dev',
+        '',
+        '# Install uv and set up Python environment',
         'curl -LsSf https://astral.sh/uv/install.sh | sh',
         'source $HOME/.local/bin/env 2>/dev/null || true',
         'uv venv --python 3.11',
@@ -273,7 +327,7 @@ def _build_run_script(cloud: str) -> str:
         'echo "[INFO] Node rank: $SKYPILOT_NODE_RANK / $SKYPILOT_NUM_NODES"',
         'echo "[INFO] GPUs per node: $SKYPILOT_NUM_GPUS_PER_NODE"',
         '',
-        '# Activate environment',
+        '# Activate environment first so aws/uv are on PATH',
         'conda deactivate 2>/dev/null; conda deactivate 2>/dev/null; true',
         'source .venv/bin/activate',
     ]

@@ -37,11 +37,11 @@ from openpi.utils.sky_utils import (
 class SkyPilotTrainingConfig:
     config_name: str
     exp_name: Optional[str] = None
-    service_provider: Optional[List[str]] = field(default_factory=lambda: ["lambda", "aws"])
+    service_provider: Optional[List[str]] = field(default_factory=lambda: ["aws"])
     s3_bucket: str = "s3://xdof-internal-research"
     s3_checkpoint_base: str = "s3://xdof-internal-research/model_ckpts"
-    accelerators: str = "A100-80GB:8"
-    region: Optional[str] = None  # If None, SkyPilot picks the cheapest available region
+    accelerators: List[str] = field(default_factory=lambda: ["A100-80GB:8"])
+    region: Optional[str] = "us-west-2"  # If None, SkyPilot picks the cheapest available region
     cluster_name: Optional[str] = None
     disable_wandb: bool = False
     dry_run: bool = False
@@ -99,11 +99,15 @@ def main(cfg: SkyPilotTrainingConfig):
     if not check_prerequisites():
         sys.exit(1)
 
-    # Query GPU availability across all providers and regions, let user choose
-    result = query_sky_accelerators(cfg.accelerators, cfg.service_provider)
+    # Query GPU availability across all providers, regions, and accelerator types
+    result = query_sky_accelerators(cfg.accelerators, cfg.service_provider, preferred_region=cfg.region)
     selected = result['selected']
     service_provider = selected['CLOUD'].lower()
     selected_region = selected.get('REGION')
+    # Reconstruct accelerator spec from selected option (e.g. "A100-80GB:8")
+    gpu_name = selected.get('GPU', cfg.accelerators[0].split(':')[0])
+    gpu_qty = selected.get('QTY', cfg.accelerators[0].split(':')[1] if ':' in cfg.accelerators[0] else '8')
+    selected_accelerators = f"{gpu_name}:{int(float(gpu_qty))}"
 
     # Generate dataset name and S3 paths
     s3_dataset_prefix = dataset_path.parent.name
@@ -123,7 +127,7 @@ def main(cfg: SkyPilotTrainingConfig):
     )
 
     # Generate SkyPilot configuration (single function handles all providers)
-    print(f"[INFO] Generating SkyPilot configuration for {service_provider}/{selected_region}...")
+    print(f"[INFO] Generating SkyPilot configuration for {service_provider}/{selected_region} with {selected_accelerators}...")
     sky_config = generate_sky_config(
         cloud=service_provider,
         dataset_s3_path=dataset_s3_path,
@@ -132,7 +136,7 @@ def main(cfg: SkyPilotTrainingConfig):
         repo_id=repo_id,
         s3_checkpoint_base=cfg.s3_checkpoint_base,
         wandb_api_key=wandb_api_key,
-        accelerators=cfg.accelerators,
+        accelerators=selected_accelerators,
         region=selected_region,
         idle_minutes=cfg.idle_minutes,
         xla_mem_fraction=cfg.xla_mem_fraction,

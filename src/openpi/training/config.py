@@ -603,9 +603,7 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
                         "state": "state",
                         "actions": "actions",
                         "prompt": "prompt",
-                        # rorm_weight is a pre-computed scalar per frame (clip(velocity, 0, inf))
-                        # It flows through as sample_weights for RABC loss weighting
-                        "sample_weights": "rorm_weight",
+                        "rorm_velocity": "rorm_velocity",
                     }
                 )
             ]
@@ -614,12 +612,16 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
         data_transforms = _transforms.Group(
-            inputs=[yam_policy.YamInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            inputs=[
+                _transforms.ComputeRABCWeights(self.rabc_clip_min, self.rabc_clip_max),
+                yam_policy.YamInputs(action_dim=model_config.action_dim, model_type=model_config.model_type),
+            ],
             outputs=[yam_policy.YamOutputs()],
         )
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
+            extra_horizon_keys=("rorm_velocity",),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -662,7 +664,7 @@ class TrainConfig:
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
-    checkpoint_base_dir: str = "/home/yujustin/checkpoints"
+    checkpoint_base_dir: str = "/home/justinyu/checkpoints"
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
@@ -1226,13 +1228,13 @@ _CONFIGS = [
         name="pi0_yam_tshirt_rabc_lora",
         model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotYamRormDataConfig(
-            repo_id="yam_tshirt_rorm_weighted",
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
             default_prompt="Folding tshirt pile and stacking",
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
         ),
-        batch_size=32,
+        batch_size=8,
         num_workers=8,
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=40_000,

@@ -79,7 +79,7 @@ def main(cfg: SkyPilotTrainingConfig):
     # Generate experiment name if not provided
     if not cfg.exp_name:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        cfg.exp_name = f"sky_{dataset_path.name}_{timestamp}"
+        cfg.exp_name = f"sky_{cfg.config_name}_{dataset_path.name}_{timestamp}"
 
     print("[INFO] OpenPI Training Launcher")
     print(f"  Dataset: {dataset_path}")

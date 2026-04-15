@@ -85,10 +85,12 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
                 # Download the data to a local cache.
                 logger.info(f"Downloading {url} to {local_path}")
                 scratch_path = local_path.with_suffix(".partial")
-                # Route openpi-assets through gsutil to avoid gcsfs auth issues with this bucket.
-                # All other gs:// URLs (e.g. big_vision) continue to use gcsfs as normal.
+                # Route openpi-assets through gsutil/awscli to avoid fsspec auth
+                # issues. All other gs:// URLs (e.g. big_vision) use gcsfs.
                 if parsed.scheme == "gs" and parsed.netloc == "openpi-assets":
                     _download_gsutil(url, scratch_path, **kwargs)
+                elif parsed.scheme == "s3":
+                    _download_awscli(url, scratch_path, **kwargs)
                 else:
                     _download_fsspec(url, scratch_path, **kwargs)
 
@@ -116,6 +118,19 @@ def _download_gsutil(url: str, local_path: pathlib.Path, **kwargs) -> None:
     local_path.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["gsutil", "-m", "cp", "-r", f"{url}/*", str(local_path)],
+        check=True,
+    )
+
+
+def _download_awscli(url: str, local_path: pathlib.Path, **kwargs) -> None:
+    """Download a file or directory from S3 using the AWS CLI, falling back to fsspec+s3fs."""
+    if shutil.which("aws") is None:
+        logger.warning("aws CLI not found, falling back to fsspec. This requires s3fs to be installed.")
+        _download_fsspec(url, local_path, **kwargs)
+        return
+    local_path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["aws", "s3", "sync", url, str(local_path)],
         check=True,
     )
 

@@ -4,8 +4,8 @@ Streamlined OpenPI Training Launcher
 
 This script automates the entire training pipeline given a config name:
 1. Upload dataset + norm stats to S3
-2. Generate/update SkyPilot configuration
-3. Launch training job
+2. Generate a single SkyPilot config with multi-cloud auto-failover
+3. Launch one job — SkyPilot handles failover across clouds, regions, and GPU types
 
 Usage:
     uv run sky/launch_training.py --config-name pi0_xmi_rby_low_mem_finetune
@@ -30,18 +30,24 @@ from openpi.utils.sky_utils import (
     upload_dataset_to_s3,
     generate_sky_config,
     launch_training,
-    query_sky_accelerators,
 )
 
 @dataclass
 class SkyPilotTrainingConfig:
     config_name: str
     exp_name: Optional[str] = None
-    service_provider: Optional[List[str]] = field(default_factory=lambda: ["aws"])
+    service_provider: Optional[List[str]] = field(default_factory=lambda: ["aws", "lambda"])
     s3_bucket: str = "s3://xdof-internal-research"
     s3_checkpoint_base: str = "s3://xdof-internal-research/model_ckpts"
-    accelerators: List[str] = field(default_factory=lambda: ["A100-80GB:8"])
-    region: Optional[str] = "us-west-2"  # If None, SkyPilot picks the cheapest available region
+    accelerators: List[str] = field(default_factory=lambda: ["A100-80GB:8", "H100:8", "H200:8"])
+    provider_regions: dict[str, str] = field(default_factory=lambda: {
+        "aws": "us-west-2",
+        #"aws": "us-east-1"
+    })  # Pin specific providers to a region; unpinned providers failover across all regions
+    aws_image_ids: dict[str, str] = field(default_factory=lambda: {
+        "us-west-2": "ami-067cc81f948e50e06",
+        "us-east-1": "ami-0365bff494b18bf93",
+    })
     cluster_name: Optional[str] = None
     disable_wandb: bool = False
     dry_run: bool = False
@@ -80,6 +86,8 @@ def main(cfg: SkyPilotTrainingConfig):
     print(f"  Config: {cfg.config_name}")
     print(f"  Experiment: {cfg.exp_name}")
     print(f"  S3 Bucket: {cfg.s3_bucket}")
+    print(f"  Providers: {cfg.service_provider}")
+    print(f"  Accelerators: {cfg.accelerators}")
     print(f"  Mode: {'managed job (auto-teardown)' if cfg.managed else 'cluster (manual teardown)'}")
     print()
 
@@ -99,22 +107,11 @@ def main(cfg: SkyPilotTrainingConfig):
     if not check_prerequisites():
         sys.exit(1)
 
-    # Query GPU availability across all providers, regions, and accelerator types
-    result = query_sky_accelerators(cfg.accelerators, cfg.service_provider, preferred_region=cfg.region)
-    selected = result['selected']
-    service_provider = selected['CLOUD'].lower()
-    selected_region = selected.get('REGION')
-    # Reconstruct accelerator spec from selected option (e.g. "A100-80GB:8")
-    gpu_name = selected.get('GPU', cfg.accelerators[0].split(':')[0])
-    gpu_qty = selected.get('QTY', cfg.accelerators[0].split(':')[1] if ':' in cfg.accelerators[0] else '8')
-    selected_accelerators = f"{gpu_name}:{int(float(gpu_qty))}"
-
-    # Generate dataset name and S3 paths
+    # Common dataset setup
     s3_dataset_prefix = dataset_path.parent.name
     repo_id = f"{s3_dataset_prefix}/{dataset_path.name}"
 
-    # Resolve norm stats directory: assets_dirs / asset_id
-    # asset_id is typically just the dataset name (no org prefix), unlike repo_id
+    # Resolve norm stats directory
     asset_id = data_config.asset_id or data_config.repo_id
     norm_stats_dir = Path(config.assets_dirs) / asset_id
 
@@ -126,45 +123,53 @@ def main(cfg: SkyPilotTrainingConfig):
         norm_stats_dir,
     )
 
-    # Generate SkyPilot configuration (single function handles all providers)
-    print(f"[INFO] Generating SkyPilot configuration for {service_provider}/{selected_region} with {selected_accelerators}...")
+    # Generate a single SkyPilot config with auto-failover across all
+    # providers, regions, and GPU types. SkyPilot's resources.any_of
+    # handles failover natively — no need for manual race logic.
+    print(f"[INFO] Generating SkyPilot config with auto-failover...")
+    for provider in cfg.service_provider:
+        region = cfg.provider_regions.get(provider, "any")
+        print(f"  - {provider}/{region}: {cfg.accelerators}")
+
     sky_config = generate_sky_config(
-        cloud=service_provider,
+        providers=cfg.service_provider,
+        accelerators=cfg.accelerators,
         dataset_s3_path=dataset_s3_path,
         config_name=cfg.config_name,
         exp_name=cfg.exp_name,
         repo_id=repo_id,
         s3_checkpoint_base=cfg.s3_checkpoint_base,
         wandb_api_key=wandb_api_key,
-        accelerators=selected_accelerators,
-        region=selected_region,
+        provider_regions=cfg.provider_regions,
+        aws_image_ids=cfg.aws_image_ids,
         idle_minutes=cfg.idle_minutes,
         xla_mem_fraction=cfg.xla_mem_fraction,
         managed=cfg.managed,
     )
 
-    # Write config to temporary file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
-        yaml.dump(sky_config, f, default_flow_style=False, sort_keys=False)
-        config_file = Path(f.name)
-
-    print(f"[OK] Configuration saved to: {config_file}")
-
-    if cfg.dry_run:
-        print("[INFO] Dry run complete - not launching training")
-        print(f"  To launch manually, run: sky launch {config_file}")
-        return
-
-    # Launch training
+    config_file = None
     try:
-        launch_training(config_file, cfg.cluster_name, managed=cfg.managed)
-        print(f"[OK] Training checkpoints will be saved to {cfg.s3_checkpoint_base}/{cfg.config_name}/{cfg.exp_name}")
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(sky_config, f, default_flow_style=False, sort_keys=False)
+            config_file = Path(f.name)
+
+        if cfg.dry_run:
+            print("\n[INFO] Dry run — generated config:")
+            print(f"  {config_file}")
+            print(yaml.dump(sky_config, default_flow_style=False, sort_keys=False))
+            return
+
+        launch_training(config_file, cluster_name=cfg.cluster_name, managed=cfg.managed)
+        print(f"[OK] Checkpoints: {cfg.s3_checkpoint_base}/{cfg.config_name}/{cfg.exp_name}")
     except Exception as e:
-        print(f"[ERROR] Training launch failed: {e}")
+        print(f"[ERROR] Launch failed: {e}")
         sys.exit(1)
     finally:
-        if config_file.exists():
-            config_file.unlink()
+        if config_file:
+            try:
+                config_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     cfg = tyro.cli(SkyPilotTrainingConfig)

@@ -4,7 +4,6 @@ Utility functions for OpenPI SkyPilot training launcher.
 """
 
 import subprocess
-import pandas as pd
 from pathlib import Path
 from typing import Optional, List
 
@@ -46,189 +45,6 @@ def check_prerequisites():
 
     return True
 
-
-def parse_sky_gpu_output(output: str) -> pd.DataFrame:
-    """Parse tabular output from sky show-gpus into a pandas DataFrame."""
-    lines = output.strip().split('\n')
-
-    data_rows = []
-    current_headers = None
-    header_positions = None
-
-    for line in lines:
-        if not line.strip():
-            continue
-
-        if line.startswith('GPU'):
-            current_headers = []
-            header_positions = []
-
-            words = line.split()
-            search_pos = 0
-            for word in words:
-                pos = line.find(word, search_pos)
-                current_headers.append(word)
-                header_positions.append(pos)
-                search_pos = pos + len(word)
-
-        elif current_headers and header_positions and not line.startswith('-') and len(line.strip()) > 0:
-            row_data = {}
-
-            for i, header in enumerate(current_headers):
-                if i < len(header_positions):
-                    start_pos = header_positions[i]
-
-                    if i + 1 < len(header_positions):
-                        end_pos = header_positions[i + 1]
-                        value = line[start_pos:end_pos].strip()
-                    else:
-                        value = line[start_pos:].strip()
-
-                    if 'PRICE' in header and value.startswith('$'):
-                        value = value.replace('$', '').replace(',', '').strip()
-
-                    if value == '-':
-                        value = None
-
-                    row_data[header] = value
-
-            if row_data:
-                data_rows.append(row_data)
-
-    return pd.DataFrame(data_rows)
-
-
-def query_sky_accelerators(
-    accelerators: List[str],
-    service_providers: List[str],
-    preferred_region: Optional[str] = None,
-) -> dict:
-    """Query SkyPilot for available GPU options across all providers, regions, and accelerator types.
-
-    Args:
-        accelerators: List of accelerator specs to search, e.g. ["A100-80GB:8", "H100:8"].
-        service_providers: List of cloud providers to search, e.g. ["lambda", "aws"].
-        preferred_region: If set, also query this specific region per provider
-                          (sky show-gpus only returns the cheapest region by default).
-
-    Returns a dict with the user-selected option after displaying all results.
-    Note: ``sky show-gpus`` shows instance types that exist in a region, not
-    real-time availability. Provisioning may still fail if capacity is exhausted.
-    """
-    print(f"[INFO] Checking available providers: {service_providers}")
-
-    query_cmd = f"sky check {' '.join(service_providers)}"
-    result = run_command(query_cmd, capture_output=True)
-
-    available_providers = []
-    for provider in service_providers:
-        if f"{provider}: enabled" in result.stdout.lower():
-            available_providers.append(provider)
-
-    if not available_providers:
-        raise RuntimeError(f"No providers available from {service_providers}")
-
-    print(f"[OK] Available providers: {available_providers}")
-
-    # Query all accelerator types across all providers.
-    # For each combo, query globally (cheapest region) and also the preferred
-    # region specifically, since sky show-gpus only returns one region.
-    all_dataframes = []
-    seen_queries = set()
-
-    for accel in accelerators:
-        for provider in available_providers:
-            # Global query (returns cheapest region)
-            print(f"[INFO] Querying {provider} for {accel} (all regions)...")
-            query_cmd = f"sky show-gpus {accel} --infra {provider}"
-            try:
-                result = run_command(query_cmd, capture_output=True)
-                if result.stdout.strip():
-                    provider_df = parse_sky_gpu_output(result.stdout)
-                    if not provider_df.empty:
-                        all_dataframes.append(provider_df)
-                        print(f"[OK] Found {len(provider_df)} options from {provider}")
-            except Exception as e:
-                print(f"[ERROR] Error querying {provider} for {accel}: {e}")
-
-            # Also query the preferred region specifically
-            if preferred_region:
-                key = (accel, provider, preferred_region)
-                if key not in seen_queries:
-                    seen_queries.add(key)
-                    print(f"[INFO] Querying {provider} for {accel} in {preferred_region}...")
-                    query_cmd = f"sky show-gpus {accel} --infra {provider}/{preferred_region}"
-                    try:
-                        result = run_command(query_cmd, capture_output=True)
-                        if result.stdout.strip():
-                            provider_df = parse_sky_gpu_output(result.stdout)
-                            if not provider_df.empty:
-                                all_dataframes.append(provider_df)
-                                print(f"[OK] Found {len(provider_df)} options from {provider}/{preferred_region}")
-                    except Exception as e:
-                        print(f"[ERROR] Error querying {provider}/{preferred_region} for {accel}: {e}")
-
-    if not all_dataframes:
-        raise RuntimeError(f"No GPU options found for {accelerators} across {available_providers}")
-
-    # Deduplicate rows (same GPU/CLOUD/REGION/INSTANCE_TYPE)
-    df = pd.concat(all_dataframes, ignore_index=True)
-    dedup_cols = [c for c in ['GPU', 'QTY', 'CLOUD', 'REGION', 'INSTANCE_TYPE'] if c in df.columns]
-    if dedup_cols:
-        df = df.drop_duplicates(subset=dedup_cols).reset_index(drop=True)
-
-    df = pd.concat(all_dataframes, ignore_index=True)
-
-    # Normalize price columns
-    if 'HOURLY_SPOT_PRICE' in df.columns:
-        df['HOURLY_SPOT_PRICE'] = pd.to_numeric(df['HOURLY_SPOT_PRICE'], errors='coerce')
-    if 'HOURLY_PRICE' in df.columns:
-        df['HOURLY_PRICE'] = pd.to_numeric(df['HOURLY_PRICE'], errors='coerce')
-
-    # Build a "best price" column: use spot price if available, else on-demand
-    def _best_price(row):
-        spot = row.get('HOURLY_SPOT_PRICE')
-        regular = row.get('HOURLY_PRICE')
-        if pd.notna(spot):
-            return spot
-        return regular
-    df['_BEST_PRICE'] = df.apply(_best_price, axis=1)
-    df_sorted = df.sort_values('_BEST_PRICE', na_position='last').reset_index(drop=True)
-
-    # Display options table
-    print()
-    print(f"  Available options (note: availability is not guaranteed):")
-    print(f"  {'#':<4} {'GPU':<16} {'CLOUD':<10} {'REGION':<22} {'ON-DEMAND':<12} {'SPOT':<12}")
-    print(f"  {'-'*76}")
-    for i, row in df_sorted.iterrows():
-        gpu_label = f"{row.get('GPU', '?')}x{int(float(row.get('QTY', 1)))}"
-        regular = row.get('HOURLY_PRICE')
-        spot = row.get('HOURLY_SPOT_PRICE')
-        regular_str = f"${regular:.2f}" if pd.notna(regular) else "-"
-        spot_str = f"${spot:.2f}" if pd.notna(spot) else "-"
-        print(f"  {i:<4} {gpu_label:<16} {row.get('CLOUD', '?'):<10} {row.get('REGION', '?'):<22} {regular_str:<12} {spot_str:<12}")
-    print()
-
-    # Prompt user to choose
-    default_choice = 0
-    choice = input(f"  Select option [0-{len(df_sorted)-1}] (default: {default_choice}): ").strip()
-    if choice == "":
-        choice = default_choice
-    else:
-        choice = int(choice)
-
-    if choice < 0 or choice >= len(df_sorted):
-        raise ValueError(f"Invalid choice: {choice}")
-
-    selected = df_sorted.iloc[choice].to_dict()
-    price = selected.get('_BEST_PRICE', '?')
-    print(f"[OK] Selected: {selected['CLOUD']} in {selected['REGION']} at ${price}/hr")
-
-    return {
-        'selected': selected,
-        'all_options': list(df_sorted.to_dict('records')),
-        'dataframe': df_sorted,
-    }
 
 
 def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_stats_dir: str) -> str:
@@ -309,12 +125,11 @@ def _build_setup_script() -> str:
     return '\n'.join(lines)
 
 
-def _build_run_script(cloud: str) -> str:
+def _build_run_script() -> str:
     """Build the run script with SkyPilot metadata logging and wandb tagging.
 
-    The ``source /opt/pytorch/bin/activate`` line is only included for AWS,
-    where it is provided by the AWS Deep Learning AMI. Lambda and other
-    providers do not ship this path and the command would fail.
+    Cloud-agnostic: the AWS Deep Learning AMI activation line is always
+    included but uses ``|| true`` so it's a silent no-op on other providers.
     """
     lines = [
         'echo "############################"',
@@ -330,12 +145,9 @@ def _build_run_script(cloud: str) -> str:
         '# Activate environment first so aws/uv are on PATH',
         'conda deactivate 2>/dev/null; conda deactivate 2>/dev/null; true',
         'source .venv/bin/activate',
+        '# AWS Deep Learning AMI PyTorch env (silent no-op on other clouds)',
+        'source /opt/pytorch/bin/activate 2>/dev/null || true',
     ]
-
-    # AWS Deep Learning AMI exposes a PyTorch env at /opt/pytorch/bin/activate.
-    # Lambda (and other providers) do not have this path, so we skip it.
-    if cloud == 'aws':
-        lines.append('source /opt/pytorch/bin/activate 2>/dev/null || true')
 
     lines += [
         '',
@@ -371,53 +183,67 @@ def _build_run_script(cloud: str) -> str:
 
 
 def generate_sky_config(
-    cloud: str,
+    providers: List[str],
+    accelerators: List[str],
     dataset_s3_path: str,
     config_name: str,
     exp_name: str,
     repo_id: str,
     s3_checkpoint_base: str,
     wandb_api_key: Optional[str] = None,
-    accelerators: str = "A100:8",
-    region: Optional[str] = None,
-    image_id: Optional[str] = None,
+    provider_regions: Optional[dict[str, str]] = None,
+    aws_image_ids: Optional[dict[str, str]] = None,
     idle_minutes: int = 10,
     xla_mem_fraction: float = 0.95,
     managed: bool = True,
 ) -> dict:
-    """Generate SkyPilot YAML configuration for any supported cloud provider.
+    """Generate a single SkyPilot YAML with multi-cloud auto-failover.
+
+    Instead of generating separate configs per provider and racing them,
+    this uses SkyPilot's native ``resources.any_of`` to let the scheduler
+    automatically fail over across clouds, regions, and GPU types.
 
     Args:
-        managed: If True (default), the config is intended for ``sky jobs launch``
-                 which auto-tears-down the cluster. Autostop is omitted since
-                 managed jobs handle cleanup. If False, autostop is configured
-                 as a safety net for ``sky launch``.
+        providers: Cloud providers to try, e.g. ["aws", "lambda"].
+        accelerators: GPU specs in preference order, e.g. ["H200:8", "H100:8", "A100-80GB:8"].
+        provider_regions: Optional map pinning providers to a region,
+            e.g. {"aws": "us-west-2"}. Unpinned providers let SkyPilot
+            choose the cheapest available region.
+        aws_image_ids: Map of AWS region to AMI ID for the Deep Learning AMI.
+        managed: If True, config is for ``sky jobs launch`` (auto-teardown).
     """
+    provider_regions = provider_regions or {}
     checkpoint_path = f"{s3_checkpoint_base}/{config_name}/{exp_name}"
     wandb_mode_arg = "" if wandb_api_key else "WANDB_MODE=disabled "
 
-    # Secrets block keeps sensitive values redacted in `sky status` / dashboard
     secrets = {}
     if wandb_api_key:
         secrets['WANDB_API_KEY'] = wandb_api_key
 
-    resources = {
-        'cloud': cloud,
-        'accelerators': accelerators,
-    }
+    # Build one resource candidate per provider. SkyPilot's any_of will
+    # try each and auto-failover across regions within each cloud.
+    candidates = []
+    for provider in providers:
+        region = provider_regions.get(provider)
+        infra = f"{provider}/{region}" if region else provider
 
-    # Only pin region if explicitly specified; otherwise SkyPilot picks
-    # the cheapest available region automatically.
-    if region:
-        resources['region'] = region
-
-    # Managed jobs (sky jobs launch) auto-teardown on completion and don't
-    # support the autostop field. Only add autostop for sky launch mode as
-    # a safety net against leaked instances.
-    if not managed:
-        resources['autostop'] = {
-            'down': True,
+        entry = {
+            'infra': infra,
+            'accelerators': accelerators,
         }
+
+        if provider == 'aws' and aws_image_ids:
+            if region and region in aws_image_ids:
+                entry['image_id'] = aws_image_ids[region]
+            elif not region:
+                entry['image_id'] = aws_image_ids
+
+        candidates.append(entry)
+
+    if len(candidates) == 1:
+        resources = candidates[0]
+    else:
+        resources = {'any_of': candidates}
 
     config = {
         'workdir': '.',
@@ -434,14 +260,11 @@ def generate_sky_config(
         'resources': resources,
         'num_nodes': 1,
         'setup': _build_setup_script(),
-        'run': _build_run_script(cloud),
+        'run': _build_run_script(),
     }
 
     if secrets:
         config['secrets'] = secrets
-
-    if cloud == 'aws' and image_id:
-        config['resources']['image_id'] = image_id
 
     return config
 
@@ -491,3 +314,5 @@ def launch_training(config_file: Path, cluster_name: Optional[str] = None, manag
             # Use check=False because sky jobs logs returns non-zero if the
             # job fails, but we still want to see the output.
             run_command(f"sky jobs logs {job_id}", check=False)
+
+

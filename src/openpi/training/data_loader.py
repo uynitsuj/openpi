@@ -39,7 +39,13 @@ def _patched_decode_video_frames_torchcodec(video_path, timestamps, tolerance_s,
     num_frames = metadata.num_frames
 
     # Clamp frame indices to valid range [0, num_frames - 1].
-    frame_indices = [min(round(ts * average_fps), num_frames - 1) for ts in timestamps]
+    # Track which timestamps were clamped (past video end) so we can
+    # exempt them from the tolerance check — returning the last frame
+    # is the best we can do for those.
+    max_frame = num_frames - 1
+    raw_indices = [round(ts * average_fps) for ts in timestamps]
+    was_clamped = [idx > max_frame for idx in raw_indices]
+    frame_indices = [min(idx, max_frame) for idx in raw_indices]
 
     frames_batch = decoder.get_frames_at(indices=frame_indices)
 
@@ -57,7 +63,9 @@ def _patched_decode_video_frames_torchcodec(video_path, timestamps, tolerance_s,
     dist = torch.cdist(query_ts[:, None], loaded_ts_t[:, None], p=1)
     min_, argmin_ = dist.min(1)
 
-    is_within_tol = min_ < tolerance_s
+    # Only enforce tolerance for non-clamped timestamps.
+    clamped_mask = torch.tensor(was_clamped)
+    is_within_tol = (min_ < tolerance_s) | clamped_mask
     assert is_within_tol.all(), (
         f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
         "It means that the closest frame that can be loaded from the video is too far away in time."

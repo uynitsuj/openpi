@@ -681,6 +681,9 @@ class TrainConfig:
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
+    # If set, each checkpoint step is synced to this S3 path via ``aws s3 sync``.
+    s3_checkpoint_path: str | None = None
+
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
     # If true, will resume training from the last checkpoint.

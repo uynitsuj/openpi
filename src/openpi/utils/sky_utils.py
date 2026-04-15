@@ -220,25 +220,27 @@ def generate_sky_config(
     if wandb_api_key:
         secrets['WANDB_API_KEY'] = wandb_api_key
 
-    # Build one resource candidate per provider. SkyPilot's any_of will
-    # try each and auto-failover across regions within each cloud.
+    # Build one resource candidate per (provider, accelerator) pair.
+    # Within any_of entries, accelerators must be a single string.
+    # SkyPilot picks the cheapest available and auto-fails-over.
     candidates = []
     for provider in providers:
         region = provider_regions.get(provider)
         infra = f"{provider}/{region}" if region else provider
 
-        entry = {
-            'infra': infra,
-            'accelerators': accelerators,
-        }
+        for accel in accelerators:
+            entry = {
+                'infra': infra,
+                'accelerators': accel,
+            }
 
-        if provider == 'aws' and aws_image_ids:
-            if region and region in aws_image_ids:
-                entry['image_id'] = aws_image_ids[region]
-            elif not region:
-                entry['image_id'] = aws_image_ids
+            if provider == 'aws' and aws_image_ids:
+                if region and region in aws_image_ids:
+                    entry['image_id'] = aws_image_ids[region]
+                elif not region:
+                    entry['image_id'] = aws_image_ids
 
-        candidates.append(entry)
+            candidates.append(entry)
 
     if len(candidates) == 1:
         resources = candidates[0]
@@ -269,27 +271,30 @@ def generate_sky_config(
     return config
 
 
-def _get_latest_job_id() -> Optional[str]:
-    """Get the job ID of the most recently submitted managed job."""
-    try:
-        result = subprocess.run(
-            "sky jobs queue | tail -n +2 | head -1 | awk '{print $1}'",
-            shell=True, capture_output=True, text=True, check=True,
-        )
-        job_id = result.stdout.strip()
-        return job_id if job_id.isdigit() else None
-    except subprocess.CalledProcessError:
-        return None
+def _parse_job_id_from_output(output: str) -> Optional[str]:
+    """Extract the managed job ID from ``sky jobs launch`` output.
+
+    Looks for patterns like ``sky jobs logs 219`` or ``Job ID: 219`` in the
+    output to reliably capture the ID without a separate queue query.
+    """
+    import re
+    # sky jobs launch prints hints like: "sky jobs logs <id>"
+    match = re.search(r'sky jobs logs\s+(?:--controller\s+)?(\d+)', output)
+    if match:
+        return match.group(1)
+    # Fallback: "Job ID: <id>" or "Managed job ID: <id>"
+    match = re.search(r'[Jj]ob ID:\s*(\d+)', output)
+    if match:
+        return match.group(1)
+    return None
 
 
 def launch_training(config_file: Path, cluster_name: Optional[str] = None, managed: bool = False):
     """Launch the training job using SkyPilot.
 
-    Args:
-        config_file: Path to the SkyPilot YAML config.
-        cluster_name: Optional cluster name.
-        managed: If True, use ``sky jobs launch`` for guaranteed auto-teardown
-                 on completion. Recommended to prevent leaked GPU instances.
+    For managed jobs, streams the launch output (provisioning/setup) to the
+    terminal, parses the job ID, then tails the actual task logs so the user
+    sees training output without having to run ``sky jobs logs`` manually.
     """
     if managed:
         print(f"[INFO] Launching managed job with config: {config_file}")
@@ -302,17 +307,37 @@ def launch_training(config_file: Path, cluster_name: Optional[str] = None, manag
         if cluster_name:
             launch_cmd += f" --cluster-name {cluster_name}"
 
-    run_command(launch_cmd)
+    if not managed:
+        run_command(launch_cmd)
+        print("[OK] Training job launched successfully!")
+        return
+
+    # For managed jobs: tee the launch output to the terminal while
+    # capturing it so we can parse the job ID for log tailing.
+    print(f"[RUN] {launch_cmd}")
+    captured_lines = []
+    proc = subprocess.Popen(
+        launch_cmd, shell=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    for line in proc.stdout:
+        print(line, end='', flush=True)
+        captured_lines.append(line)
+    proc.wait()
+
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, launch_cmd)
+
     print("[OK] Training job launched successfully!")
 
-    # For managed jobs, tail the job logs so they stream to this terminal.
-    # This blocks until the job finishes (Ctrl+C detaches without cancelling).
-    if managed:
-        job_id = _get_latest_job_id()
-        if job_id:
-            print(f"[INFO] Streaming logs for managed job {job_id} (Ctrl+C to detach)...")
-            # Use check=False because sky jobs logs returns non-zero if the
-            # job fails, but we still want to see the output.
-            run_command(f"sky jobs logs {job_id}", check=False)
+    # Parse job ID from the launch output, then stream the task logs.
+    output = ''.join(captured_lines)
+    job_id = _parse_job_id_from_output(output)
+    if job_id:
+        print(f"[INFO] Streaming task logs for job {job_id} (Ctrl+C to detach)...")
+        run_command(f"sky jobs logs {job_id}", check=False)
+    else:
+        print("[WARN] Could not parse job ID from launch output. "
+              "Run 'sky jobs logs <id>' manually to view training logs.")
 
 

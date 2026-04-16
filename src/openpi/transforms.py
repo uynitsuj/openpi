@@ -108,12 +108,18 @@ class ComputeRABCWeights(DataTransformFn):
     Integrates velocity over the action horizon (area under curve),
     normalizes by horizon length, and clips to [clip_min, clip_max].
 
+    When ``threshold`` is set, samples with integrated weight below the
+    threshold are zeroed out instead of being clipped to ``clip_min``.
+    Samples at or above the threshold keep their integrated weight
+    (still clipped to ``clip_max``).
+
     Expects `rorm_velocity` in the data dict as shape (action_horizon,).
     Produces `sample_weights` as a scalar float.
     """
 
     clip_min: float = 0.0
     clip_max: float = 1.0
+    threshold: float | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
         if "rorm_velocity" not in data:
@@ -121,8 +127,12 @@ class ComputeRABCWeights(DataTransformFn):
         vel = np.asarray(data["rorm_velocity"], dtype=np.float32)
         # Integrate velocity over the action horizon and normalize
         weight = float(np.sum(vel) / max(len(vel), 1))
-        # Clip to range
-        weight = float(np.clip(weight, self.clip_min, self.clip_max))
+        if self.threshold is not None:
+            # Hard threshold: zero out samples below, keep integrated weight above.
+            weight = 0.0 if weight < self.threshold else float(np.clip(weight, None, self.clip_max))
+        else:
+            # Original behaviour: clip to range.
+            weight = float(np.clip(weight, self.clip_min, self.clip_max))
         data = {**data, "sample_weights": np.float32(weight)}
         # Remove raw velocity from dict (not needed downstream)
         data.pop("rorm_velocity", None)

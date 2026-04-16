@@ -590,6 +590,7 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
     default_prompt: str | None = None
     rabc_clip_min: float = 0.0
     rabc_clip_max: float = 1.0
+    rabc_threshold: float | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -613,7 +614,7 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
 
         data_transforms = _transforms.Group(
             inputs=[
-                _transforms.ComputeRABCWeights(self.rabc_clip_min, self.rabc_clip_max),
+                _transforms.ComputeRABCWeights(self.rabc_clip_min, self.rabc_clip_max, threshold=self.rabc_threshold),
                 yam_policy.YamInputs(action_dim=model_config.action_dim, model_type=model_config.model_type),
             ],
             outputs=[yam_policy.YamOutputs()],
@@ -1208,6 +1209,171 @@ _CONFIGS = [
         num_train_steps=40_000,
         rabc_enabled=True,
     ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_thresh_none_clip_none",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_threshold=None,
+            rabc_clip_max=None,
+            rabc_clip_min=None,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_thresh_0_25_clip_max_6_0",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_threshold=0.25, # oopsies was actually 0.2 during training
+            rabc_clip_max=6.0
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_thresh_0_50_clip_max_6_0",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_threshold=0.5,
+            rabc_clip_max=6.0
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_thresh_0_75_clip_max_6_0",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_threshold=0.75,
+            rabc_clip_max=6.0
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_thresh_1_00_clip_max_6_0",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_threshold=1.0,
+            rabc_clip_max=6.0
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+    ),
+
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_clip_min_0_25_clip_max_6_0",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_clip_min=0.25,
+            rabc_clip_max=6.0
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_clip_min_0_50_clip_max_6_0",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_threshold=0.5,
+            rabc_clip_max=6.0
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_clip_min_0_75_clip_max_6_0",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_threshold=0.75,
+            rabc_clip_max=6.0
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_clip_min_1_00_clip_max_6_0",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_threshold=1.0,
+            rabc_clip_max=6.0
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+    ),
+
     TrainConfig(
         name="pi0_yam_tshirt_no_rabc",
         model=pi0_config.Pi0Config(action_horizon=30),

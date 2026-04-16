@@ -679,9 +679,9 @@ class TrainConfig:
     # How often (in steps) to log training metrics.
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
-    save_interval: int = 1000
+    save_interval: int = 10000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
-    keep_period: int | None = 5000
+    keep_period: int | None = 10000
 
     # If set, each checkpoint step is synced to this S3 path via ``aws s3 sync``.
     s3_checkpoint_path: str | None = None

@@ -104,14 +104,23 @@ def _build_setup_script() -> str:
         'echo "[SETUP] Setting up openpi"',
         'conda deactivate 2>/dev/null; conda deactivate 2>/dev/null; true',
         '',
-        '# System dependencies',
-        'apt-get update && apt-get install -y git curl pkg-config software-properties-common awscli',
+        '# Use sudo when available but still work on root-runner images.',
+        'if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi',
+        'export DEBIAN_FRONTEND=noninteractive',
         '',
-        '# Install FFmpeg 7 dev libs (required by av>=14 sdist build and torchcodec)',
-        '# Ubuntu default repos only have FFmpeg 6; use the PPA for FFmpeg 7.',
-        'add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg7',
-        'apt-get update',
-        'apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavdevice-dev libavutil-dev libavfilter-dev libswscale-dev libswresample-dev',
+        '# System dependencies',
+        '$SUDO apt-get update && $SUDO apt-get install -y git curl pkg-config software-properties-common awscli',
+        '',
+        '# Install FFmpeg runtime/dev libs for torchcodec. Prefer FFmpeg 7, but',
+        '# fall back to the distro packages if the PPA is unavailable.',
+        'if $SUDO add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg7; then',
+        '  $SUDO apt-get update',
+        'else',
+        '  echo "[SETUP] FFmpeg 7 PPA unavailable; falling back to distro FFmpeg packages"',
+        'fi',
+        '$SUDO apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavdevice-dev libavutil-dev libavfilter-dev libswscale-dev libswresample-dev',
+        '$SUDO ldconfig || true',
+        'ffmpeg -version',
         '',
         '# Install uv and set up Python environment',
         'curl -LsSf https://astral.sh/uv/install.sh | sh',
@@ -339,5 +348,4 @@ def launch_training(config_file: Path, cluster_name: Optional[str] = None, manag
     else:
         print("[WARN] Could not parse job ID from launch output. "
               "Run 'sky jobs logs <id>' manually to view training logs.")
-
 

@@ -1419,6 +1419,196 @@ _CONFIGS = [
         ema_decay=None,
     ),
     #
+    # LoRA variants of the clip_min/clip_max RABC sweep. Data configs mirror the
+    # non-LoRA originals above; only the model/freeze_filter/batch_size/ema_decay
+    # differ to match the `pi0_yam_tshirt_rabc_lora` template.
+    #
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_clip_min_0_00_clip_max_1_5_lora",
+        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_threshold=None,
+            rabc_clip_min=0.0,
+            rabc_clip_max=1.5,
+        ),
+        batch_size=8,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=60_000,
+        rabc_enabled=True,
+        save_interval=20000,
+        keep_period=20000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_clip_min_0_25_clip_max_1_5_lora",
+        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_clip_min=0.25,
+            rabc_clip_max=1.5,
+        ),
+        batch_size=8,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=60_000,
+        rabc_enabled=True,
+        save_interval=20000,
+        keep_period=20000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_clip_min_0_50_clip_max_1_5_lora",
+        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_clip_min=0.5,
+            rabc_clip_max=1.5,
+        ),
+        batch_size=8,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+        save_interval=20000,
+        keep_period=20000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_clip_min_0_75_clip_max_1_5_lora",
+        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_clip_min=0.75,
+            rabc_clip_max=1.5,
+        ),
+        batch_size=8,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=60_000,
+        rabc_enabled=True,
+        save_interval=20000,
+        keep_period=20000,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_clip_min_0_25_clip_max_6_0_lora",
+        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_clip_min=0.25,
+            rabc_clip_max=6.0,
+        ),
+        batch_size=8,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_clip_min_0_50_clip_max_6_0_lora",
+        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_threshold=0.5,
+            rabc_clip_max=6.0,
+        ),
+        batch_size=8,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_clip_min_0_75_clip_max_6_0_lora",
+        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_threshold=0.75,
+            rabc_clip_max=6.0,
+        ),
+        batch_size=8,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_clip_min_1_00_clip_max_6_0_lora",
+        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamRormDataConfig(
+            repo_id="uynitsuj/yam_tshirt_rorm_weighted",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_threshold=1.0,
+            rabc_clip_max=6.0,
+        ),
+        batch_size=8,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=40_000,
+        rabc_enabled=True,
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
     # Pi0.5 RABC / AWR weighted YAM tshirt folding configs.
     #
     TrainConfig(

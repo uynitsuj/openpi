@@ -18,6 +18,7 @@ class EnvMode(enum.Enum):
     ALOHA_SIM = "aloha_sim"
     DROID = "droid"
     LIBERO = "libero"
+    YAM = "yam"
 
 
 @dataclasses.dataclass
@@ -28,6 +29,13 @@ class Checkpoint:
     config: str
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
+
+
+@dataclasses.dataclass
+class NamedCheckpoint:
+    """Load a preset checkpoint by short name (see NAMED_CHECKPOINTS)."""
+
+    name: str
 
 
 @dataclasses.dataclass
@@ -47,12 +55,53 @@ class Args:
     default_prompt: str | None = None
 
     # Port to serve the policy on.
-    port: int = 8000
+    port: int = 8012
     # Record the policy's behavior for debugging.
     record: bool = False
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
-    policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
+    policy: Checkpoint | NamedCheckpoint | Default = dataclasses.field(default_factory=Default)
+
+
+# Named presets for frequently-served checkpoints. Select via `--policy named --policy.name <key>`.
+NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
+    "yam_no_rabc_39k": Checkpoint(
+        config="pi0_yam_tshirt_no_rabc",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999",
+    ),
+    "yam_rabc_1k": Checkpoint(
+        config="pi0_yam_tshirt_rabc",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc/sky_pi0_yam_tshirt_rabc_yam_tshirt_rorm_weighted_20260415_090157/1000",
+    ),
+    "yam_rabc_11k_a": Checkpoint(
+        config="pi0_yam_tshirt_rabc",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc/sky_pi0_yam_tshirt_rabc_yam_tshirt_rorm_weighted_20260415_111935/11000",
+    ),
+    "yam_rabc_11k_b": Checkpoint(
+        config="pi0_yam_tshirt_rabc",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc/sky_pi0_yam_tshirt_rabc_yam_tshirt_rorm_weighted_20260415_115838/11000",
+    ),
+    "yam_rabc_30k": Checkpoint(
+        config="pi0_yam_tshirt_rabc",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc/sky_pi0_yam_tshirt_rabc_yam_tshirt_rorm_weighted_20260415_174132/30000",
+    ),
+    "yam_rabc_thresh1_clip6_39k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_1_00_clip_max_6_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_1_00_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_1_00_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_183732/39999",
+    ),
+    "yam_rabc_thresh0_25_clip6_39k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_0_25_clip_max_6_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_25_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_0_25_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_184347/39999",
+    ),
+    "yam_rabc_thresh0_50_clip6_39k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_0_50_clip_max_6_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_50_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_0_50_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_184251/39999",
+    ),
+    "yam_rabc_thresh0_75_clip6_30k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_0_75_clip_max_6_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_75_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_0_75_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_184228/30000",
+    ),
+}
 
 
 # Default checkpoints that should be used for each environment.
@@ -73,6 +122,7 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
         config="pi05_libero",
         dir="gs://openpi-assets/checkpoints/pi05_libero",
     ),
+    EnvMode.YAM: NAMED_CHECKPOINTS["yam_no_rabc_39k"],
 }
 
 
@@ -91,6 +141,16 @@ def create_policy(args: Args) -> _policy.Policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
                 _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+            )
+        case NamedCheckpoint():
+            if args.policy.name not in NAMED_CHECKPOINTS:
+                raise ValueError(
+                    f"Unknown named checkpoint: {args.policy.name!r}. "
+                    f"Available: {sorted(NAMED_CHECKPOINTS)}"
+                )
+            ckpt = NAMED_CHECKPOINTS[args.policy.name]
+            return _policy_config.create_trained_policy(
+                _config.get_config(ckpt.config), ckpt.dir, default_prompt=args.default_prompt
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

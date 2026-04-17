@@ -1210,7 +1210,7 @@ _CONFIGS = [
         rabc_enabled=True,
     ),
     TrainConfig(
-        name="pi0_yam_tshirt_rabc_thresh_none_clip_none",
+        name="pi0_yam_tshirt_rabc_clip_min_0_00_clip_max_1_5",
         model=pi0_config.Pi0Config(action_horizon=30),
         data=LeRobotYamRormDataConfig(
             repo_id="uynitsuj/yam_tshirt_rorm_weighted",
@@ -1219,17 +1219,19 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
             rabc_threshold=None,
-            rabc_clip_max=None,
-            rabc_clip_min=None,
+            rabc_clip_min=0.0,
+            rabc_clip_max=1.5,
         ),
         batch_size=32,
         num_workers=8,
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
+        save_interval = 20000,
+        keep_period = 20000,
     ),
     TrainConfig(
-        name="pi0_yam_tshirt_rabc_thresh_0_25_clip_max_6_0",
+        name="pi0_yam_tshirt_rabc_clip_min_0_25_clip_max_1_5",
         model=pi0_config.Pi0Config(action_horizon=30),
         data=LeRobotYamRormDataConfig(
             repo_id="uynitsuj/yam_tshirt_rorm_weighted",
@@ -1237,17 +1239,19 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
-            rabc_threshold=0.25, # oopsies was actually 0.2 during training
-            rabc_clip_max=6.0
+            rabc_clip_min=0.25,
+            rabc_clip_max=1.5
         ),
         batch_size=32,
         num_workers=8,
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=40_000,
+        num_train_steps=60_000,
         rabc_enabled=True,
+        save_interval = 20000,
+        keep_period = 20000,
     ),
     TrainConfig(
-        name="pi0_yam_tshirt_rabc_thresh_0_50_clip_max_6_0",
+        name="pi0_yam_tshirt_rabc_clip_min_0_50_clip_max_1_5",
         model=pi0_config.Pi0Config(action_horizon=30),
         data=LeRobotYamRormDataConfig(
             repo_id="uynitsuj/yam_tshirt_rorm_weighted",
@@ -1255,17 +1259,19 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
-            rabc_threshold=0.5,
-            rabc_clip_max=6.0
+            rabc_clip_min=0.5,
+            rabc_clip_max=1.5
         ),
         batch_size=32,
         num_workers=8,
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
+        save_interval = 20000,
+        keep_period = 20000,
     ),
     TrainConfig(
-        name="pi0_yam_tshirt_rabc_thresh_0_75_clip_max_6_0",
+        name="pi0_yam_tshirt_rabc_clip_min_0_75_clip_max_1_5",
         model=pi0_config.Pi0Config(action_horizon=30),
         data=LeRobotYamRormDataConfig(
             repo_id="uynitsuj/yam_tshirt_rorm_weighted",
@@ -1273,14 +1279,16 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
-            rabc_threshold=0.75,
-            rabc_clip_max=6.0
+            rabc_clip_min=0.75,
+            rabc_clip_max=1.5
         ),
         batch_size=32,
         num_workers=8,
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=40_000,
+        num_train_steps=60_000,
         rabc_enabled=True,
+        save_interval = 20000,
+        keep_period = 20000,
     ),
     TrainConfig(
         name="pi0_yam_tshirt_rabc_thresh_1_00_clip_max_6_0",
@@ -1297,7 +1305,7 @@ _CONFIGS = [
         batch_size=32,
         num_workers=8,
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=40_000,
+        num_train_steps=60_000,
         rabc_enabled=True,
     ),
 

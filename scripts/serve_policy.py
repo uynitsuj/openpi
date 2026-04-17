@@ -89,6 +89,18 @@ NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
         config="pi0_yam_tshirt_rabc_thresh_1_00_clip_max_6_0",
         dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_1_00_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_1_00_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_183732/39999",
     ),
+    "yam_rabc_thresh0_25_clip6_39k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_0_25_clip_max_6_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_25_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_0_25_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_184347/39999",
+    ),
+    "yam_rabc_thresh0_50_clip6_39k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_0_50_clip_max_6_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_50_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_0_50_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_184251/39999",
+    ),
+    "yam_rabc_thresh0_75_clip6_30k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_0_75_clip_max_6_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_75_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_0_75_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_184228/30000",
+    ),
 }
 
 

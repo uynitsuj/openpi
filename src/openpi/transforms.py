@@ -105,13 +105,20 @@ class RepackTransform(DataTransformFn):
 class ComputeRABCWeights(DataTransformFn):
     """Compute per-sample RABC weights from rorm_velocity.
 
-    Integrates velocity over the action horizon (area under curve),
+    Default mode integrates velocity over the action horizon (area under curve),
     normalizes by horizon length, and clips to [clip_min, clip_max].
 
     When ``threshold`` is set, samples with integrated weight below the
     threshold are zeroed out instead of being clipped to ``clip_min``.
     Samples at or above the threshold keep their integrated weight
     (still clipped to ``clip_max``).
+
+    When ``use_final_action_condition`` is True, skips integration and instead
+    keeps the sample iff either of these holds at the final action in the chunk:
+      1. velocity is positive AND dv/dt is positive (accelerating upward), OR
+      2. velocity is above ``threshold``.
+    Kept samples get weight = clip(vel[-1], None, clip_max); rejected samples
+    get weight = 0. ``threshold`` must be set in this mode.
 
     Expects `rorm_velocity` in the data dict as shape (action_horizon,).
     Produces `sample_weights` as a scalar float.
@@ -120,19 +127,29 @@ class ComputeRABCWeights(DataTransformFn):
     clip_min: float = 0.0
     clip_max: float = 1.0
     threshold: float | None = None
+    use_final_action_condition: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         if "rorm_velocity" not in data:
             return data
         vel = np.asarray(data["rorm_velocity"], dtype=np.float32)
-        # Integrate velocity over the action horizon and normalize
-        weight = float(np.sum(vel) / max(len(vel), 1))
-        if self.threshold is not None:
-            # Hard threshold: zero out samples below, keep integrated weight above.
-            weight = 0.0 if weight < self.threshold else float(np.clip(weight, None, self.clip_max))
+        if self.use_final_action_condition:
+            if self.threshold is None:
+                raise ValueError("use_final_action_condition=True requires `threshold` to be set.")
+            final_vel = float(vel[-1])
+            dv_dt = float(vel[-1] - vel[-2]) if len(vel) >= 2 else 0.0
+            cond_accel = final_vel > 0.0 and dv_dt > 0.0
+            cond_above = final_vel > self.threshold
+            weight = float(np.clip(final_vel, None, self.clip_max)) if (cond_accel or cond_above) else 0.0
         else:
-            # Original behaviour: clip to range.
-            weight = float(np.clip(weight, self.clip_min, self.clip_max))
+            # Integrate velocity over the action horizon and normalize
+            weight = float(np.sum(vel) / max(len(vel), 1))
+            if self.threshold is not None:
+                # Hard threshold: zero out samples below, keep integrated weight above.
+                weight = 0.0 if weight < self.threshold else float(np.clip(weight, None, self.clip_max))
+            else:
+                # Original behaviour: clip to range.
+                weight = float(np.clip(weight, self.clip_min, self.clip_max))
         data = {**data, "sample_weights": np.float32(weight)}
         # Remove raw velocity from dict (not needed downstream)
         data.pop("rorm_velocity", None)

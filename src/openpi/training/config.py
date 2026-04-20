@@ -1438,7 +1438,7 @@ _CONFIGS = [
         ),
         batch_size=8,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/home/justinyu/checkpoints/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=60_000,
         rabc_enabled=True,
         save_interval=20000,

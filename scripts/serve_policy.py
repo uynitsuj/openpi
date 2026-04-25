@@ -29,6 +29,8 @@ class Checkpoint:
     config: str
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
+    # Default prompt to use when the data does not carry one. Overridden by --default_prompt.
+    default_prompt: str | None = None
 
 
 @dataclasses.dataclass
@@ -68,38 +70,72 @@ NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
     "yam_no_rabc_39k": Checkpoint(
         config="pi0_yam_tshirt_no_rabc",
         dir="/home/justinyu/checkpoints/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999",
+        default_prompt="Folding tshirt pile and stacking",
     ),
     "yam_rabc_1k": Checkpoint(
         config="pi0_yam_tshirt_rabc",
         dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc/sky_pi0_yam_tshirt_rabc_yam_tshirt_rorm_weighted_20260415_090157/1000",
+        default_prompt="Folding tshirt pile and stacking",
     ),
     "yam_rabc_11k_a": Checkpoint(
         config="pi0_yam_tshirt_rabc",
         dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc/sky_pi0_yam_tshirt_rabc_yam_tshirt_rorm_weighted_20260415_111935/11000",
+        default_prompt="Folding tshirt pile and stacking",
     ),
     "yam_rabc_11k_b": Checkpoint(
         config="pi0_yam_tshirt_rabc",
         dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc/sky_pi0_yam_tshirt_rabc_yam_tshirt_rorm_weighted_20260415_115838/11000",
+        default_prompt="Folding tshirt pile and stacking",
     ),
     "yam_rabc_30k": Checkpoint(
         config="pi0_yam_tshirt_rabc",
         dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc/sky_pi0_yam_tshirt_rabc_yam_tshirt_rorm_weighted_20260415_174132/30000",
+        default_prompt="Folding tshirt pile and stacking",
     ),
     "yam_rabc_thresh1_clip6_39k": Checkpoint(
         config="pi0_yam_tshirt_rabc_thresh_1_00_clip_max_6_0",
         dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_1_00_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_1_00_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_183732/39999",
+        default_prompt="Folding tshirt pile and stacking",
     ),
     "yam_rabc_thresh0_25_clip6_39k": Checkpoint(
         config="pi0_yam_tshirt_rabc_thresh_0_25_clip_max_6_0",
         dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_25_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_0_25_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_184347/39999",
+        default_prompt="Folding tshirt pile and stacking",
     ),
     "yam_rabc_thresh0_50_clip6_39k": Checkpoint(
         config="pi0_yam_tshirt_rabc_thresh_0_50_clip_max_6_0",
         dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_50_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_0_50_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_184251/39999",
+        default_prompt="Folding tshirt pile and stacking",
     ),
     "yam_rabc_thresh0_75_clip6_30k": Checkpoint(
         config="pi0_yam_tshirt_rabc_thresh_0_75_clip_max_6_0",
         dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_75_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_0_75_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_184228/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_clipmin0_25_clip1_5_59k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_clip_min_0_25_clip_max_1_5",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_clip_min_0_25_clip_max_1_5/sky_pi0_yam_tshirt_rabc_clip_min_0_25_clip_max_1_5_yam_tshirt_rorm_weighted_20260416_193041/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_clipmin0_50_clip1_5_39k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_clip_min_0_50_clip_max_1_5",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_clip_min_0_50_clip_max_1_5/sky_pi0_yam_tshirt_rabc_clip_min_0_50_clip_max_1_5_yam_tshirt_rorm_weighted_20260416_193043/39999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_clipmin0_75_clip1_5_59k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_clip_min_0_75_clip_max_1_5",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_clip_min_0_75_clip_max_1_5/sky_pi0_yam_tshirt_rabc_clip_min_0_75_clip_max_1_5_yam_tshirt_rorm_weighted_20260416_235224/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_thresh0_50_clip1_0_30k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_0_50_clip_max_1_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_50_clip_max_1_0/sky_pi0_yam_tshirt_rabc_thresh_0_50_clip_max_1_0_yam_tshirt_rorm_weighted_20260417_015259/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_thresh0_80_clip1_0_30k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_0_80_clip_max_1_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_80_clip_max_1_0/sky_pi0_yam_tshirt_rabc_thresh_0_80_clip_max_1_0_yam_tshirt_rorm_weighted_20260417_090709/30000",
+        default_prompt="Folding tshirt pile and stacking",
     ),
 }
 
@@ -140,7 +176,9 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt or args.policy.default_prompt,
             )
         case NamedCheckpoint():
             if args.policy.name not in NAMED_CHECKPOINTS:
@@ -150,7 +188,9 @@ def create_policy(args: Args) -> _policy.Policy:
                 )
             ckpt = NAMED_CHECKPOINTS[args.policy.name]
             return _policy_config.create_trained_policy(
-                _config.get_config(ckpt.config), ckpt.dir, default_prompt=args.default_prompt
+                _config.get_config(ckpt.config),
+                ckpt.dir,
+                default_prompt=args.default_prompt or ckpt.default_prompt,
             )
         case Default():
             return create_default_policy(args.env, default_prompt=args.default_prompt)

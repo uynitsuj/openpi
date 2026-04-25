@@ -103,15 +103,23 @@ class RepackTransform(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class ComputeRABCWeights(DataTransformFn):
-    """Compute per-sample RABC weights from rorm_velocity.
+    """Compute per-sample RABC weights from rorm_velocity (and optionally rorm_q).
 
-    Default mode integrates velocity over the action horizon (area under curve),
-    normalizes by horizon length, and clips to [clip_min, clip_max].
+    Velocity weight: v_weight = clip(mean(rorm_velocity over chunk), clip_min, clip_max)
 
-    When ``threshold`` is set, samples with integrated weight below the
-    threshold are zeroed out instead of being clipped to ``clip_min``.
-    Samples at or above the threshold keep their integrated weight
-    (still clipped to ``clip_max``).
+    When q_min/q_max are provided, also normalizes rorm_q:
+      q_norm = clip((rorm_q - q_min) / (q_max - q_min), 0, 1)
+
+    Combined per ``mode``:
+      "velocity_only"  (default): w = v_weight
+      "multiplicative":           w = v_weight * q_norm
+      "additive":                 w = 0.5 * (v_weight + q_norm)
+
+    Legacy velocity-only modes (threshold / use_final_action_condition) still
+    work when mode="velocity_only".
+
+    When ``threshold`` is set and mode="velocity_only", samples with integrated
+    weight below the threshold are zeroed out instead of clipped to clip_min.
 
     When ``use_final_action_condition`` is True, skips integration and instead
     keeps the sample iff either of these holds at the final action in the chunk:
@@ -128,6 +136,9 @@ class ComputeRABCWeights(DataTransformFn):
     clip_max: float = 1.0
     threshold: float | None = None
     use_final_action_condition: bool = False
+    mode: str = "velocity_only"
+    q_min: float | None = None
+    q_max: float | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
         if "rorm_velocity" not in data:
@@ -142,17 +153,32 @@ class ComputeRABCWeights(DataTransformFn):
             cond_above = final_vel > self.threshold
             weight = float(np.clip(final_vel, None, self.clip_max)) if (cond_accel or cond_above) else 0.0
         else:
-            # Integrate velocity over the action horizon and normalize
             weight = float(np.sum(vel) / max(len(vel), 1))
             if self.threshold is not None:
-                # Hard threshold: zero out samples below, keep integrated weight above.
                 weight = 0.0 if weight < self.threshold else float(np.clip(weight, None, self.clip_max))
             else:
-                # Original behaviour: clip to range.
                 weight = float(np.clip(weight, self.clip_min, self.clip_max))
+
+        can_use_q = (
+            self.mode != "velocity_only"
+            and self.q_min is not None
+            and self.q_max is not None
+            and "rorm_q" in data
+        )
+        if can_use_q:
+            q_val = float(np.asarray(data["rorm_q"], dtype=np.float32).reshape(-1)[0])
+            denom = max(self.q_max - self.q_min, 1e-8)
+            q_norm = float(np.clip((q_val - self.q_min) / denom, 0.0, 1.0))
+            if self.mode == "multiplicative":
+                weight = weight * q_norm
+            elif self.mode == "additive":
+                weight = 0.5 * (weight + q_norm)
+            else:
+                raise ValueError(f"Unknown RABC mode {self.mode!r}. Expected 'velocity_only', 'multiplicative', or 'additive'.")
+
         data = {**data, "sample_weights": np.float32(weight)}
-        # Remove raw velocity from dict (not needed downstream)
         data.pop("rorm_velocity", None)
+        data.pop("rorm_q", None)
         return data
 
 

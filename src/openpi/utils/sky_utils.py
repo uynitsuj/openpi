@@ -63,7 +63,7 @@ def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_
 
     print(f"[INFO] Uploading dataset from {dataset_path} to {s3_path}")
 
-    upload_cmd = f"aws s3 sync {dataset_path} {s3_path} --exclude 'dp_dataset/*' --exclude 'jpg/*'"
+    upload_cmd = f"aws s3 sync {dataset_path} {s3_path} --exclude 'dp_dataset/*' --exclude 'jpg/*' --exclude 'norm_stats/*' --delete"
     run_command(upload_cmd)
 
     print("[INFO] Verifying upload...")
@@ -257,7 +257,7 @@ def generate_sky_config(
         resources = {'any_of': candidates}
 
     config = {
-        'workdir': '.',
+        'workdir': '/home/justinyu/openpi',
         'envs': {
             'DATASET_PATH': dataset_s3_path,
             'CONFIG_NAME': config_name,
@@ -339,13 +339,13 @@ def launch_training(config_file: Path, cluster_name: Optional[str] = None, manag
 
     print("[OK] Training job launched successfully!")
 
-    # Parse job ID from the launch output, then stream the task logs.
+    # Parse job ID from the launch output. Skip log tailing so batch
+    # launches can advance through multiple configs without blocking.
     output = ''.join(captured_lines)
     job_id = _parse_job_id_from_output(output)
     if job_id:
-        print(f"[INFO] Streaming task logs for job {job_id} (Ctrl+C to detach)...")
-        run_command(f"sky jobs logs {job_id}", check=False)
+        print(f"[INFO] Submitted job {job_id}. Tail with: sky jobs logs {job_id}")
     else:
         print("[WARN] Could not parse job ID from launch output. "
-              "Run 'sky jobs logs <id>' manually to view training logs.")
+              "Run 'sky jobs queue' to find it.")
 

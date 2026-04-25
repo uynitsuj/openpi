@@ -22,7 +22,7 @@ import tyro
 from dataclasses import dataclass, field
 
 import openpi.training.config as _config
-from lerobot.common.constants import HF_LEROBOT_HOME
+from lerobot.utils.constants import HF_LEROBOT_HOME
 from datetime import datetime
 
 from openpi.utils.sky_utils import (
@@ -159,7 +159,10 @@ def main(cfg: SkyPilotTrainingConfig):
             print(yaml.dump(sky_config, default_flow_style=False, sort_keys=False))
             return
 
-        launch_training(config_file, cluster_name=cfg.cluster_name, managed=cfg.managed)
+        # Default the sky job name to the exp_name so `sky jobs queue` shows
+        # which config each job is for, instead of auto-generated sky-XXXX names.
+        job_name = cfg.cluster_name or cfg.exp_name
+        launch_training(config_file, cluster_name=job_name, managed=cfg.managed)
         print(f"[OK] Checkpoints: {cfg.s3_checkpoint_base}/{cfg.config_name}/{cfg.exp_name}")
     except Exception as e:
         print(f"[ERROR] Launch failed: {e}")

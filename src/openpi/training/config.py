@@ -103,6 +103,11 @@ class DataConfig:
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
+    # Episode filtering for LeRobot datasets. If set, only these episode indices are used for training.
+    episodes: tuple[int, ...] | None = None
+    # Held-out validation episodes. Used by val dataloader if set.
+    val_episodes: tuple[int, ...] | None = None
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -529,6 +534,134 @@ class LeRobotXmiRbyDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+def _total_episodes(repo_id: str) -> int:
+    """Read total_episodes from the dataset's meta/info.json."""
+    import json
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+    info = json.loads((HF_LEROBOT_HOME / repo_id / "meta" / "info.json").read_text())
+    return int(info["total_episodes"])
+
+
+def _split_val_episodes(
+    repo_id: str, val_frac: float, val_seed: int = 0,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Hold out ``val_frac`` of episodes for validation.
+
+    Returns (val_episodes, non_val_episodes). Deterministic across configs that
+    share ``val_seed`` so topq/rabc runs all see the same held-out val set.
+    """
+    import numpy as np
+    if val_frac <= 0:
+        return (), tuple(range(_total_episodes(repo_id)))
+    n = _total_episodes(repo_id)
+    rng = np.random.default_rng(val_seed)
+    k = max(1, int(round(val_frac * n)))
+    perm = rng.permutation(n)
+    val = tuple(sorted(int(x) for x in perm[:k]))
+    non_val = tuple(sorted(int(x) for x in perm[k:]))
+    return val, non_val
+
+
+def _top_q_episodes(
+    repo_id: str, frac: float, exclude_eps: tuple[int, ...] = (),
+) -> list[int]:
+    """Return sorted episode indices whose mean rorm_q is in the top ``frac`` of the pool."""
+    if not 0 < frac <= 1:
+        raise ValueError(f"top_q_frac must be in (0, 1], got {frac}")
+    import numpy as np
+    import pyarrow.parquet as pq
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    root = HF_LEROBOT_HOME / repo_id
+    parquet_files = sorted((root / "data").glob("chunk-*/*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"no parquet files under {root}/data")
+
+    ep_to_q: dict[int, float] = {}
+    ep_count: dict[int, int] = {}
+    for f in parquet_files:
+        t = pq.read_table(f, columns=["episode_index", "rorm_q"])
+        eps = np.asarray(t["episode_index"]).astype(np.int64).ravel()
+        qs = np.asarray(t["rorm_q"]).astype(np.float64).ravel()
+        for e, q in zip(eps, qs):
+            e = int(e)
+            ep_to_q[e] = ep_to_q.get(e, 0.0) + q
+            ep_count[e] = ep_count.get(e, 0) + 1
+
+    excluded = set(exclude_eps)
+    candidate_ids = [e for e in ep_to_q if e not in excluded]
+    ep_ids = np.array(candidate_ids)
+    mean_q = np.array([ep_to_q[e] / ep_count[e] for e in ep_ids])
+    order = np.argsort(mean_q)[::-1]
+    total = len(ep_to_q)
+    k = max(1, int(round(frac * total)))
+    k = min(k, len(ep_ids))
+    kept = sorted(int(ep_ids[i]) for i in order[:k])
+    logging.info(
+        f"top_q_frac={frac}: keeping {k}/{total} episodes "
+        f"(q >= {float(mean_q[order[k - 1]]):.4f}, excluded {len(excluded)} val eps)"
+    )
+    return kept
+
+
+def _shortest_episodes(
+    repo_id: str, frac: float, exclude_eps: tuple[int, ...] = (),
+) -> list[int]:
+    """Return sorted episode indices with the shortest lengths in the bottom ``frac`` of the pool.
+
+    Supports both lerobot v2.1 (meta/episodes.jsonl) and v3.0 (meta/episodes/chunk-*/file-*.parquet).
+    """
+    if not 0 < frac <= 1:
+        raise ValueError(f"top_shortest_frac must be in (0, 1], got {frac}")
+    import json
+    import numpy as np
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    root = HF_LEROBOT_HOME / repo_id
+    ep_lengths: dict[int, int] = {}
+    legacy_path = root / "meta" / "episodes.jsonl"
+    v3_files = sorted((root / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
+    if v3_files:
+        import pyarrow.parquet as pq
+        for f in v3_files:
+            t = pq.read_table(f, columns=["episode_index", "length"])
+            for ep_idx, length in zip(t["episode_index"].to_pylist(), t["length"].to_pylist()):
+                ep_lengths[int(ep_idx)] = int(length)
+    elif legacy_path.exists():
+        with open(legacy_path) as f:
+            for line in f:
+                rec = json.loads(line)
+                ep_lengths[int(rec["episode_index"])] = int(rec["length"])
+    else:
+        raise FileNotFoundError(f"no episode metadata under {root}/meta")
+
+    excluded = set(exclude_eps)
+    candidate_ids = [e for e in ep_lengths if e not in excluded]
+    ep_ids = np.array(candidate_ids)
+    lengths = np.array([ep_lengths[e] for e in ep_ids])
+    order = np.argsort(lengths)  # ascending: shortest first
+    total = len(ep_lengths)
+    k = max(1, int(round(frac * total)))
+    k = min(k, len(ep_ids))
+    kept = sorted(int(ep_ids[i]) for i in order[:k])
+    logging.info(
+        f"top_shortest_frac={frac}: keeping {k}/{total} episodes "
+        f"(length <= {int(lengths[order[k - 1]])}, excluded {len(excluded)} val eps)"
+    )
+    return kept
+
+
+def _load_rabc_q_range(repo_id: str) -> tuple[float | None, float | None]:
+    """Load q_min/q_max from meta/rabc_stats.json if present."""
+    import json
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+    p = HF_LEROBOT_HOME / repo_id / "meta" / "rabc_stats.json"
+    if not p.exists():
+        return None, None
+    stats = json.loads(p.read_text())
+    return stats.get("q_min"), stats.get("q_max")
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotYamDataConfig(DataConfigFactory):
     """
@@ -583,57 +716,102 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
     """
     YAM dataset with RORM reward weights for RABC / AWR training.
 
-    Same as LeRobotYamDataConfig but also loads `rorm_velocity` from the dataset
-    and computes per-sample RABC weights via the ComputeRABCWeights transform.
+    Same as LeRobotYamDataConfig but also loads `rorm_velocity` (and optionally
+    `rorm_q`) from the dataset and computes per-sample RABC weights.
+
+    Modes (rabc_mode):
+      "velocity_only"  — classic velocity-integrated weight (default)
+      "multiplicative" — v_weight * q_norm  (requires rorm_q in dataset)
+      "additive"       — 0.5 * (v_weight + q_norm)  (requires rorm_q in dataset)
+
+    For Q-based modes, q_min/q_max are loaded from meta/rabc_stats.json unless
+    explicitly provided via rabc_q_min / rabc_q_max.
+
+    top_q_frac: if set, hard-filters to the top fraction of episodes by mean
+    rorm_q score (no soft weighting). val_frac episodes are held out first
+    using val_seed so all ablation configs share the same validation set.
     """
 
     default_prompt: str | None = None
     rabc_clip_min: float = 0.0
     rabc_clip_max: float = 1.0
     rabc_threshold: float | None = None
-    # When True, use final-action-in-chunk gating instead of integrating velocity
-    # over the horizon. See ComputeRABCWeights for details. Requires rabc_threshold.
     rabc_use_final_action_condition: bool = False
+    # Q-based reweighting mode. One of {"velocity_only", "multiplicative", "additive"}.
+    rabc_mode: str = "velocity_only"
+    # Explicit Q normalization range. Auto-loaded from rabc_stats.json when None.
+    rabc_q_min: float | None = None
+    rabc_q_max: float | None = None
+    # Hard Q-filter: keep only the top fraction of episodes by mean rorm_q.
+    top_q_frac: float | None = None
+    # Length filter: keep only the shortest fraction of episodes by frame count.
+    top_shortest_frac: float | None = None
+    val_frac: float = 0.0
+    val_seed: int = 0
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        use_q = self.rabc_mode != "velocity_only"
+        repack_keys = {
+            "left_camera-images-rgb": "left_camera-images-rgb",
+            "right_camera-images-rgb": "right_camera-images-rgb",
+            "top_camera-images-rgb": "top_camera-images-rgb",
+            "state": "state",
+            "actions": "actions",
+            "prompt": "prompt",
+            "rorm_velocity": "rorm_velocity",
+        }
+        if use_q:
+            repack_keys["rorm_q"] = "rorm_q"
+
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "left_camera-images-rgb": "left_camera-images-rgb",
-                        "right_camera-images-rgb": "right_camera-images-rgb",
-                        "top_camera-images-rgb": "top_camera-images-rgb",
-                        "state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                        "rorm_velocity": "rorm_velocity",
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack_keys)]
         )
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
+        q_min, q_max = self.rabc_q_min, self.rabc_q_max
+        if use_q and (q_min is None or q_max is None) and self.repo_id is not None:
+            q_min, q_max = _load_rabc_q_range(self.repo_id)
+
         data_transforms = _transforms.Group(
             inputs=[
                 _transforms.ComputeRABCWeights(
-                    self.rabc_clip_min,
-                    self.rabc_clip_max,
+                    clip_min=self.rabc_clip_min,
+                    clip_max=self.rabc_clip_max,
                     threshold=self.rabc_threshold,
                     use_final_action_condition=self.rabc_use_final_action_condition,
+                    mode=self.rabc_mode,
+                    q_min=q_min,
+                    q_max=q_max,
                 ),
                 yam_policy.YamInputs(action_dim=model_config.action_dim, model_type=model_config.model_type),
             ],
             outputs=[yam_policy.YamOutputs()],
         )
 
+        extra_horizon_keys = ("rorm_velocity", "rorm_q") if use_q else ("rorm_velocity",)
+
+        episodes: tuple[int, ...] | None = None
+        val_episodes: tuple[int, ...] | None = None
+        if self.repo_id is not None:
+            val_eps, non_val_eps = _split_val_episodes(self.repo_id, self.val_frac, self.val_seed)
+            val_episodes = val_eps if val_eps else None
+            if self.top_q_frac is not None:
+                episodes = tuple(_top_q_episodes(self.repo_id, self.top_q_frac, exclude_eps=val_eps))
+            elif self.top_shortest_frac is not None:
+                episodes = tuple(_shortest_episodes(self.repo_id, self.top_shortest_frac, exclude_eps=val_eps))
+            elif non_val_eps:
+                episodes = non_val_eps
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
-            extra_horizon_keys=("rorm_velocity",),
+            extra_horizon_keys=extra_horizon_keys,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            episodes=episodes,
+            val_episodes=val_episodes,
         )
 
 
@@ -1129,7 +1307,7 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=30_000,
     ),
     TrainConfig(
@@ -1155,7 +1333,7 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=30_000,
         freeze_filter=pi0_config.Pi0Config(action_horizon=10, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
@@ -1173,7 +1351,7 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=30_000,
     ),
     TrainConfig(
@@ -1186,7 +1364,7 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=30_000,
         # The freeze filter defines which parameters should be frozen during training.
         # We have a convenience function in the model config that returns the default freeze filter
@@ -1213,7 +1391,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
     ),
@@ -1232,7 +1410,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
         save_interval = 20000,
@@ -1252,7 +1430,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=60_000,
         rabc_enabled=True,
         save_interval = 20000,
@@ -1272,7 +1450,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
         save_interval = 20000,
@@ -1292,7 +1470,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=60_000,
         rabc_enabled=True,
         save_interval = 20000,
@@ -1312,7 +1490,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=60_000,
         rabc_enabled=True,
     ),
@@ -1332,7 +1510,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=60_000,
         rabc_enabled=True,
     ),
@@ -1351,7 +1529,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
     ),
@@ -1369,7 +1547,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
     ),
@@ -1387,7 +1565,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
     ),
@@ -1405,7 +1583,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
     ),
@@ -1422,7 +1600,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=40_000,
         rabc_enabled=False,
     ),
@@ -1438,7 +1616,7 @@ _CONFIGS = [
         ),
         batch_size=8,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
         freeze_filter=pi0_config.Pi0Config(
@@ -1466,7 +1644,7 @@ _CONFIGS = [
         ),
         batch_size=8,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("/home/justinyu/checkpoints/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=60_000,
         rabc_enabled=True,
         save_interval=20000,
@@ -1490,7 +1668,7 @@ _CONFIGS = [
         ),
         batch_size=8,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=60_000,
         rabc_enabled=True,
         save_interval=20000,
@@ -1514,7 +1692,7 @@ _CONFIGS = [
         ),
         batch_size=8,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
         save_interval=20000,
@@ -1538,7 +1716,7 @@ _CONFIGS = [
         ),
         batch_size=8,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=60_000,
         rabc_enabled=True,
         save_interval=20000,
@@ -1562,7 +1740,7 @@ _CONFIGS = [
         ),
         batch_size=8,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
         freeze_filter=pi0_config.Pi0Config(
@@ -1584,7 +1762,7 @@ _CONFIGS = [
         ),
         batch_size=8,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
         freeze_filter=pi0_config.Pi0Config(
@@ -1606,7 +1784,7 @@ _CONFIGS = [
         ),
         batch_size=8,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
         freeze_filter=pi0_config.Pi0Config(
@@ -1628,7 +1806,7 @@ _CONFIGS = [
         ),
         batch_size=8,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=40_000,
         rabc_enabled=True,
         freeze_filter=pi0_config.Pi0Config(
@@ -1726,6 +1904,169 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+    # Hard Q-filter ablations — train on top-N% episodes by rorm_q, no soft weighting.
+    # Direct counterpart to the multiplicative/additive RABC runs for A/B comparison.
+    *[
+        TrainConfig(
+            name=f"pi0_yam_tshirt_topq{int(frac * 100):02d}",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id="tshirt_folding_d405_v010_20260420",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                top_q_frac=frac,
+                val_frac=0.1,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+            num_train_steps=60_000,
+            rabc_enabled=False,
+        )
+        for frac in (0.10, 0.25, 0.50, 0.75)
+    ],
+    *[
+        TrainConfig(
+            name=f"pi0_yam_tshirt_topq{int(frac * 100):02d}_lora",
+            model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+            data=LeRobotYamRormDataConfig(
+                repo_id="tshirt_folding_d405_v010_20260420",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                top_q_frac=frac,
+                val_frac=0.1,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+            num_train_steps=60_000,
+            rabc_enabled=False,
+            freeze_filter=pi0_config.Pi0Config(
+                action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+            ).get_freeze_filter(),
+            ema_decay=None,
+        )
+        for frac in (0.10, 0.25, 0.50, 0.75)
+    ],
+    # Shortest-episode filter ablations — train on shortest N% of episodes by frame count.
+    # Shortest demos tend to be cleaner/more confident executions.
+    *[
+        TrainConfig(
+            name=f"pi0_yam_tshirt_shortest_{int(frac * 100):02d}",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id="tshirt_folding_d405_v010_20260420",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                top_shortest_frac=frac,
+                val_frac=0.1,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+            num_train_steps=60_000,
+            rabc_enabled=False,
+        )
+        for frac in (0.10, 0.20, 0.50, 0.75)
+    ],
+    # Q-weighted RABC — multiplicative: w = v_weight * q_norm
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_q_mult",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="tshirt_folding_d405_v010_20260420",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_mode="multiplicative",
+            val_frac=0.1,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        rabc_enabled=True,
+    ),
+    # Q-weighted RABC — additive: w = 0.5 * (v_weight + q_norm)
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_q_add",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="tshirt_folding_d405_v010_20260420",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_mode="additive",
+            val_frac=0.1,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        rabc_enabled=True,
+    ),
+    # LoRA variants of the new ablation configs (topq, shortest, q_mult, q_add).
+    *[
+        TrainConfig(
+            name=f"pi0_yam_tshirt_shortest_{int(frac * 100):02d}_lora",
+            model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+            data=LeRobotYamRormDataConfig(
+                repo_id="tshirt_folding_d405_v010_20260420",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                top_shortest_frac=frac,
+                val_frac=0.1,
+            ),
+            batch_size=8,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+            num_train_steps=60_000,
+            rabc_enabled=False,
+            freeze_filter=pi0_config.Pi0Config(
+                action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+            ).get_freeze_filter(),
+            ema_decay=None,
+        )
+        for frac in (0.10, 0.20, 0.50, 0.75)
+    ],
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_q_mult_lora",
+        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamRormDataConfig(
+            repo_id="tshirt_folding_d405_v010_20260420",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_mode="multiplicative",
+            val_frac=0.1,
+        ),
+        batch_size=8,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        rabc_enabled=True,
+        freeze_filter=pi0_config.Pi0Config(
+            action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_q_add_lora",
+        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotYamRormDataConfig(
+            repo_id="tshirt_folding_d405_v010_20260420",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_mode="additive",
+            val_frac=0.1,
+        ),
+        batch_size=8,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        rabc_enabled=True,
+        freeze_filter=pi0_config.Pi0Config(
+            action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

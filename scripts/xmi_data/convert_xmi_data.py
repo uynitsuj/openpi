@@ -15,8 +15,8 @@ import os
 os.environ["HF_LEROBOT_HOME"] = "/home/justinyu/nfs_us/justinyu/xmi_lerobot_datasets"
 import shutil
 import h5py 
-from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import HF_LEROBOT_HOME
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import numpy as np
 from tqdm import tqdm, trange
 import zarr

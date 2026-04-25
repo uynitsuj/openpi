@@ -24,8 +24,8 @@ import os
 os.environ["LEROBOT_HOME"] = "/shared/projects/icrl/data/dpgs/lerobot"
 import shutil
 import h5py 
-from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LEROBOT_HOME
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import numpy as np
 from tqdm import tqdm, trange
 import zarr

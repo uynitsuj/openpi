@@ -107,9 +107,15 @@ def main(cfg: SkyPilotTrainingConfig):
         service_provider = cfg.service_provider[0]
         print(f"[INFO] Using {service_provider} as the service provider")
 
-    # Generate dataset name and S3 paths
+    # S3 upload path mirrors the local cache layout (parent dir + name).
+    # The worker REPO_ID, however, must equal data_config.repo_id so that
+    # the dataset/norm-stats land at HF_LEROBOT_HOME / data_config.repo_id
+    # (where training reads them). When data_config.repo_id has no username
+    # prefix (parent is the literal lerobot home), reusing the s3 prefix as
+    # REPO_ID would produce a doubled `lerobot/lerobot/...` path.
     s3_dataset_prefix = dataset_path.parent.name
-    repo_id = f"{s3_dataset_prefix}/{dataset_path.name}"
+    s3_repo_id = f"{s3_dataset_prefix}/{dataset_path.name}"
+    repo_id = data_config.repo_id
 
     # Resolve norm stats directory: assets_dirs / asset_id
     # asset_id is typically just the dataset name (no org prefix), unlike repo_id
@@ -120,7 +126,7 @@ def main(cfg: SkyPilotTrainingConfig):
     dataset_s3_path = upload_dataset_to_s3(
         dataset_path,
         cfg.s3_bucket,
-        repo_id,
+        s3_repo_id,
         norm_stats_dir,
     )
 

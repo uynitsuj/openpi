@@ -307,7 +307,10 @@ def launch_training(config_file: Path, cluster_name: Optional[str] = None, manag
     """
     if managed:
         print(f"[INFO] Launching managed job with config: {config_file}")
-        launch_cmd = f"sky jobs launch '{config_file}' --yes"
+        # --detach-run: return as soon as the job is submitted to the controller
+        # instead of streaming worker logs. Lets batch launchers advance
+        # through multiple configs without blocking on the actual training run.
+        launch_cmd = f"sky jobs launch '{config_file}' --yes --detach-run"
         if cluster_name:
             launch_cmd += f" -n {cluster_name}"
     else:

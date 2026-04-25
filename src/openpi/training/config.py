@@ -1912,7 +1912,7 @@ _CONFIGS = [
             name=f"pi0_yam_tshirt_topq{int(frac * 100):02d}",
             model=pi0_config.Pi0Config(action_horizon=30),
             data=LeRobotYamRormDataConfig(
-                repo_id="tshirt_folding_d405_v010_20260420",
+                repo_id="tshirt_folding_d405_v010_20260420_gop10",
                 default_prompt="Folding tshirt pile and stacking",
                 base_config=DataConfig(prompt_from_task=True),
                 top_q_frac=frac,
@@ -1931,7 +1931,7 @@ _CONFIGS = [
             name=f"pi0_yam_tshirt_topq{int(frac * 100):02d}_lora",
             model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
             data=LeRobotYamRormDataConfig(
-                repo_id="tshirt_folding_d405_v010_20260420",
+                repo_id="tshirt_folding_d405_v010_20260420_gop10",
                 default_prompt="Folding tshirt pile and stacking",
                 base_config=DataConfig(prompt_from_task=True),
                 top_q_frac=frac,
@@ -1956,7 +1956,7 @@ _CONFIGS = [
             name=f"pi0_yam_tshirt_shortest_{int(frac * 100):02d}",
             model=pi0_config.Pi0Config(action_horizon=30),
             data=LeRobotYamRormDataConfig(
-                repo_id="tshirt_folding_d405_v010_20260420",
+                repo_id="tshirt_folding_d405_v010_20260420_gop10",
                 default_prompt="Folding tshirt pile and stacking",
                 base_config=DataConfig(prompt_from_task=True),
                 top_shortest_frac=frac,
@@ -1975,7 +1975,7 @@ _CONFIGS = [
         name="pi0_yam_tshirt_rabc_q_mult",
         model=pi0_config.Pi0Config(action_horizon=30),
         data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420",
+            repo_id="tshirt_folding_d405_v010_20260420_gop10",
             default_prompt="Folding tshirt pile and stacking",
             base_config=DataConfig(prompt_from_task=True),
             rabc_mode="multiplicative",
@@ -1992,7 +1992,7 @@ _CONFIGS = [
         name="pi0_yam_tshirt_rabc_q_add",
         model=pi0_config.Pi0Config(action_horizon=30),
         data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420",
+            repo_id="tshirt_folding_d405_v010_20260420_gop10",
             default_prompt="Folding tshirt pile and stacking",
             base_config=DataConfig(prompt_from_task=True),
             rabc_mode="additive",
@@ -2010,7 +2010,7 @@ _CONFIGS = [
             name=f"pi0_yam_tshirt_shortest_{int(frac * 100):02d}_lora",
             model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
             data=LeRobotYamRormDataConfig(
-                repo_id="tshirt_folding_d405_v010_20260420",
+                repo_id="tshirt_folding_d405_v010_20260420_gop10",
                 default_prompt="Folding tshirt pile and stacking",
                 base_config=DataConfig(prompt_from_task=True),
                 top_shortest_frac=frac,
@@ -2029,10 +2029,42 @@ _CONFIGS = [
         for frac in (0.10, 0.20, 0.50, 0.75)
     ],
     TrainConfig(
+        name="pi0_yam_tshirt_rabc_false",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="tshirt_folding_d405_v010_20260420_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_mode="velocity_only",
+            val_frac=0.1,
+        ),
+        batch_size=8,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_only",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="tshirt_folding_d405_v010_20260420_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_mode="velocity_only",
+            val_frac=0.1,
+        ),
+        batch_size=8,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
         name="pi0_yam_tshirt_rabc_q_mult_lora",
         model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420",
+            repo_id="tshirt_folding_d405_v010_20260420_gop10",
             default_prompt="Folding tshirt pile and stacking",
             base_config=DataConfig(prompt_from_task=True),
             rabc_mode="multiplicative",
@@ -2052,7 +2084,7 @@ _CONFIGS = [
         name="pi0_yam_tshirt_rabc_q_add_lora",
         model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420",
+            repo_id="tshirt_folding_d405_v010_20260420_gop10",
             default_prompt="Folding tshirt pile and stacking",
             base_config=DataConfig(prompt_from_task=True),
             rabc_mode="additive",

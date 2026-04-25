@@ -39,7 +39,7 @@ class SkyPilotTrainingConfig:
     service_provider: Optional[List[str]] = field(default_factory=lambda: ["aws", "lambda"])
     s3_bucket: str = "s3://xdof-internal-research"
     s3_checkpoint_base: str = "s3://xdof-internal-research/model_ckpts"
-    accelerators: List[str] = field(default_factory=lambda: ["A100-80GB:8", "H100:8", "H200:8"])
+    accelerators: List[str] = field(default_factory=lambda: ["A100-80GB:8", "A100-80GB:4", "H100:8", "H100:4", "H200:8", "H200:4", "B200:4"])
     provider_regions: dict[str, str] = field(default_factory=lambda: {
         "aws": "us-west-2",
         #"aws": "us-east-1"
@@ -107,9 +107,15 @@ def main(cfg: SkyPilotTrainingConfig):
     if not check_prerequisites():
         sys.exit(1)
 
-    # Common dataset setup
+    # S3 upload path mirrors the local cache layout (parent dir + name).
+    # The worker REPO_ID, however, must equal data_config.repo_id so that
+    # the dataset/norm-stats land at HF_LEROBOT_HOME / data_config.repo_id
+    # (where training reads them). When data_config.repo_id has no username
+    # prefix (parent is the literal lerobot home), reusing the s3 prefix as
+    # REPO_ID would produce a doubled `lerobot/lerobot/...` path.
     s3_dataset_prefix = dataset_path.parent.name
-    repo_id = f"{s3_dataset_prefix}/{dataset_path.name}"
+    s3_repo_id = f"{s3_dataset_prefix}/{dataset_path.name}"
+    repo_id = data_config.repo_id
 
     # Resolve norm stats directory
     asset_id = data_config.asset_id or data_config.repo_id
@@ -119,7 +125,7 @@ def main(cfg: SkyPilotTrainingConfig):
     dataset_s3_path = upload_dataset_to_s3(
         dataset_path,
         cfg.s3_bucket,
-        repo_id,
+        s3_repo_id,
         norm_stats_dir,
     )
 

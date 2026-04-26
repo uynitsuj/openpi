@@ -765,6 +765,21 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         use_q = self.rabc_mode != "velocity_only"
+        # Inspect the dataset parquet schema so we only request columns that exist.
+        # Carry both canonical (repromo_*) and legacy (rorm_*) names through the
+        # repack when present so ComputeRABCWeights can resolve whichever the
+        # parquet uses; RepackTransform is a strict lookup and would KeyError on
+        # a missing column.
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+        import pyarrow.parquet as pq
+        schema_cols: set[str] = set()
+        if self.repo_id is not None:
+            data_dir = HF_LEROBOT_HOME / self.repo_id / "data"
+            try:
+                first_parquet = next(data_dir.rglob("*.parquet"))
+                schema_cols = set(pq.read_schema(first_parquet).names)
+            except (StopIteration, FileNotFoundError):
+                schema_cols = set()
         repack_keys = {
             "left_camera-images-rgb": "left_camera-images-rgb",
             "right_camera-images-rgb": "right_camera-images-rgb",
@@ -772,14 +787,14 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
             "state": "state",
             "actions": "actions",
             "prompt": "prompt",
-            # Carry both canonical and legacy column names through the repack
-            # so ComputeRABCWeights can resolve whichever the parquet uses.
-            "repromo_signed_magnitude": "repromo_signed_magnitude",
-            "rorm_velocity": "rorm_velocity",
         }
+        for col in ("repromo_signed_magnitude", "rorm_velocity"):
+            if col in schema_cols:
+                repack_keys[col] = col
         if use_q:
-            repack_keys["repromo_quality"] = "repromo_quality"
-            repack_keys["rorm_q"] = "rorm_q"
+            for col in ("repromo_quality", "rorm_q"):
+                if col in schema_cols:
+                    repack_keys[col] = col
 
         repack_transform = _transforms.Group(
             inputs=[_transforms.RepackTransform(repack_keys)]

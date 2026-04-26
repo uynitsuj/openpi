@@ -1,6 +1,7 @@
 import dataclasses
 import functools
 import logging
+import math
 import platform
 from typing import Any
 
@@ -149,9 +150,12 @@ def train_step(
     ):
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
         # RABC: weight per-sample loss by integrated velocity over action horizon
+        print(f"RABC_ENABLED: {config.rabc_enabled}")
+        print(f"observation.sample_weights: {observation.sample_weights}")
         if config.rabc_enabled and observation.sample_weights is not None:
             per_sample_loss = jnp.mean(chunked_loss, axis=-1)  # [B]
             weighted_loss = per_sample_loss * observation.sample_weights  # [B]
+            # print(f"{observation.sample_weights}")
             return jnp.mean(weighted_loss)
         return jnp.mean(chunked_loss)
 
@@ -193,6 +197,16 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+    if config.rabc_enabled and observation.sample_weights is not None:
+        sample_weights = observation.sample_weights
+        info.update(
+            {
+                "sample_weight_sum": jnp.sum(sample_weights),
+                "sample_weight_sq_sum": jnp.sum(jnp.square(sample_weights)),
+                "sample_weight_zero_count": jnp.sum(sample_weights == 0),
+                "sample_weight_count": sample_weights.size,
+            }
+        )
     return new_state, info
 
 
@@ -261,6 +275,10 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
+    running_sample_weight_sum = 0.0
+    running_sample_weight_sq_sum = 0.0
+    running_sample_weight_zero_count = 0.0
+    running_sample_weight_count = 0.0
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
@@ -268,6 +286,49 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+
+            # Sample reweighting statistics logging
+            if "sample_weight_count" in stacked_infos:
+                window_sample_weight_sum = float(np.sum(np.asarray(stacked_infos["sample_weight_sum"])))
+                window_sample_weight_sq_sum = float(np.sum(np.asarray(stacked_infos["sample_weight_sq_sum"])))
+                window_sample_weight_zero_count = float(np.sum(np.asarray(stacked_infos["sample_weight_zero_count"])))
+                window_sample_weight_count = float(np.sum(np.asarray(stacked_infos["sample_weight_count"])))
+
+                running_sample_weight_sum += window_sample_weight_sum
+                running_sample_weight_sq_sum += window_sample_weight_sq_sum
+                running_sample_weight_zero_count += window_sample_weight_zero_count
+                running_sample_weight_count += window_sample_weight_count
+
+                window_sample_weight_mean = window_sample_weight_sum / window_sample_weight_count
+                window_sample_weight_var = max(
+                    window_sample_weight_sq_sum / window_sample_weight_count - window_sample_weight_mean**2, 0.0
+                )
+                running_sample_weight_mean = running_sample_weight_sum / running_sample_weight_count
+                running_sample_weight_var = max(
+                    running_sample_weight_sq_sum / running_sample_weight_count - running_sample_weight_mean**2, 0.0
+                )
+
+                reduced_info.update(
+                    {
+                        "sample_weight_mean": window_sample_weight_mean,
+                        "sample_weight_std": math.sqrt(window_sample_weight_var),
+                        "sample_weight_zero_frac": window_sample_weight_zero_count / window_sample_weight_count,
+                        "sample_weight_mean_running": running_sample_weight_mean,
+                        "sample_weight_std_running": math.sqrt(running_sample_weight_var),
+                        "sample_weight_zero_frac_running": (
+                            running_sample_weight_zero_count / running_sample_weight_count
+                        ),
+                    }
+                )
+
+                for key in (
+                    "sample_weight_sum",
+                    "sample_weight_sq_sum",
+                    "sample_weight_zero_count",
+                    "sample_weight_count",
+                ):
+                    reduced_info.pop(key, None)
+
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
@@ -275,7 +336,7 @@ def main(config: _config.TrainConfig):
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step, config.s3_checkpoint_path)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

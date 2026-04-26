@@ -7,7 +7,7 @@ This module contains functions for creating and managing LeRobot datasets with h
 import shutil
 from pathlib import Path
 from typing import Dict, List
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 try:
     from .video_utils import encode_video_hardware
     from .data_utils import CAMERA_KEYS, CAMERA_KEY_MAPPING

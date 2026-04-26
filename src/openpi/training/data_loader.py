@@ -7,7 +7,7 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -143,14 +143,22 @@ def create_torch_dataset(
     # Extra keys (e.g., rorm_velocity) fetched with the same horizon window
     for key in data_config.extra_horizon_keys:
         delta_timestamps[key] = delta_ts
+    episodes = list(data_config.episodes) if data_config.episodes is not None else None
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps=delta_timestamps,
         tolerance_s=0.04,  # 40ms tolerance for slight FPS mismatch (e.g., 29.58 vs 30)
+        episodes=episodes,
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        # v3 lerobot returns tasks as a pandas DataFrame (task as index, task_index as column);
+        # PromptFromLeRobotTask expects dict[int, str]. Coerce both shapes here.
+        tasks = dataset_meta.tasks
+        if hasattr(tasks, "to_dict"):
+            # DataFrame: task → task_index. Invert to {int(task_index): task_string}.
+            tasks = {int(idx): str(task) for task, idx in tasks["task_index"].items()}
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(tasks)])
 
     return dataset
 

@@ -63,7 +63,7 @@ def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_
 
     print(f"[INFO] Uploading dataset from {dataset_path} to {s3_path}")
 
-    upload_cmd = f"aws s3 sync {dataset_path} {s3_path} --exclude 'dp_dataset/*' --exclude 'jpg/*'"
+    upload_cmd = f"aws s3 sync {dataset_path} {s3_path} --exclude 'dp_dataset/*' --exclude 'jpg/*' --exclude 'norm_stats/*' --delete"
     run_command(upload_cmd)
 
     print("[INFO] Verifying upload...")
@@ -174,19 +174,53 @@ def _build_run_script() -> str:
         'export WANDB_TAGS="skypilot,$SKYPILOT_CLUSTER_NAME"',
         'export WANDB_NOTES="task_id=$SKYPILOT_TASK_ID cluster=$SKYPILOT_CLUSTER_NAME"',
         '',
+        '# Resume mode: pull existing checkpoints from S3 into the local checkpoint dir',
+        '# BEFORE training so train.py can pick up from where it stopped.',
+        'LOCAL_CKPT_DIR="$CHECKPOINT_BASE_DIR/$CONFIG_NAME/$EXP_NAME"',
+        'if [ "$RESUME" = "true" ]; then',
+        '  echo "[INFO] Resume mode: syncing prior checkpoints from $S3_CHECKPOINT_PATH"',
+        '  mkdir -p "$LOCAL_CKPT_DIR"',
+        '  # Skip orbax tmp dirs from previous failed writes — they\'re partial/corrupt.',
+        '  aws s3 sync "$S3_CHECKPOINT_PATH" "$LOCAL_CKPT_DIR" \\',
+        '    --exclude "*.orbax-checkpoint-tmp-*"',
+        '  # Free disk: keep only the latest checkpoint locally; older steps still in S3.',
+        '  # Also remove any orbax tmp dirs that slipped through (defensive).',
+        '  find "$LOCAL_CKPT_DIR" -maxdepth 1 -mindepth 1 -type d -name "*orbax-checkpoint-tmp*" -exec rm -rf {} + 2>/dev/null',
+        '  LATEST_STEP=$(find "$LOCAL_CKPT_DIR" -maxdepth 1 -mindepth 1 -type d -regextype posix-extended -regex ".*/[0-9]+" -printf "%f\\n" 2>/dev/null | sort -n | tail -1)',
+        '  if [ -n "$LATEST_STEP" ]; then',
+        '    echo "[INFO] Latest checkpoint: $LATEST_STEP. Removing older local checkpoints (still on S3)."',
+        '    find "$LOCAL_CKPT_DIR" -maxdepth 1 -mindepth 1 -type d -regextype posix-extended -regex ".*/[0-9]+" ! -name "$LATEST_STEP" -exec rm -rf {} +',
+        '    df -h "$LOCAL_CKPT_DIR" | tail -1',
+        '  fi',
+        '  RESUME_ARG="--resume --no-overwrite"',
+        'else',
+        '  RESUME_ARG="--overwrite"',
+        'fi',
+        '',
+        '# Optional CLI overrides forwarded to train.py only when set.',
+        'EXTRA_ARGS=""',
+        'if [ -n "$NUM_TRAIN_STEPS_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --num-train-steps=$NUM_TRAIN_STEPS_OVERRIDE"; fi',
+        'if [ -n "$SAVE_INTERVAL_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --save-interval=$SAVE_INTERVAL_OVERRIDE"; fi',
+        'if [ -n "$KEEP_PERIOD_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --keep-period=$KEEP_PERIOD_OVERRIDE"; fi',
+        '',
         '# Run training',
-        'echo "[INFO] Running training: $CONFIG_NAME exp=$EXP_NAME"',
+        'echo "[INFO] Running training: $CONFIG_NAME exp=$EXP_NAME (resume=$RESUME, extras=$EXTRA_ARGS)"',
         'export XLA_PYTHON_CLIENT_MEM_FRACTION=$XLA_MEM_FRACTION',
         '${WANDB_MODE_ARG}uv run scripts/train.py $CONFIG_NAME \\',
         '  --exp-name=$EXP_NAME \\',
-        '  --overwrite \\',
+        '  $RESUME_ARG \\',
+        '  $EXTRA_ARGS \\',
         '  --checkpoint_base_dir $CHECKPOINT_BASE_DIR \\',
         '  --s3_checkpoint_path $S3_CHECKPOINT_PATH',
+        'TRAIN_EXIT=$?',
         '',
-        '# Final sync after training completes',
-        'echo "[INFO] Final checkpoint sync to S3"',
-        'aws s3 sync ./tmp_checkpoints "$S3_CHECKPOINT_PATH"',
-        'echo "[OK] Training complete"',
+        '# Final sync after training (also runs on crash, since no set -e).',
+        '# IMPORTANT: source must be the per-experiment dir, NOT ./tmp_checkpoints,',
+        '# otherwise S3 ends up with a nested <exp>/<config>/<exp>/... duplicate.',
+        'echo "[INFO] Final checkpoint sync to S3 (train exit=$TRAIN_EXIT)"',
+        'aws s3 sync "$LOCAL_CKPT_DIR" "$S3_CHECKPOINT_PATH"',
+        'echo "[OK] Training complete (exit $TRAIN_EXIT)"',
+        'exit $TRAIN_EXIT',
     ]
     return '\n'.join(lines)
 
@@ -205,6 +239,11 @@ def generate_sky_config(
     idle_minutes: int = 10,
     xla_mem_fraction: float = 0.95,
     managed: bool = True,
+    disk_size: int = 512,
+    resume: bool = False,
+    num_train_steps_override: Optional[int] = None,
+    save_interval_override: Optional[int] = None,
+    keep_period_override: Optional[int] = None,
 ) -> dict:
     """Generate a single SkyPilot YAML with multi-cloud auto-failover.
 
@@ -241,6 +280,7 @@ def generate_sky_config(
             entry = {
                 'infra': infra,
                 'accelerators': accel,
+                'disk_size': disk_size,
             }
 
             if provider == 'aws' and aws_image_ids:
@@ -257,7 +297,7 @@ def generate_sky_config(
         resources = {'any_of': candidates}
 
     config = {
-        'workdir': '.',
+        'workdir': '/home/justinyu/openpi',
         'envs': {
             'DATASET_PATH': dataset_s3_path,
             'CONFIG_NAME': config_name,
@@ -267,6 +307,10 @@ def generate_sky_config(
             'S3_CHECKPOINT_PATH': checkpoint_path,
             'WANDB_MODE_ARG': wandb_mode_arg,
             'XLA_MEM_FRACTION': str(xla_mem_fraction),
+            'RESUME': 'true' if resume else 'false',
+            'NUM_TRAIN_STEPS_OVERRIDE': str(num_train_steps_override) if num_train_steps_override is not None else '',
+            'SAVE_INTERVAL_OVERRIDE': str(save_interval_override) if save_interval_override is not None else '',
+            'KEEP_PERIOD_OVERRIDE': str(keep_period_override) if keep_period_override is not None else '',
         },
         'resources': resources,
         'num_nodes': 1,
@@ -307,7 +351,10 @@ def launch_training(config_file: Path, cluster_name: Optional[str] = None, manag
     """
     if managed:
         print(f"[INFO] Launching managed job with config: {config_file}")
-        launch_cmd = f"sky jobs launch '{config_file}' --yes"
+        # --detach-run: return as soon as the job is submitted to the controller
+        # instead of streaming worker logs. Lets batch launchers advance
+        # through multiple configs without blocking on the actual training run.
+        launch_cmd = f"sky jobs launch '{config_file}' --yes --detach-run"
         if cluster_name:
             launch_cmd += f" -n {cluster_name}"
     else:
@@ -339,13 +386,13 @@ def launch_training(config_file: Path, cluster_name: Optional[str] = None, manag
 
     print("[OK] Training job launched successfully!")
 
-    # Parse job ID from the launch output, then stream the task logs.
+    # Parse job ID from the launch output. Skip log tailing so batch
+    # launches can advance through multiple configs without blocking.
     output = ''.join(captured_lines)
     job_id = _parse_job_id_from_output(output)
     if job_id:
-        print(f"[INFO] Streaming task logs for job {job_id} (Ctrl+C to detach)...")
-        run_command(f"sky jobs logs {job_id}", check=False)
+        print(f"[INFO] Submitted job {job_id}. Tail with: sky jobs logs {job_id}")
     else:
         print("[WARN] Could not parse job ID from launch output. "
-              "Run 'sky jobs logs <id>' manually to view training logs.")
+              "Run 'sky jobs queue' to find it.")
 

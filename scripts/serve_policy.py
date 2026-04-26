@@ -2,6 +2,7 @@ import dataclasses
 import enum
 import logging
 import socket
+from typing import Literal
 
 import tyro
 
@@ -60,6 +61,9 @@ class Args:
     port: int = 8012
     # Record the policy's behavior for debugging.
     record: bool = False
+
+    # Shortcut for serving a named checkpoint (see NAMED_CHECKPOINTS). Takes precedence over --policy.
+    name: "NamedCheckpointKey | None" = None
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | NamedCheckpoint | Default = dataclasses.field(default_factory=Default)
@@ -137,7 +141,39 @@ NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
         dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_80_clip_max_1_0/sky_pi0_yam_tshirt_rabc_thresh_0_80_clip_max_1_0_yam_tshirt_rorm_weighted_20260417_090709/30000",
         default_prompt="Folding tshirt pile and stacking",
     ),
+    "yam_rabc_final_action_cond_20k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_use_final_action_cond",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_use_final_action_cond/sky_pi0_yam_tshirt_rabc_use_final_action_cond_tshirt_folding_d405_v010_20260420_gop10_20260425_032855/20000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_shortest_10_30k": Checkpoint(
+        config="pi0_yam_tshirt_shortest_10",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_shortest_10/sky_pi0_yam_tshirt_shortest_10_tshirt_folding_d405_v010_20260420_gop10_20260425_030032/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_shortest_50_30k": Checkpoint(
+        config="pi0_yam_tshirt_shortest_50",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_shortest_50/sky_pi0_yam_tshirt_shortest_50_tshirt_folding_d405_v010_20260420_gop10_20260425_030123/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_topq10_30k": Checkpoint(
+        config="pi0_yam_tshirt_topq10",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_topq10/sky_pi0_yam_tshirt_topq10_tshirt_folding_d405_v010_20260420_gop10_20260425_024926/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_topq10_rabc_q_mult_30k": Checkpoint(
+        config="pi0_yam_tshirt_topq10_rabc_q_mult",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_topq10_rabc_q_mult/sky_pi0_yam_tshirt_topq10_rabc_q_mult_tshirt_folding_d405_v010_20260420_gop10_20260425_031912/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_topq50_30k": Checkpoint(
+        config="pi0_yam_tshirt_topq50",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_topq50/sky_pi0_yam_tshirt_topq50_tshirt_folding_d405_v010_20260420_gop10_20260425_025936/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
 }
+
+NamedCheckpointKey = Literal[*NAMED_CHECKPOINTS]
 
 
 # Default checkpoints that should be used for each environment.
@@ -173,6 +209,13 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) ->
 
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
+    if args.name is not None:
+        ckpt = NAMED_CHECKPOINTS[args.name]
+        return _policy_config.create_trained_policy(
+            _config.get_config(ckpt.config),
+            ckpt.dir,
+            default_prompt=args.default_prompt or ckpt.default_prompt,
+        )
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(

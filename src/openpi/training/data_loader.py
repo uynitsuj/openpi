@@ -7,7 +7,7 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
@@ -15,80 +15,6 @@ import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
-
-# Monkey-patch lerobot's torchcodec frame decoding to clamp frame indices.
-# Without this, round(ts * fps) can produce index == num_frames for the last frame,
-# causing "Invalid frame index" errors in torchcodec. This survives uv sync.
-# See: https://github.com/huggingface/lerobot/issues/XXXX
-import lerobot.common.datasets.video_utils as _lerobot_video_utils
-
-_original_decode_torchcodec = _lerobot_video_utils.decode_video_frames_torchcodec
-
-
-def _patched_decode_video_frames_torchcodec(video_path, timestamps, tolerance_s, device="cpu", log_loaded_timestamps=False):
-    import importlib.util
-
-    if importlib.util.find_spec("torchcodec"):
-        from torchcodec.decoders import VideoDecoder
-    else:
-        raise ImportError("torchcodec is required but not available.")
-
-    decoder = VideoDecoder(video_path, device=device, seek_mode="approximate")
-    metadata = decoder.metadata
-    average_fps = metadata.average_fps
-    num_frames = metadata.num_frames
-
-    # Clamp frame indices to valid range [0, num_frames - 1].
-    # Track which timestamps were clamped (past video end) so we can
-    # exempt them from the tolerance check — returning the last frame
-    # is the best we can do for those.
-    max_frame = num_frames - 1
-    raw_indices = [round(ts * average_fps) for ts in timestamps]
-    was_clamped = [idx > max_frame for idx in raw_indices]
-    frame_indices = [min(idx, max_frame) for idx in raw_indices]
-
-    frames_batch = decoder.get_frames_at(indices=frame_indices)
-
-    loaded_frames = []
-    loaded_ts = []
-    for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=False):
-        loaded_frames.append(frame)
-        loaded_ts.append(pts.item())
-        if log_loaded_timestamps:
-            logging.info(f"Frame loaded at timestamp={pts:.4f}")
-
-    query_ts = torch.tensor(timestamps)
-    loaded_ts_t = torch.tensor(loaded_ts)
-
-    dist = torch.cdist(query_ts[:, None], loaded_ts_t[:, None], p=1)
-    min_, argmin_ = dist.min(1)
-
-    # Only enforce tolerance for non-clamped timestamps.
-    clamped_mask = torch.tensor(was_clamped)
-    is_within_tol = (min_ < tolerance_s) | clamped_mask
-    assert is_within_tol.all(), (
-        f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
-        "It means that the closest frame that can be loaded from the video is too far away in time."
-        "This might be due to synchronization issues with timestamps during data collection."
-        "To be safe, we advise to ignore this item during training."
-        f"\nqueried timestamps: {query_ts}"
-        f"\nloaded timestamps: {loaded_ts_t}"
-        f"\nvideo: {video_path}"
-    )
-
-    closest_frames = torch.stack([loaded_frames[idx] for idx in argmin_])
-    closest_ts = loaded_ts_t[argmin_]
-
-    if log_loaded_timestamps:
-        logging.info(f"{closest_ts=}")
-
-    closest_frames = closest_frames.type(torch.float32) / 255
-
-    assert len(timestamps) == len(closest_frames)
-    return closest_frames
-
-
-_lerobot_video_utils.decode_video_frames_torchcodec = _patched_decode_video_frames_torchcodec
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -217,14 +143,22 @@ def create_torch_dataset(
     # Extra keys (e.g., rorm_velocity) fetched with the same horizon window
     for key in data_config.extra_horizon_keys:
         delta_timestamps[key] = delta_ts
+    episodes = list(data_config.episodes) if data_config.episodes is not None else None
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps=delta_timestamps,
         tolerance_s=0.04,  # 40ms tolerance for slight FPS mismatch (e.g., 29.58 vs 30)
+        episodes=episodes,
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        # v3 lerobot returns tasks as a pandas DataFrame (task as index, task_index as column);
+        # PromptFromLeRobotTask expects dict[int, str]. Coerce both shapes here.
+        tasks = dataset_meta.tasks
+        if hasattr(tasks, "to_dict"):
+            # DataFrame: task → task_index. Invert to {int(task_index): task_string}.
+            tasks = {int(idx): str(task) for task, idx in tasks["task_index"].items()}
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(tasks)])
 
     return dataset
 

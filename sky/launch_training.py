@@ -54,6 +54,11 @@ class SkyPilotTrainingConfig:
     managed: bool = True  # Use sky jobs launch (auto-teardown) instead of sky launch
     idle_minutes: int = 10  # Autostop idle timeout before teardown
     xla_mem_fraction: float = 0.95
+    disk_size: int = 256  # Worker disk size in GiB. Bumped to fit dataset + multiple checkpoints + opt state.
+    resume: bool = False  # Resume from checkpoints already in S3 at s3_checkpoint_base/config/exp_name. Requires --exp-name.
+    num_train_steps: Optional[int] = None  # Override TrainConfig.num_train_steps (e.g., extend a resumed run).
+    save_interval: Optional[int] = None  # Override TrainConfig.save_interval to control checkpoint save frequency.
+    keep_period: Optional[int] = None  # Override TrainConfig.keep_period (orbax keeps checkpoints at step%keep_period==0 forever).
 
 
 def main(cfg: SkyPilotTrainingConfig):
@@ -76,7 +81,11 @@ def main(cfg: SkyPilotTrainingConfig):
             f"Make sure to run: \nuv run scripts/compute_norm_stats.py --config-name={cfg.config_name}"
         )
 
-    # Generate experiment name if not provided
+    # Generate experiment name if not provided. Resume mode requires the user
+    # to specify the original exp_name explicitly so we point at the same
+    # checkpoint directory in S3.
+    if cfg.resume and not cfg.exp_name:
+        raise ValueError("--resume requires --exp-name to be set to the original experiment name.")
     if not cfg.exp_name:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         cfg.exp_name = f"sky_{cfg.config_name}_{dataset_path.name}_{timestamp}"
@@ -151,6 +160,11 @@ def main(cfg: SkyPilotTrainingConfig):
         idle_minutes=cfg.idle_minutes,
         xla_mem_fraction=cfg.xla_mem_fraction,
         managed=cfg.managed,
+        disk_size=cfg.disk_size,
+        resume=cfg.resume,
+        num_train_steps_override=cfg.num_train_steps,
+        save_interval_override=cfg.save_interval,
+        keep_period_override=cfg.keep_period,
     )
 
     config_file = None

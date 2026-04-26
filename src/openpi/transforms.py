@@ -141,9 +141,16 @@ class ComputeRABCWeights(DataTransformFn):
     q_max: float | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
-        if "rorm_velocity" not in data:
+        # Schema migration: read repromo_signed_magnitude (canonical, post
+        # Repromo rename) or fall back to rorm_velocity (legacy, pre-rename).
+        # Same for repromo_quality vs rorm_q on the quality side.
+        vel_key = next(
+            (k for k in ("repromo_signed_magnitude", "rorm_velocity") if k in data),
+            None,
+        )
+        if vel_key is None:
             return data
-        vel = np.asarray(data["rorm_velocity"], dtype=np.float32)
+        vel = np.asarray(data[vel_key], dtype=np.float32)
         if self.use_final_action_condition:
             if self.threshold is None:
                 raise ValueError("use_final_action_condition=True requires `threshold` to be set.")
@@ -159,14 +166,18 @@ class ComputeRABCWeights(DataTransformFn):
             else:
                 weight = float(np.clip(weight, self.clip_min, self.clip_max))
 
+        q_key = next(
+            (k for k in ("repromo_quality", "rorm_q") if k in data),
+            None,
+        )
         can_use_q = (
             self.mode != "velocity_only"
             and self.q_min is not None
             and self.q_max is not None
-            and "rorm_q" in data
+            and q_key is not None
         )
         if can_use_q:
-            q_val = float(np.asarray(data["rorm_q"], dtype=np.float32).reshape(-1)[0])
+            q_val = float(np.asarray(data[q_key], dtype=np.float32).reshape(-1)[0])
             denom = max(self.q_max - self.q_min, 1e-8)
             q_norm = float(np.clip((q_val - self.q_min) / denom, 0.0, 1.0))
             if self.mode == "multiplicative":
@@ -177,8 +188,9 @@ class ComputeRABCWeights(DataTransformFn):
                 raise ValueError(f"Unknown RABC mode {self.mode!r}. Expected 'velocity_only', 'multiplicative', or 'additive'.")
 
         data = {**data, "sample_weights": np.float32(weight)}
-        data.pop("rorm_velocity", None)
-        data.pop("rorm_q", None)
+        data.pop(vel_key, None)
+        if q_key is not None:
+            data.pop(q_key, None)
         return data
 
 

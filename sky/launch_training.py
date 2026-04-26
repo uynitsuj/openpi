@@ -54,7 +54,7 @@ class SkyPilotTrainingConfig:
     managed: bool = True  # Use sky jobs launch (auto-teardown) instead of sky launch
     idle_minutes: int = 10  # Autostop idle timeout before teardown
     xla_mem_fraction: float = 0.95
-    disk_size: int = 256  # Worker disk size in GiB. Bumped to fit dataset + multiple checkpoints + opt state.
+    disk_size: int = 512  # Worker disk size in GiB. Sized for dataset + downloaded prior checkpoints + new checkpoint write + jax/orbax tmp.
     resume: bool = False  # Resume from checkpoints already in S3 at s3_checkpoint_base/config/exp_name. Requires --exp-name.
     num_train_steps: Optional[int] = None  # Override TrainConfig.num_train_steps (e.g., extend a resumed run).
     save_interval: Optional[int] = None  # Override TrainConfig.save_interval to control checkpoint save frequency.

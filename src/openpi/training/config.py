@@ -826,7 +826,10 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
 
         episodes: tuple[int, ...] | None = None
         val_episodes: tuple[int, ...] | None = None
-        if self.repo_id is not None:
+        # Episode resolution is training-only; skip when the dataset isn't on disk
+        # (e.g., during inference / serving) so the config still materializes.
+        info_path = HF_LEROBOT_HOME / self.repo_id / "meta" / "info.json" if self.repo_id is not None else None
+        if info_path is not None and info_path.exists():
             val_eps, non_val_eps = _split_val_episodes(self.repo_id, self.val_frac, self.val_seed)
             val_episodes = val_eps if val_eps else None
             if self.top_q_frac is not None:
@@ -835,6 +838,11 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
                 episodes = tuple(_shortest_episodes(self.repo_id, self.top_shortest_frac, exclude_eps=val_eps))
             elif non_val_eps:
                 episodes = non_val_eps
+        elif self.repo_id is not None:
+            logging.info(
+                f"Skipping episode split for {self.repo_id!r}: dataset not present at {info_path}. "
+                f"Assumed inference-only context."
+            )
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),

@@ -161,9 +161,9 @@ NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
         dir="/home/justinyu/checkpoints/pi0_yam_tshirt_topq10/sky_pi0_yam_tshirt_topq10_tshirt_folding_d405_v010_20260420_gop10_20260425_024926/30000",
         default_prompt="Folding tshirt pile and stacking",
     ),
-    "yam_topq10_rabc_q_mult_30k": Checkpoint(
+    "yam_topq10_rabc_q_mult_79k": Checkpoint(
         config="pi0_yam_tshirt_topq10_rabc_q_mult",
-        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_topq10_rabc_q_mult/sky_pi0_yam_tshirt_topq10_rabc_q_mult_tshirt_folding_d405_v010_20260420_gop10_20260425_031912/30000",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_topq10_rabc_q_mult/sky_pi0_yam_tshirt_topq10_rabc_q_mult_tshirt_folding_d405_v010_20260420_gop10_20260425_031912/79999",
         default_prompt="Folding tshirt pile and stacking",
     ),
     "yam_topq50_30k": Checkpoint(

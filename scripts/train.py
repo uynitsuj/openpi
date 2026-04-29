@@ -56,16 +56,19 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
     ckpt_dir = config.checkpoint_dir
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+    wandb_id_file = ckpt_dir / "wandb_id.txt"
+    if resuming and wandb_id_file.exists():
+        run_id = wandb_id_file.read_text().strip()
         wandb.init(id=run_id, resume="must", project=config.project_name)
     else:
+        # No wandb_id.txt yet (fresh run) or it never made it to S3 from the
+        # prior crashed/cancelled run — start a new wandb run either way.
         wandb.init(
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
         )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+        wandb_id_file.write_text(wandb.run.id)
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)

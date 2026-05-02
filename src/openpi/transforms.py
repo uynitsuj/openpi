@@ -206,8 +206,19 @@ class ComputeRABCWeights(DataTransformFn):
             denom = max(self.q_max - self.q_min, 1e-8)
             q_norm = float(np.clip((q_val - self.q_min) / denom, 0.0, 1.0))
             thr = self._threshold_from_q_norm(q_norm)
-            mean_vel = float(np.sum(vel) / max(len(vel), 1))
-            weight = 0.0 if mean_vel < thr else float(np.clip(mean_vel, None, self.clip_max))
+            if self.use_final_action_condition:
+                # Per-episode q-derived threshold replaces the static
+                # ``threshold`` in the final-action keep rule:
+                #   keep iff (vel[-1] > 0 AND dv/dt > 0) OR vel[-1] > thr
+                # Kept samples weight = clip(vel[-1], None, clip_max), else 0.
+                final_vel = float(vel[-1])
+                dv_dt = float(vel[-1] - vel[-2]) if len(vel) >= 2 else 0.0
+                cond_accel = final_vel > 0.0 and dv_dt > 0.0
+                cond_above = final_vel > thr
+                weight = float(np.clip(final_vel, None, self.clip_max)) if (cond_accel or cond_above) else 0.0
+            else:
+                mean_vel = float(np.sum(vel) / max(len(vel), 1))
+                weight = 0.0 if mean_vel < thr else float(np.clip(mean_vel, None, self.clip_max))
             data = {**data, "sample_weights": np.float32(weight)}
             data.pop(vel_key, None)
             data.pop("episode_q_norm", None)

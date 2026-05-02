@@ -20,6 +20,7 @@ import torch
 from openpi.models_pytorch import pi0_pytorch
 from openpi.shared import image_tools
 import openpi.shared.array_typing as at
+from openpi.models.random_perspective import RandomPerspective
 
 logger = logging.getLogger("openpi")
 
@@ -169,6 +170,28 @@ def preprocess_observation(
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
             image = image_tools.resize_with_pad(image, *image_resolution)
 
+        # if train:
+        #     # Convert from [-1, 1] to [0, 1] for augmax.
+        #     image = image / 2.0 + 0.5
+
+        #     transforms = []
+        #     if "wrist" not in key:
+        #         height, width = image.shape[1:3]
+        #         transforms += [
+        #             augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
+        #             augmax.Resize(width, height),
+        #             augmax.Rotate((-5, 5)),
+        #         ]
+        #     transforms += [
+        #         augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
+        #     ]
+        #     sub_rngs = jax.random.split(rng, image.shape[0])
+        #     image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
+
+        #     # Back to [-1, 1].
+        #     image = image * 2.0 - 1.0
+        
+        # Greater augmentation & random perspective
         if train:
             # Convert from [-1, 1] to [0, 1] for augmax.
             image = image / 2.0 + 0.5
@@ -177,12 +200,13 @@ def preprocess_observation(
             if "wrist" not in key:
                 height, width = image.shape[1:3]
                 transforms += [
-                    augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
+                    augmax.RandomCrop(int(width * 0.9), int(height * 0.9)),
                     augmax.Resize(width, height),
-                    augmax.Rotate((-5, 5)),
+                    augmax.Rotate((-10, 10)),
+                    RandomPerspective(scale=0.30, p=0.25),
                 ]
             transforms += [
-                augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
+                augmax.ColorJitter(brightness=0.5, contrast=0.6, saturation=0.7),
             ]
             sub_rngs = jax.random.split(rng, image.shape[0])
             image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)

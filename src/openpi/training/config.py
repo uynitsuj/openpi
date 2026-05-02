@@ -1502,7 +1502,9 @@ _CONFIGS = [
         batch_size=32,
         num_workers=8,
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=40_000,
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
         rabc_enabled=True,
     ),
     TrainConfig(
@@ -1520,7 +1522,90 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=60_000,
         save_interval=30_000,
-        keep_period=30_000,      
+        keep_period=30_000,
+        rabc_enabled=False,
+    ),
+    # hlm_tshirt_reward_select — counterpart to the d405 rabc/no_rabc pair on
+    # the human-led-manipulation dataset. Reuses the same pi0 base ckpt as
+    # the d405 configs. repo_id targets the gop10-reencoded variant for
+    # faster random-access decode during training (run
+    # `openpi/scripts/reencode_dense_keyframes.py` once if not yet on disk).
+    TrainConfig(
+        name="pi0_hlm_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_tshirt_reward_select_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_hlm_no_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_tshirt_reward_select_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=False,
+    ),
+    # Merged hlm + d405-under-60s — counterpart to pi0_hlm_{rabc,no_rabc}
+    # but on the 2427-episode merge that adds short d405 demos to the hlm
+    # base. Same prompt + base ckpt; only repo_id changes. RABC variants
+    # (uniform-shape vs piecewise-shape) come from re-injecting the
+    # repromo_progress column with the appropriate RM checkpoint between
+    # launches.
+    TrainConfig(
+        name="pi0_merged_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_under60s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_merged_no_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_under60s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
         rabc_enabled=False,
     ),
     # Hard Q-filter ablations — train on top-N% episodes by rorm_q, no soft weighting.
@@ -1706,7 +1791,80 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=60_000,
         save_interval=30_000,
-        keep_period=30_000,     
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    # q_threshold + final_action variants: q-derived threshold replaces the
+    # static threshold in the final-action keep rule. Sample is kept iff
+    # vel[-1] is positive-and-accelerating OR vel[-1] > q-derived threshold.
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_q_thresh_linear_fa",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="tshirt_folding_d405_v010_20260420_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_mode="q_threshold",
+            rabc_use_final_action_condition=True,
+            q_threshold_shape="linear",
+            q_threshold_low=1.0,
+            q_threshold_high=0.0,
+            val_frac=0.1,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=20_000,
+        keep_period=40_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_q_thresh_sig_top5_fa",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="tshirt_folding_d405_v010_20260420_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_mode="q_threshold",
+            rabc_use_final_action_condition=True,
+            q_threshold_shape="sigmoid",
+            q_threshold_center=0.95,
+            q_threshold_steepness=25.0,
+            q_threshold_low=1.0,
+            q_threshold_high=0.0,
+            val_frac=0.1,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=20_000,
+        keep_period=40_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_rabc_q_thresh_sig_top10_fa",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="tshirt_folding_d405_v010_20260420_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_mode="q_threshold",
+            rabc_use_final_action_condition=True,
+            q_threshold_shape="sigmoid",
+            q_threshold_center=0.90,
+            q_threshold_steepness=20.0,
+            q_threshold_low=1.0,
+            q_threshold_high=0.0,
+            val_frac=0.1,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=20_000,
+        keep_period=40_000,
         rabc_enabled=True,
     ),
     # No-clip RABC — disable both clip bounds so v_weight passes through unmodified.

@@ -188,7 +188,8 @@ NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
     ),
     "hlm_piecewise_rabc_59k": Checkpoint(
         config="pi0_hlm_rabc",
-        dir="/home/justinyu/checkpoints/pi0_hlm_rabc/pi0_hlm_piecewise_bs1024_rabc_20260430_v2/59999",
+        # dir="/home/justinyu/checkpoints/pi0_hlm_rabc/pi0_hlm_piecewise_bs1024_rabc_20260430_v2/59999",
+        dir="/home/hyrl/checkpoints/pi0_hlm_piecewise_bs1024_rabc_20260430_v2/59999",
         default_prompt="Folding tshirt pile and stacking",
     ),
     "hlm_uniform_rabc_59k": Checkpoint(
@@ -199,6 +200,12 @@ NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
     "hlm_no_rabc_59k": Checkpoint(
         config="pi0_hlm_no_rabc",
         dir="/home/justinyu/checkpoints/pi0_hlm_no_rabc/pi0_hlm_baseline_bs1024_no_rabc_20260430_v2/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+
+    "pi0_hlm_d405short25rm_bs1024_rabc_20260501": Checkpoint(
+        config="pi0_hlm_rabc",
+        dir="/home/hyrl/checkpoints/pi0_hlm_d405short25rm_bs1024_rabc_20260501/59999",
         default_prompt="Folding tshirt pile and stacking",
     ),
 }

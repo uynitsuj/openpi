@@ -55,6 +55,22 @@ class Policy(BasePolicy):
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
 
+        # RTC action_prefix normalizer — invert the Unnormalize step in
+        # output_transforms so an incoming prefix (client-space actions) is
+        # projected back into the model's normalized action space, matching
+        # the coordinate system of the denoiser's x_t / x1_t. Without this,
+        # the RTC guidance correction pulls x1_t toward client-space values
+        # which then get re-unnormalized on output → chunks violently off.
+        self._rtc_action_normalizer: _transforms.Normalize | None = None
+        for t in output_transforms:
+            if isinstance(t, _transforms.Unnormalize):
+                self._rtc_action_normalizer = _transforms.Normalize(
+                    norm_stats=t.norm_stats,
+                    use_quantiles=t.use_quantiles,
+                    strict=False,
+                )
+                break
+
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
             self._model.eval()
@@ -66,6 +82,19 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        # Pluck RTC fields off before transformations — they're model-side guidance
+        # hints, not observations that need _input_transform's scaling / resizing.
+        # Both are forwarded straight to sample_actions via sample_kwargs below.
+        rtc_action_prefix = obs.pop("action_prefix", None) if isinstance(obs, dict) else None
+        rtc_inference_delay = obs.pop("inference_delay", 0) if isinstance(obs, dict) else 0
+        rtc_execution_horizon = obs.pop("execution_horizon", None) if isinstance(obs, dict) else None
+        rtc_max_guidance_weight = obs.pop("max_guidance_weight", None) if isinstance(obs, dict) else None
+        # rtc_debug ignored at the policy layer — the RTC denoiser always emits
+        # jax.debug.print stats when active (can't thread a Python bool through
+        # the NNX jit wrapper without making it a static_argname).
+        if isinstance(obs, dict):
+            obs.pop("rtc_debug", None)
+
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -86,6 +115,33 @@ class Policy(BasePolicy):
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+
+        # Forward RTC guidance hints (model's sample_actions tolerates None).
+        if rtc_action_prefix is not None:
+            prefix_arr = np.asarray(rtc_action_prefix, dtype=np.float32)
+            # Normalize client-space → model normalized-space so err =
+            # (prefix − x1_t) compares apples to apples inside the denoiser.
+            if self._rtc_action_normalizer is not None:
+                prefix_arr = np.asarray(
+                    self._rtc_action_normalizer({"actions": prefix_arr})["actions"],
+                    dtype=np.float32,
+                )
+            prefix_arr = jnp.asarray(prefix_arr)
+            if prefix_arr.ndim == 2:                  # (T_prev, A) → add batch
+                prefix_arr = prefix_arr[None, ...]
+            sample_kwargs["action_prefix"] = prefix_arr
+            sample_kwargs["inference_delay"] = jnp.asarray(int(rtc_inference_delay), dtype=jnp.int32)
+            if rtc_execution_horizon is not None:
+                # Pass as a JAX scalar (dynamic) not a Python int — lets value
+                # changes between inferences reuse the JIT cache. The model's
+                # sample_actions_rtc coerces this into a jnp.float32 regardless.
+                sample_kwargs["execution_horizon"] = jnp.asarray(
+                    int(rtc_execution_horizon), dtype=jnp.int32
+                )
+            if rtc_max_guidance_weight is not None:
+                sample_kwargs["max_guidance_weight"] = jnp.asarray(
+                    float(rtc_max_guidance_weight), dtype=jnp.float32
+                )
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()

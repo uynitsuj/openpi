@@ -103,10 +103,49 @@ class RepackTransform(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class ComputeRABCWeights(DataTransformFn):
-    """Compute per-sample RABC weights from rorm_velocity.
+    """Compute per-sample RABC weights from rorm_velocity (and optionally rorm_q).
 
-    Integrates velocity over the action horizon (area under curve),
-    normalizes by horizon length, and clips to [clip_min, clip_max].
+    Velocity weight: v_weight = clip(mean(rorm_velocity over chunk), clip_min, clip_max)
+
+    When q_min/q_max are provided, also normalizes rorm_q:
+      q_norm = clip((rorm_q - q_min) / (q_max - q_min), 0, 1)
+
+    Combined per ``mode``:
+      "velocity_only"  (default): w = v_weight
+      "multiplicative":           w = v_weight * q_norm
+      "additive":                 w = 0.5 * (v_weight + q_norm)
+      "q_threshold":              episode-Q-driven adaptive velocity threshold
+                                  (see q_threshold_* params)
+
+    Legacy velocity-only modes (threshold / use_final_action_condition) still
+    work when mode="velocity_only".
+
+    When ``threshold`` is set and mode="velocity_only", samples with integrated
+    weight below the threshold are zeroed out instead of clipped to clip_min.
+
+    When ``use_final_action_condition`` is True, skips integration and instead
+    keeps the sample iff either of these holds at the final action in the chunk:
+      1. velocity is positive AND dv/dt is positive (accelerating upward), OR
+      2. velocity is above ``threshold``.
+    Kept samples get weight = clip(vel[-1], None, clip_max); rejected samples
+    get weight = 0. ``threshold`` must be set in this mode.
+
+    q_threshold mode: compute q_norm via the same min-max normalization the
+    multiplicative/additive modes use:
+      q_norm = clip((rorm_q - q_min) / (q_max - q_min), 0, 1)
+    Then map q_norm to a per-episode velocity threshold via ``q_threshold_shape``:
+      "linear":  thr = q_threshold_low + (q_threshold_high - q_threshold_low) * q_norm
+      "sigmoid": thr = q_threshold_high
+                       + (q_threshold_low - q_threshold_high)
+                       * (1 - sigmoid((q_norm - q_threshold_center) * q_threshold_steepness))
+    With defaults q_threshold_low=1.0, q_threshold_high=0.0: best episode →
+    threshold 0 (any positive velocity passes); worst episode → threshold 1.
+    Kept chunks get weight = clip(mean(vel), None, clip_max); rejected get 0.
+
+    Previously this mode required a precomputed rank-percentile lookup
+    (InjectEpisodeQNorm) keyed on episode_index; that path is gone in favor
+    of pure min-max so the threshold computation is self-contained per sample
+    and behaves consistently with the multiplicative/additive modes.
 
     Expects `rorm_velocity` in the data dict as shape (action_horizon,).
     Produces `sample_weights` as a scalar float.
@@ -114,19 +153,148 @@ class ComputeRABCWeights(DataTransformFn):
 
     clip_min: float = 0.0
     clip_max: float = 1.0
+    threshold: float | None = None
+    use_final_action_condition: bool = False
+    mode: str = "velocity_only"
+    q_min: float | None = None
+    q_max: float | None = None
+    # q_threshold mode params.
+    q_threshold_low: float = 1.0
+    q_threshold_high: float = 0.0
+    q_threshold_shape: str = "linear"  # "linear" | "sigmoid"
+    q_threshold_center: float = 0.5
+    q_threshold_steepness: float = 10.0
+
+    def _threshold_from_q_norm(self, q_norm: float) -> float:
+        if self.q_threshold_shape == "linear":
+            return float(self.q_threshold_low + (self.q_threshold_high - self.q_threshold_low) * q_norm)
+        if self.q_threshold_shape == "sigmoid":
+            x = (q_norm - self.q_threshold_center) * self.q_threshold_steepness
+            sig = 1.0 / (1.0 + float(np.exp(-x)))
+            return float(self.q_threshold_high + (self.q_threshold_low - self.q_threshold_high) * (1.0 - sig))
+        raise ValueError(
+            f"Unknown q_threshold_shape {self.q_threshold_shape!r}. Expected 'linear' or 'sigmoid'."
+        )
 
     def __call__(self, data: DataDict) -> DataDict:
-        if "rorm_velocity" not in data:
+        # Schema migration: read repromo_signed_magnitude (canonical, post
+        # Repromo rename) or fall back to rorm_velocity (legacy, pre-rename).
+        # Same for repromo_quality vs rorm_q on the quality side.
+        vel_key = next(
+            (k for k in ("repromo_signed_magnitude", "rorm_velocity") if k in data),
+            None,
+        )
+        if vel_key is None:
             return data
-        vel = np.asarray(data["rorm_velocity"], dtype=np.float32)
-        # Integrate velocity over the action horizon and normalize
-        weight = float(np.sum(vel) / max(len(vel), 1))
-        # Clip to range
-        weight = float(np.clip(weight, self.clip_min, self.clip_max))
+        vel = np.asarray(data[vel_key], dtype=np.float32)
+
+        if self.mode == "q_threshold":
+            if self.q_min is None or self.q_max is None:
+                raise ValueError(
+                    "mode='q_threshold' requires q_min and q_max for min-max "
+                    "normalization. Set them on the config (typically via "
+                    "rabc_q_min / rabc_q_max or autoload from rabc_stats.json)."
+                )
+            q_key = next((k for k in ("repromo_quality", "rorm_q") if k in data), None)
+            if q_key is None:
+                raise KeyError(
+                    "mode='q_threshold' requires `repromo_quality` (or legacy "
+                    "`rorm_q`) in the data dict; ensure RepackTransform is "
+                    "carrying it through."
+                )
+            q_val = float(np.asarray(data[q_key], dtype=np.float32).reshape(-1)[0])
+            denom = max(self.q_max - self.q_min, 1e-8)
+            q_norm = float(np.clip((q_val - self.q_min) / denom, 0.0, 1.0))
+            thr = self._threshold_from_q_norm(q_norm)
+            if self.use_final_action_condition:
+                # Per-episode q-derived threshold replaces the static
+                # ``threshold`` in the final-action keep rule:
+                #   keep iff (vel[-1] > 0 AND dv/dt > 0) OR vel[-1] > thr
+                # Kept samples weight = clip(vel[-1], None, clip_max), else 0.
+                final_vel = float(vel[-1])
+                dv_dt = float(vel[-1] - vel[-2]) if len(vel) >= 2 else 0.0
+                cond_accel = final_vel > 0.0 and dv_dt > 0.0
+                cond_above = final_vel > thr
+                weight = float(np.clip(final_vel, None, self.clip_max)) if (cond_accel or cond_above) else 0.0
+            else:
+                mean_vel = float(np.sum(vel) / max(len(vel), 1))
+                weight = 0.0 if mean_vel < thr else float(np.clip(mean_vel, None, self.clip_max))
+            data = {**data, "sample_weights": np.float32(weight)}
+            data.pop(vel_key, None)
+            data.pop("episode_q_norm", None)
+            for k in ("repromo_quality", "rorm_q"):
+                data.pop(k, None)
+            return data
+
+        if self.use_final_action_condition:
+            if self.threshold is None:
+                raise ValueError("use_final_action_condition=True requires `threshold` to be set.")
+            final_vel = float(vel[-1])
+            dv_dt = float(vel[-1] - vel[-2]) if len(vel) >= 2 else 0.0
+            cond_accel = final_vel > 0.0 and dv_dt > 0.0
+            cond_above = final_vel > self.threshold
+            weight = float(np.clip(final_vel, None, self.clip_max)) if (cond_accel or cond_above) else 0.0
+        else:
+            weight = float(np.sum(vel) / max(len(vel), 1))
+            if self.threshold is not None:
+                weight = 0.0 if weight < self.threshold else float(np.clip(weight, None, self.clip_max))
+            else:
+                weight = float(np.clip(weight, self.clip_min, self.clip_max))
+
+        q_key = next(
+            (k for k in ("repromo_quality", "rorm_q") if k in data),
+            None,
+        )
+        can_use_q = (
+            self.mode != "velocity_only"
+            and self.q_min is not None
+            and self.q_max is not None
+            and q_key is not None
+        )
+        if can_use_q:
+            q_val = float(np.asarray(data[q_key], dtype=np.float32).reshape(-1)[0])
+            denom = max(self.q_max - self.q_min, 1e-8)
+            q_norm = float(np.clip((q_val - self.q_min) / denom, 0.0, 1.0))
+            if self.mode == "multiplicative":
+                weight = weight * q_norm
+            elif self.mode == "additive":
+                weight = 0.5 * (weight + q_norm)
+            else:
+                raise ValueError(
+                    f"Unknown RABC mode {self.mode!r}. Expected 'velocity_only', "
+                    "'multiplicative', 'additive', or 'q_threshold'."
+                )
+
         data = {**data, "sample_weights": np.float32(weight)}
-        # Remove raw velocity from dict (not needed downstream)
-        data.pop("rorm_velocity", None)
+        data.pop(vel_key, None)
+        if q_key is not None:
+            data.pop(q_key, None)
+        data.pop("episode_q_norm", None)
         return data
+
+
+@dataclasses.dataclass(frozen=True)
+class InjectEpisodeQNorm(DataTransformFn):
+    """Deprecated. q_threshold mode now uses min-max normalization on the
+    per-frame `repromo_quality` directly, the same as multiplicative/additive
+    modes — no precomputed rank lookup is needed. This class is kept only so
+    pickled configs from prior runs still import; remove once nothing in flight
+    depends on it.
+    """
+
+    episode_q_norm_pairs: tuple[tuple[int, float], ...] = ()
+    default: float = 0.0
+
+    def __post_init__(self) -> None:
+        lookup = {int(k): float(v) for k, v in self.episode_q_norm_pairs}
+        object.__setattr__(self, "_lookup", lookup)
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "episode_index" not in data:
+            return data
+        ep = int(np.asarray(data["episode_index"]).reshape(-1)[0])
+        q = self._lookup.get(ep, self.default)
+        return {**data, "episode_q_norm": np.float32(q)}
 
 
 @dataclasses.dataclass(frozen=True)

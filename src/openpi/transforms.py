@@ -164,6 +164,28 @@ class ComputeRABCWeights(DataTransformFn):
     q_threshold_shape: str = "linear"  # "linear" | "sigmoid"
     q_threshold_center: float = 0.5
     q_threshold_steepness: float = 10.0
+    # Window-aggregator: how to collapse the per-frame velocity vector into a
+    # single scalar weight before clipping. "mean" (default) is the historical
+    # behavior. "min" takes the lowest velocity in the chunk — penalizes any
+    # frame in the window dipping into anti-progress, which is a stricter
+    # criterion than averaging (one bad frame zeros out the weight after
+    # clip_min). "max" takes the highest velocity — rewards windows whose
+    # best frame is positive, useful when chunks straddle action boundaries.
+    velocity_aggregator: str = "mean"
+
+    def _aggregate_velocity(self, vel: np.ndarray) -> float:
+        """Collapse the per-frame velocity vector to a scalar window weight."""
+        n = max(len(vel), 1)
+        if self.velocity_aggregator == "mean":
+            return float(np.sum(vel) / n)
+        if self.velocity_aggregator == "min":
+            return float(np.min(vel))
+        if self.velocity_aggregator == "max":
+            return float(np.max(vel))
+        raise ValueError(
+            f"Unknown velocity_aggregator {self.velocity_aggregator!r}. "
+            "Expected 'mean' | 'min' | 'max'."
+        )
 
     def _threshold_from_q_norm(self, q_norm: float) -> float:
         if self.q_threshold_shape == "linear":
@@ -217,8 +239,8 @@ class ComputeRABCWeights(DataTransformFn):
                 cond_above = final_vel > thr
                 weight = float(np.clip(final_vel, None, self.clip_max)) if (cond_accel or cond_above) else 0.0
             else:
-                mean_vel = float(np.sum(vel) / max(len(vel), 1))
-                weight = 0.0 if mean_vel < thr else float(np.clip(mean_vel, None, self.clip_max))
+                agg_vel = self._aggregate_velocity(vel)
+                weight = 0.0 if agg_vel < thr else float(np.clip(agg_vel, None, self.clip_max))
             data = {**data, "sample_weights": np.float32(weight)}
             data.pop(vel_key, None)
             data.pop("episode_q_norm", None)
@@ -235,7 +257,7 @@ class ComputeRABCWeights(DataTransformFn):
             cond_above = final_vel > self.threshold
             weight = float(np.clip(final_vel, None, self.clip_max)) if (cond_accel or cond_above) else 0.0
         else:
-            weight = float(np.sum(vel) / max(len(vel), 1))
+            weight = self._aggregate_velocity(vel)
             if self.threshold is not None:
                 weight = 0.0 if weight < self.threshold else float(np.clip(weight, None, self.clip_max))
             else:

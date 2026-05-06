@@ -806,6 +806,11 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
     # Use rank-based percentiles, e.g. 0.95 for "top 5%", 0.90 for "top 10%".
     q_threshold_center: float = 0.5
     q_threshold_steepness: float = 10.0
+    # How to collapse the per-frame velocity vector into a single window
+    # weight before clipping. "mean" (default) is the historical behavior.
+    # "min" picks the lowest velocity in the chunk — stricter, penalizes any
+    # frame in the window dipping into anti-progress. "max" picks the highest.
+    rabc_velocity_aggregator: str = "mean"
     # Hard Q-filter: keep only the top fraction of episodes by mean rorm_q.
     top_q_frac: float | None = None
     # Length filter: keep only the shortest fraction of episodes by frame count.
@@ -874,6 +879,7 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
                 q_threshold_shape=self.q_threshold_shape,
                 q_threshold_center=self.q_threshold_center,
                 q_threshold_steepness=self.q_threshold_steepness,
+                velocity_aggregator=self.rabc_velocity_aggregator,
             ),
             yam_policy.YamInputs(action_dim=model_config.action_dim, model_type=model_config.model_type),
         ]
@@ -1607,6 +1613,101 @@ _CONFIGS = [
         save_interval=30_000,
         keep_period=30_000,
         rabc_enabled=False,
+    ),
+    # Wider merge — hlm + d405 episodes ≤ 90s (4124 episodes total) instead
+    # of the under-60s 2427. More d405 demonstrations added to the training
+    # mix; downstream RABC + no-RABC pair to sweep whether the wider data
+    # window helps under the fs=2 RM signal.
+    TrainConfig(
+        name="pi0_merged90_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_under90s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_merged90_no_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_under90s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=False,
+    ),
+    # Run-2 variant: pi0 on merged90 forked with truear-trained d405 RM
+    # (--sampler truear). Forked S3 prefix because 171/172 spent 3h+ in
+    # capacity-PENDING — the in-place re-inject race that "non-spot makes
+    # negligible" reopens when 171/172 haven't even synced yet. Forking
+    # restores correctness; the fork videos are already on S3.
+    TrainConfig(
+        name="pi0_merged90_truearrm_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_under90s_truearrm_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    # Run-3 variant: pi0 on merged90 with d405-short25-RM sidecar but window
+    # weight = MIN(velocity) instead of mean. Stricter — any anti-progress
+    # frame in the chunk drives the weight down.
+    TrainConfig(
+        name="pi0_merged90_rabc_minwin",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_under90s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_velocity_aggregator="min",
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    # Run-4 dataset: hlm + singlefold-d405 (no time filter, multi-fold pruned).
+    # 7679 episodes — adds the full surviving d405 single-fold corpus to hlm.
+    TrainConfig(
+        name="pi0_merged_singlefold_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_singlefold_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
     ),
     # Hard Q-filter ablations — train on top-N% episodes by rorm_q, no soft weighting.
     # Direct counterpart to the multiplicative/additive RABC runs for A/B comparison.

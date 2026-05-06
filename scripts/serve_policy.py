@@ -171,6 +171,57 @@ NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
         dir="/home/justinyu/checkpoints/pi0_yam_tshirt_topq50/sky_pi0_yam_tshirt_topq50_tshirt_folding_d405_v010_20260420_gop10_20260425_025936/30000",
         default_prompt="Folding tshirt pile and stacking",
     ),
+    "yam_no_rabc_d405_30k": Checkpoint(
+        config="pi0_yam_tshirt_no_rabc_d405",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_no_rabc_d405/sky_pi0_yam_tshirt_no_rabc_d405_tshirt_folding_d405_v010_20260420_gop10_20260428_200336/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_q_thresh_linear_30k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_q_thresh_linear",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_q_thresh_linear/sky_pi0_yam_tshirt_rabc_q_thresh_linear_tshirt_folding_d405_v010_20260420_gop10_20260429_030557/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_q_thresh_sig_top5_59k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_q_thresh_sig_top5",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_q_thresh_sig_top5/sky_pi0_yam_tshirt_rabc_q_thresh_sig_top5_tshirt_folding_d405_v010_20260420_gop10_20260429_030558/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "hlm_piecewise_rabc_59k": Checkpoint(
+        config="pi0_hlm_rabc",
+        # dir="/home/justinyu/checkpoints/pi0_hlm_rabc/pi0_hlm_piecewise_bs1024_rabc_20260430_v2/59999",
+        dir="/home/hyrl/checkpoints/pi0_hlm_piecewise_bs1024_rabc_20260430_v2/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "hlm_uniform_rabc_59k": Checkpoint(
+        config="pi0_hlm_rabc",
+        dir="/home/justinyu/checkpoints/pi0_hlm_rabc/pi0_hlm_uniform_bs1024_rabc_20260430_v2/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "hlm_no_rabc_59k": Checkpoint(
+        config="pi0_hlm_no_rabc",
+        dir="/home/justinyu/checkpoints/pi0_hlm_no_rabc/pi0_hlm_baseline_bs1024_no_rabc_20260430_v2/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_hlm_d405short25rm_bs1024_rabc_20260501": Checkpoint(
+        config="pi0_hlm_rabc",
+        dir="/home/hyrl/checkpoints/pi0_hlm_rabc/pi0_hlm_d405short25rm_bs1024_rabc_20260501/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged_d405_no_rabc_20260501": Checkpoint(
+        config="pi0_merged_no_rabc",
+        dir="/home/hyrl/checkpoints/pi0_merged_no_rabc/pi0_merged_baseline_bs1024_no_rabc_20260501/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged_d405short25rm_bs1024_rabc_20260501": Checkpoint(
+        config="pi0_merged_rabc",
+        dir="/home/hyrl/checkpoints/pi0_merged_rabc/pi0_merged_d405short25rm_bs1024_rabc_20260501/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged_fs2_bs1024_rabc_20260503": Checkpoint(
+        config="pi0_merged_rabc",
+        dir="/home/hyrl/checkpoints/pi0_merged_rabc/pi0_merged_fs2rm_bs1024_rabc_20260503/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
 }
 
 NamedCheckpointKey = Literal[*NAMED_CHECKPOINTS]

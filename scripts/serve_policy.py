@@ -1,7 +1,10 @@
 import dataclasses
 import enum
 import logging
+import pathlib
+import shutil
 import socket
+import subprocess
 from typing import Literal
 
 import tyro
@@ -64,6 +67,10 @@ class Args:
 
     # Shortcut for serving a named checkpoint (see NAMED_CHECKPOINTS). Takes precedence over --policy.
     name: "NamedCheckpointKey | None" = None
+
+    # S3 path to a checkpoint directory (e.g., s3://bucket/model_ckpts/config_name/run_name/step/).
+    # Downloads assets, params, and metadata (excluding train_state) to ~/checkpoints/.
+    s3: str | None = None
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | NamedCheckpoint | Default = dataclasses.field(default_factory=Default)
@@ -217,9 +224,14 @@ NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
         dir="/home/hyrl/checkpoints/pi0_merged_rabc/pi0_merged_d405short25rm_bs1024_rabc_20260501/59999",
         default_prompt="Folding tshirt pile and stacking",
     ),
-    "pi0_merged_fs2_bs1024_rabc_20260503": Checkpoint(
-        config="pi0_merged_rabc",
-        dir="/home/hyrl/checkpoints/pi0_merged_rabc/pi0_merged_fs2rm_bs1024_rabc_20260503/30000",
+    "pi0_merged90_d405short25rm_bs1024_rabc_20260505": Checkpoint(
+        config="pi0_merged90_rabc",
+        dir="/home/hyrl/checkpoints/pi0_merged90_rabc/pi0_merged90_d405short25rm_bs1024_rabc_20260505/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_d405short25rm_bs1024_rabcminwin_20260505": Checkpoint(
+        config="pi0_merged90_rabc_minwin",
+        dir="/home/hyrl/checkpoints/pi0_merged90_rabc_minwin/pi0_merged90_d405short25rm_bs1024_rabcminwin_20260505/59999",
         default_prompt="Folding tshirt pile and stacking",
     ),
 }
@@ -249,6 +261,42 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
+def download_s3_checkpoint(s3_path: str) -> Checkpoint:
+    """Download a checkpoint from S3, excluding train_state, and return a Checkpoint."""
+    s3_path = s3_path.rstrip("/")
+    parts = s3_path.split("/")
+
+    try:
+        ckpts_idx = parts.index("model_ckpts")
+    except ValueError:
+        raise ValueError(f"S3 path must contain 'model_ckpts/' segment: {s3_path}")
+
+    remaining = parts[ckpts_idx + 1 :]
+    if len(remaining) < 3:
+        raise ValueError(
+            f"Expected s3://...model_ckpts/<config>/<run_name>/<step>/, got: {s3_path}"
+        )
+
+    config_name = remaining[0]
+    run_name = remaining[1]
+    step = remaining[2]
+
+    local_dir = pathlib.Path.home() / "checkpoints" / run_name / step
+    if local_dir.exists() and (local_dir / "params").exists():
+        logging.info("Checkpoint already exists at %s, skipping download", local_dir)
+    else:
+        local_dir.mkdir(parents=True, exist_ok=True)
+        logging.info("Downloading checkpoint from %s to %s (excluding train_state)", s3_path, local_dir)
+        if shutil.which("aws") is None:
+            raise RuntimeError("aws CLI is required for S3 downloads but was not found")
+        subprocess.run(
+            ["aws", "s3", "sync", s3_path, str(local_dir), "--exclude", "train_state/*"],
+            check=True,
+        )
+
+    return Checkpoint(config=config_name, dir=str(local_dir))
+
+
 def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
@@ -260,6 +308,13 @@ def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) ->
 
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
+    if args.s3 is not None:
+        ckpt = download_s3_checkpoint(args.s3)
+        return _policy_config.create_trained_policy(
+            _config.get_config(ckpt.config),
+            ckpt.dir,
+            default_prompt=args.default_prompt or ckpt.default_prompt,
+        )
     if args.name is not None:
         ckpt = NAMED_CHECKPOINTS[args.name]
         return _policy_config.create_trained_policy(

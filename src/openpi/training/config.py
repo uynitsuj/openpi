@@ -789,8 +789,10 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
     default_prompt: str | None = None
     rabc_clip_min: float = 0.0
     rabc_clip_max: float = 1.0
-    rabc_threshold: float | None = None
-    rabc_use_final_action_condition: bool = False
+    # Default flipped 2026-05-07 — finalaction gating beat mean integration
+    # 11/12 vs 0/12 on real-world tshirt-fold eval; future configs inherit it.
+    rabc_threshold: float | None = 0.50
+    rabc_use_final_action_condition: bool = True
     # Q-based reweighting mode. One of {"velocity_only", "multiplicative", "additive", "q_threshold"}.
     rabc_mode: str = "velocity_only"
     # Explicit Q normalization range. Auto-loaded from rabc_stats.json when None.
@@ -1587,6 +1589,8 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
+            rabc_use_final_action_condition=False,
+            rabc_threshold=None,
         ),
         batch_size=32,
         num_workers=8,
@@ -1625,6 +1629,8 @@ _CONFIGS = [
             repo_id="hlm_plus_d405_under90s_gop10",
             default_prompt="Folding tshirt pile and stacking",
             base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=False,  # preserve original mean-aggregator behavior
+            rabc_threshold=None,
         ),
         batch_size=32,
         num_workers=8,
@@ -1645,6 +1651,7 @@ _CONFIGS = [
                 repo_id="hlm_plus_d405_under90s_gop10",
                 default_prompt="Folding tshirt pile and stacking",
                 base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=False,
                 rabc_threshold=thr,
                 rabc_clip_max=float("inf"),
             ),
@@ -1658,6 +1665,74 @@ _CONFIGS = [
         )
         for thr in (0.50, 0.60, 0.75)
     ],
+    # hlm+all-d405 (singlefold-pruned, no time filter, 7679 ep). Same data +
+    # injected RM as Run-4 (pi0_merged_singlefold_rabc); final-action gating
+    # with two thresholds.
+    *[
+        TrainConfig(
+            name=f"pi0_merged_singlefold_rabc_finalaction_thr{int(thr * 100):03d}",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id="hlm_plus_d405_singlefold_gop10",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=True,
+                rabc_threshold=thr,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+            num_train_steps=60_000,
+            save_interval=30_000,
+            keep_period=30_000,
+            rabc_enabled=True,
+        )
+        for thr in (0.50, 0.75)
+    ],
+    # 120s-cap variants: hlm + d405<120s, d405-short25-RM injected, final-action
+    # gating with two thresholds for sweep.
+    *[
+        TrainConfig(
+            name=f"pi0_merged120_rabc_finalaction_thr{int(thr * 100):03d}",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id="hlm_plus_d405_under120s_gop10",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=True,
+                rabc_threshold=thr,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+            num_train_steps=60_000,
+            save_interval=30_000,
+            keep_period=30_000,
+            rabc_enabled=True,
+        )
+        for thr in (0.50, 0.75)
+    ],
+    # Run-5b variant: same as finalaction, but multiply weight by q_norm
+    # (min-max from injected pinned Q). Q comes from injected repromo_quality.
+    TrainConfig(
+        name="pi0_merged90_rabc_finalaction_mult",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_under90s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=0.50,
+            rabc_mode="multiplicative",
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
     # Run-5 variant: pi0 on merged90 with d405-short25-RM, RABC weight
     # additionally gated by the final-action condition. Same data + RM as
     # Run-1 (pi0_merged90_rabc) — only the transform flag differs.
@@ -1707,6 +1782,8 @@ _CONFIGS = [
             repo_id="hlm_plus_d405_under90s_truearrm_gop10",
             default_prompt="Folding tshirt pile and stacking",
             base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=False,
+            rabc_threshold=None,
         ),
         batch_size=32,
         num_workers=8,
@@ -1727,6 +1804,8 @@ _CONFIGS = [
             default_prompt="Folding tshirt pile and stacking",
             base_config=DataConfig(prompt_from_task=True),
             rabc_velocity_aggregator="min",
+            rabc_use_final_action_condition=False,
+            rabc_threshold=None,
         ),
         batch_size=32,
         num_workers=8,
@@ -1745,6 +1824,8 @@ _CONFIGS = [
             repo_id="hlm_plus_d405_singlefold_gop10",
             default_prompt="Folding tshirt pile and stacking",
             base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=False,
+            rabc_threshold=None,
         ),
         batch_size=32,
         num_workers=8,

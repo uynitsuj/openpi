@@ -234,6 +234,36 @@ NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
         dir="/home/hyrl/checkpoints/pi0_merged90_rabc_minwin/pi0_merged90_d405short25rm_bs1024_rabcminwin_20260505/59999",
         default_prompt="Folding tshirt pile and stacking",
     ),
+    "pi0_merged90_d405short25rm_bs1024_rabc_thr050_nomax_20260506": Checkpoint(
+        config="pi0_merged90_rabc_thr050_nomax",
+        dir="/home/hyrl/checkpoints/pi0_merged90_rabc_thr050_nomax/pi0_merged90_d405short25rm_bs1024_rabc_thr050_nomax_20260506/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_d405short25rm_bs1024_rabc_thr075_nomax_20260506": Checkpoint(
+        config="pi0_merged90_rabc_thr075_nomax",
+        dir="/home/hyrl/checkpoints/pi0_merged90_rabc_thr075_nomax/pi0_merged90_d405short25rm_bs1024_rabc_thr075_nomax_20260506/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_d405short25rm_bs1024_rabc_finalaction_thr050_20260506": Checkpoint(
+        config="pi0_merged90_rabc_finalaction",
+        dir="/home/hyrl/checkpoints/pi0_merged90_rabc_finalaction/pi0_merged90_d405short25rm_bs1024_rabc_finalaction_thr050_20260506/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_d405short25rm_bs1024_rabc_thr075_nomax_20260506": Checkpoint(
+        config="pi0_merged90_rabc_thr075_nomax",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged90_rabc_thr075_nomax/pi0_merged90_d405short25rm_bs1024_rabc_thr075_nomax_20260506/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged_singlefold_d405short25rm_bs1024_rabc_finalaction_thr050_20260507": Checkpoint(
+        config="pi0_merged_singlefold_rabc_finalaction_thr050",
+        dir="/home/hyrl/checkpoints/pi0_merged_singlefold_rabc_finalaction_thr050/pi0_merged_singlefold_d405short25rm_bs1024_rabc_finalaction_thr050_20260507/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_fs2rm_bs1024_no_rabc_20260504": Checkpoint(
+        config="pi0_merged_singlefold_rabc_finalaction_thr050",
+        dir="/home/hyrl/checkpoints/pi0_merged90_no_rabc/pi0_merged90_fs2rm_bs1024_no_rabc_20260504/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
 }
 
 NamedCheckpointKey = Literal[*NAMED_CHECKPOINTS]

@@ -254,6 +254,11 @@ NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
         dir="s3://xdof-internal-research/model_ckpts/pi0_merged90_rabc_thr075_nomax/pi0_merged90_d405short25rm_bs1024_rabc_thr075_nomax_20260506/59999",
         default_prompt="Folding tshirt pile and stacking",
     ),
+    "pi0_merged90_d405short25rm_bs1024_rabc_finalaction_mult_thr050_20260507": Checkpoint(
+        config="pi0_merged90_rabc_finalaction_mult",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged90_rabc_finalaction_mult/pi0_merged90_d405short25rm_bs1024_rabc_finalaction_mult_thr050_20260507/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
     "pi0_merged_singlefold_d405short25rm_bs1024_rabc_finalaction_thr050_20260507": Checkpoint(
         config="pi0_merged_singlefold_rabc_finalaction_thr050",
         dir="/home/hyrl/checkpoints/pi0_merged_singlefold_rabc_finalaction_thr050/pi0_merged_singlefold_d405short25rm_bs1024_rabc_finalaction_thr050_20260507/59999",

@@ -108,6 +108,19 @@ class DataConfig:
     # Held-out validation episodes. Used by val dataloader if set.
     val_episodes: tuple[int, ...] | None = None
 
+    # If True, the data loader filters out samples whose RABC weight is 0 so
+    # every batch has fully positive weights. ``reject_zero_weighted_mode``
+    # picks the implementation:
+    #   - "subset" (default): precompute the valid flat indices once from
+    #     parquet (no video decode), wrap the transformed dataset in
+    #     torch.utils.data.Subset. Single decision per index, no runtime cost.
+    #   - "rejection": per-getitem rejection sampling — re-decodes video on
+    #     each retry. Kept as a fallback for cases where the subset precompute
+    #     can't be trusted (custom transforms, dynamic weights).
+    # No-op when no `sample_weights` key is produced (rabc disabled).
+    reject_zero_weighted_samples: bool = True
+    reject_zero_weighted_mode: str = "subset"
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -793,6 +806,15 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
     # 11/12 vs 0/12 on real-world tshirt-fold eval; future configs inherit it.
     rabc_threshold: float | None = 0.50
     rabc_use_final_action_condition: bool = True
+    # Filter zero-weighted chunks so the effective batch size matches the
+    # nominal one (no GPU FLOPs spent on samples whose gradient is exactly
+    # zero). Set False to revert to the legacy "weight-by-zero" loss-mask
+    # behavior. See DataConfig.reject_zero_weighted_samples.
+    rabc_reject_zero_weighted: bool = True
+    # Implementation: "subset" precomputes valid indices from parquet once and
+    # wraps the dataset in torch.utils.data.Subset (zero runtime overhead).
+    # "rejection" does per-getitem retry (re-decodes video on each rejection).
+    rabc_reject_zero_weighted_mode: str = "subset"
     # Q-based reweighting mode. One of {"velocity_only", "multiplicative", "additive", "q_threshold"}.
     rabc_mode: str = "velocity_only"
     # Explicit Q normalization range. Auto-loaded from rabc_stats.json when None.
@@ -930,6 +952,8 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             episodes=episodes,
             val_episodes=val_episodes,
+            reject_zero_weighted_samples=self.rabc_reject_zero_weighted,
+            reject_zero_weighted_mode=self.rabc_reject_zero_weighted_mode,
         )
 
 
@@ -1690,7 +1714,10 @@ _CONFIGS = [
         for thr in (0.50, 0.75)
     ],
     # 120s-cap variants: hlm + d405<120s, d405-short25-RM injected, final-action
-    # gating with two thresholds for sweep.
+    # gating. thr=0.75 keeps ~52% of frames; thr=1.00 keeps ~22% (long-episode
+    # frames almost entirely drop). thr=0.50 retired 2026-05-08 — the strict
+    # gate without cond_accel kept ~80% which under-filtered long episodes
+    # relative to RM-prediction shape.
     *[
         TrainConfig(
             name=f"pi0_merged120_rabc_finalaction_thr{int(thr * 100):03d}",
@@ -1710,7 +1737,7 @@ _CONFIGS = [
             keep_period=30_000,
             rabc_enabled=True,
         )
-        for thr in (0.50, 0.75)
+        for thr in (0.75, 1.00)
     ],
     # Run-5b variant: same as finalaction, but multiply weight by q_norm
     # (min-max from injected pinned Q). Q comes from injected repromo_quality.
@@ -1745,6 +1772,47 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             rabc_use_final_action_condition=True,
             rabc_threshold=0.50,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    # thr=1.0 strict variant — the most aggressive filter; long-episode frames
+    # are nearly all dropped. Expected keep ~34% on under90s.
+    TrainConfig(
+        name="pi0_merged90_rabc_finalaction_thr100",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_under90s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    # thr=0.75 strict variant of pi0_merged90_rabc_finalaction. Drops cond_accel
+    # rescue (handled in transforms.py) and raises threshold so long-episode
+    # frames with mid-range velocity are filtered out. Expected keep ~61%.
+    TrainConfig(
+        name="pi0_merged90_rabc_finalaction_thr075",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_under90s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=0.75,
         ),
         batch_size=32,
         num_workers=8,

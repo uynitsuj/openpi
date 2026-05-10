@@ -538,7 +538,10 @@ def train_loop(config: _config.TrainConfig):
                 per_sample_loss = losses.mean(dim=-1) if losses.dim() > 1 else losses  # [B] or [B, H]
                 while per_sample_loss.dim() > 1:
                     per_sample_loss = per_sample_loss.mean(dim=-1)
-                loss = (per_sample_loss * observation.sample_weights).mean()
+                if config.rabc_normalize_weights:
+                    loss = (per_sample_loss * observation.sample_weights).sum() / (observation.sample_weights.sum() + 1e-6)
+                else:
+                    loss = (per_sample_loss * observation.sample_weights).mean()
             else:
                 loss = losses.mean()
 

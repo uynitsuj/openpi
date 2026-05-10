@@ -155,6 +155,8 @@ def train_step(
         if (config.rabc_enabled or config.online_rm_enabled) and observation.sample_weights is not None:
             per_sample_loss = jnp.mean(chunked_loss, axis=-1)  # [B]
             weighted_loss = per_sample_loss * observation.sample_weights  # [B]
+            if config.rabc_normalize_weights:
+                return jnp.sum(weighted_loss) / (jnp.sum(observation.sample_weights) + 1e-6)
             return jnp.mean(weighted_loss)
         return jnp.mean(chunked_loss)
 

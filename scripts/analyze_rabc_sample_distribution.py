@@ -41,12 +41,12 @@ def _read_dataset(repo_id: str) -> tuple[dict[int, np.ndarray], dict[int, float]
 
     for f in parquet_files:
         schema_cols = set(pq.read_schema(f).names)
-        vel_col = "repromo_signed_magnitude" if "repromo_signed_magnitude" in schema_cols else "rorm_velocity"
-        q_col = "repromo_quality" if "repromo_quality" in schema_cols else "rorm_q"
-        if vel_col not in schema_cols:
-            raise KeyError(f"velocity column missing in {f}")
-        if q_col not in schema_cols:
-            raise KeyError(f"quality column missing in {f}")
+        vel_col = next((c for c in ("repromo_signed_magnitude", "rorm_velocity", "sarm_dense_signed_magnitude") if c in schema_cols), None)
+        q_col = next((c for c in ("repromo_quality", "rorm_q", "sarm_dense_quality") if c in schema_cols), None)
+        if vel_col is None:
+            raise KeyError(f"no velocity column (repromo_signed_magnitude / rorm_velocity / sarm_dense_signed_magnitude) in {f}")
+        if q_col is None:
+            raise KeyError(f"no quality column (repromo_quality / rorm_q / sarm_dense_quality) in {f}")
         cols = ["episode_index", "frame_index", vel_col, q_col]
         t = pq.read_table(f, columns=cols)
         eps = np.asarray(t["episode_index"]).astype(np.int64)

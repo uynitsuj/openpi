@@ -1713,6 +1713,25 @@ _CONFIGS = [
         )
         for thr in (0.50, 0.75)
     ],
+    # 60s-cap variant: thr=1.00 strict finalaction on hlm + d405<60s.
+    TrainConfig(
+        name="pi0_merged60_rabc_finalaction_thr100",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_under60s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
     # 120s-cap variants: hlm + d405<120s, d405-short25-RM injected, final-action
     # gating. thr=0.75 keeps ~52% of frames; thr=1.00 keeps ~22% (long-episode
     # frames almost entirely drop). thr=0.50 retired 2026-05-08 — the strict
@@ -1728,6 +1747,32 @@ _CONFIGS = [
                 base_config=DataConfig(prompt_from_task=True),
                 rabc_use_final_action_condition=True,
                 rabc_threshold=thr,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+            num_train_steps=60_000,
+            save_interval=30_000,
+            keep_period=30_000,
+            rabc_enabled=True,
+        )
+        for thr in (0.75, 1.00)
+    ],
+    # No-max-cap variants of the 120s strict-gate trains. clip_max=inf lets
+    # the kept-sample weight reflect raw RM magnitude (vel can be > 1.0)
+    # rather than saturating at 1.0. Tests whether the cap was suppressing
+    # the gradient signal on the most-confident-progress frames.
+    *[
+        TrainConfig(
+            name=f"pi0_merged120_rabc_finalaction_thr{int(thr * 100):03d}_nomax",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id="hlm_plus_d405_under120s_gop10",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=True,
+                rabc_threshold=thr,
+                rabc_clip_max=float("inf"),
             ),
             batch_size=32,
             num_workers=8,

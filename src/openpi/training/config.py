@@ -1016,6 +1016,12 @@ class TrainConfig:
     rabc_clip_min: float = 0.0
     rabc_clip_max: float = 1.0
 
+    # ── Online Reward Model RABC ─────────────────────────────────────────
+    # Runs a PyTorch reward model (HybridRM) at training time to compute
+    # per-sample weights. Mutually exclusive with rabc_enabled (pre-computed).
+    online_rm_enabled: bool = False
+    online_rm_weight_method: str = "float"  # "binary" or "float"
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""
@@ -2279,6 +2285,45 @@ _CONFIGS = [
             action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         ema_decay=None,
+    ),
+    # ── Online Reward Model RABC (David Chen's HybridRM) ─────────────────
+    TrainConfig(
+        name="pi0_yam_tshirt_online_rm_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamDataConfig(
+            repo_id="Qianzhong-Chen/tshirt_folding_10h_hlm_yam_white_0810",
+            default_prompt="fold the tshirt",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        online_rm_enabled=True,
+        online_rm_weight_method="float",
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_online_rm_rabc_binary",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamDataConfig(
+            repo_id="Qianzhong-Chen/tshirt_folding_10h_hlm_yam_white_0810",
+            default_prompt="fold the tshirt",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        online_rm_enabled=True,
+        online_rm_weight_method="binary",
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

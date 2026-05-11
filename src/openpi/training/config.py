@@ -1713,6 +1713,45 @@ _CONFIGS = [
         )
         for thr in (0.50, 0.75)
     ],
+    # 120s-cap vanilla BC baseline (no rabc). Counterpart to pi0_merged_no_rabc
+    # (under60s) and pi0_merged90_no_rabc (under90s).
+    TrainConfig(
+        name="pi0_merged120_no_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_under120s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=False,
+    ),
+    # sarm dataset variant: fs2_sss45-RM-injected dense+sparse subset, strict
+    # finalaction thr=1.00, no-max clip (raw RM magnitude flows to loss).
+    TrainConfig(
+        name="pi0_sarm_dense_sparse_rabc_finalaction_thr100_nomax",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sarm_dense_and_sparse_only_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            rabc_clip_max=float("inf"),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
     # 60s-cap variant: thr=1.00 strict finalaction on hlm + d405<60s.
     TrainConfig(
         name="pi0_merged60_rabc_finalaction_thr100",
@@ -1817,6 +1856,49 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             rabc_use_final_action_condition=True,
             rabc_threshold=0.50,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    # NOMAX (clip_max=inf) sibling of thr=1.0 strict on merged90: keeps the
+    # same ~34% of frames but lets kept-weight magnitude pass through raw
+    # rather than saturating at 1.0.
+    TrainConfig(
+        name="pi0_merged90_rabc_finalaction_thr100_nomax",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_under90s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            rabc_clip_max=float("inf"),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    # NOMAX sibling for merged60 thr=1.0 strict (same dataset as
+    # pi0_merged60_rabc_finalaction_thr100 but no upper cap).
+    TrainConfig(
+        name="pi0_merged60_rabc_finalaction_thr100_nomax",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_under60s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            rabc_clip_max=float("inf"),
         ),
         batch_size=32,
         num_workers=8,

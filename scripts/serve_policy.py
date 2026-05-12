@@ -264,9 +264,59 @@ NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
         dir="/home/hyrl/checkpoints/pi0_merged_singlefold_rabc_finalaction_thr050/pi0_merged_singlefold_d405short25rm_bs1024_rabc_finalaction_thr050_20260507/59999",
         default_prompt="Folding tshirt pile and stacking",
     ),
-    "pi0_merged90_fs2rm_bs1024_no_rabc_20260504": Checkpoint(
-        config="pi0_merged_singlefold_rabc_finalaction_thr050",
+    "pi0_merged90_no_rabc_20260504": Checkpoint(
+        config="pi0_merged90_no_rabc",
         dir="/home/hyrl/checkpoints/pi0_merged90_no_rabc/pi0_merged90_fs2rm_bs1024_no_rabc_20260504/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_rabc_finalaction_thr050_strict_subset_20260508": Checkpoint(
+        config="pi0_merged90_rabc_finalaction",
+        dir="/home/hyrl/checkpoints/pi0_merged90_rabc_finalaction/pi0_merged90_rabc_finalaction_thr050_strict_subset_20260508/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_rabc_finalaction_thr075_strict_subset_20260508": Checkpoint(
+        config="pi0_merged90_rabc_finalaction_thr075",
+        dir="/home/hyrl/checkpoints/pi0_merged90_rabc_finalaction_thr075/pi0_merged90_rabc_finalaction_thr075_strict_subset_20260508/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_rabc_finalaction_thr100_strict_subset_20260509": Checkpoint(
+        config="pi0_merged90_rabc_finalaction_thr100",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged90_rabc_finalaction_thr100/pi0_merged90_rabc_finalaction_thr100_strict_subset_20260509/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged120_rabc_finalaction_thr100_nomax_strict_subset_20260510": Checkpoint(
+        config="pi0_merged120_rabc_finalaction_thr100_nomax",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged120_rabc_finalaction_thr100_nomax/pi0_merged120_rabc_finalaction_thr100_nomax_strict_subset_20260510/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_yam_tshirt_sarm_rabc_dense_progress_20260510": Checkpoint(
+        config="pi0_yam_tshirt_sarm_rabc_dense_progress_20260510",
+        dir="/home/hyrl/checkpoints/pi0_yam_tshirt_sarm_rabc_dense_progress_20260510/sarm_rabc_dense_progress_20260510/89999/",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged60_rabc_finalaction_thr100_fs2sss45rm_strict_subset_20260510": Checkpoint(
+        config="pi0_merged60_rabc_finalaction_thr100",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged60_rabc_finalaction_thr100/pi0_merged60_rabc_finalaction_thr100_fs2sss45rm_strict_subset_20260510/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged60_rabc_finalaction_thr100_nomax_fs2sss45rm_strict_subset_20260510": Checkpoint(
+        config="pi0_merged60_rabc_finalaction_thr100_nomax",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged60_rabc_finalaction_thr100_nomax/pi0_merged60_rabc_finalaction_thr100_nomax_fs2sss45rm_strict_subset_20260510/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged60_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511": Checkpoint(
+        config="pi0_merged60_rabc_finalaction_thr100_nomax",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged60_rabc_finalaction_thr100_nomax/pi0_merged60_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511": Checkpoint(
+        config="pi0_merged90_rabc_finalaction_thr100_nomax",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged90_rabc_finalaction_thr100_nomax/pi0_merged90_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_sarm_dense_sparse_rabc_finalaction_thr100_nomax_fs2sss45rm_strict_subset_20260510": Checkpoint(
+        config="pi0_sarm_dense_sparse_rabc_finalaction_thr100_nomax",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_sarm_dense_sparse_rabc_finalaction_thr100_nomax/pi0_sarm_dense_sparse_rabc_finalaction_thr100_nomax_fs2sss45rm_strict_subset_20260510/59999",
         default_prompt="Folding tshirt pile and stacking",
     ),
 }

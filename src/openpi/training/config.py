@@ -1752,6 +1752,25 @@ _CONFIGS = [
         keep_period=30_000,
         rabc_enabled=True,
     ),
+    TrainConfig(
+        name="pi0_yam_tshirt_sarm_rabc_dense_progress_20260510",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sarm_dense_and_sparse_only_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            rabc_clip_max=float("inf"),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=90_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
     # 60s-cap variant: thr=1.00 strict finalaction on hlm + d405<60s.
     TrainConfig(
         name="pi0_merged60_rabc_finalaction_thr100",

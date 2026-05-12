@@ -226,7 +226,10 @@ class ComputeRABCWeights(DataTransformFn):
             if prog_key not in data:
                 return data
             prog = np.asarray(data[prog_key], dtype=np.float32).ravel()
-            assert prog.ndim == 1, f"Expected 1-D progress array, got shape {prog.shape}"
+            if len(prog) < 2:
+                data = {**data, "sample_weights": np.float32(0.0)}
+                data.pop(prog_key, None)
+                return data
             reward = float(prog[-1] - prog[0])
             # SARM paper: μ ← max(μ, 0) to prevent negative-mean datasets
             # from shifting the normalization window too far left.
@@ -260,6 +263,8 @@ class ComputeRABCWeights(DataTransformFn):
         if vel_key is None:
             return data
         vel = np.asarray(data[vel_key], dtype=np.float32)
+        if len(vel) == 0:
+            return data
         if self.velocity_scale != 1.0:
             vel = vel * self.velocity_scale
 

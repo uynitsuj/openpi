@@ -738,10 +738,14 @@ def _compute_sarm_reward_stats(
     cache_path = root / "meta" / "sarm_reward_stats.json"
     if cache_path.exists():
         stats = json.loads(cache_path.read_text())
-        key = str(action_horizon)
+        key = f"{action_horizon}_{progress_col}"
+        # Fall back to horizon-only key only for the default column
+        # (backward compat with pre-column-aware caches).
+        if key not in stats and progress_col == "sarm_dense_progress":
+            key = str(action_horizon)
         if key in stats and stats[key].get("mu") is not None and stats[key].get("sigma") is not None:
             mu, sigma = float(stats[key]["mu"]), float(stats[key]["sigma"])
-            logging.info(f"_compute_sarm_reward_stats: loaded from cache for horizon={action_horizon}: μ={mu:.6f}, σ={sigma:.6f}")
+            logging.info(f"_compute_sarm_reward_stats: loaded from cache ({key}): μ={mu:.6f}, σ={sigma:.6f}")
             return mu, sigma
 
     parquet_files = sorted((root / "data").glob("chunk-*/*.parquet"))
@@ -2434,6 +2438,43 @@ _CONFIGS = [
         keep_period=30_000,
         online_rm_enabled=True,
         online_rm_weight_method="binary",
+    ),
+    # ── SARM vanilla BC (no weighting, baseline comparison) ─────────────
+    TrainConfig(
+        name="pi0_yam_tshirt_sarm_bc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamDataConfig(
+            repo_id="sarm_dense_and_sparse_only_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=90_000,
+        save_interval=30_000,
+        keep_period=30_000,
+    ),
+    # ── SARM cached RABC sparse head ────────────────────────────────────
+    TrainConfig(
+        name="pi0_yam_tshirt_sarm_rabc_sparse",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sarm_dense_and_sparse_only_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_mode="sarm_progress_delta",
+            sarm_kappa=0.01,
+            sarm_progress_key="sarm_sparse_progress",
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=90_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+        rabc_normalize_weights=True,
     ),
     # ── SARM cached RABC (pre-computed dense progress predictions) ──────
     TrainConfig(

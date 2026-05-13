@@ -173,7 +173,24 @@ class ComputeRABCWeights(DataTransformFn):
     # criterion than averaging (one bad frame zeros out the weight after
     # clip_min). "max" takes the highest velocity — rewards windows whose
     # best frame is positive, useful when chunks straddle action boundaries.
+    # "mean_lookahead": mean of vel[action_horizon:] only — the lookahead
+    # portion of the velocity window, ignoring the action-chunk part. Requires
+    # the data loader to fetch action_horizon + lookahead frames (set
+    # ``extra_horizon_lookahead_frames`` on the DataConfig), and requires
+    # ``action_horizon`` to be set on this transform so we know where to slice.
     velocity_aggregator: str = "mean"
+    # Action chunk size, used by aggregators that need to know where the
+    # action-chunk window ends and the lookahead begins ("mean_lookahead").
+    # Set to model_config.action_horizon at config-build time.
+    action_horizon: int = 0
+    # Non-linear power applied to the weight AFTER gate decision but BEFORE
+    # the final clip(weight, None, clip_max). With weight_power=2 + clip_max=1
+    # this gives min(weight^2, 1) — quadratically suppresses medium-magnitude
+    # weights while capping bursts, which empirically penalizes long episodes
+    # (since their per-frame vel distribution is concentrated at ~0.5) by an
+    # extra ~12% relative to linear weighting. weight_power=1 (default) is the
+    # historical linear behavior.
+    weight_power: float = 1.0
 
     def _aggregate_velocity(self, vel: np.ndarray) -> float:
         """Collapse the per-frame velocity vector to a scalar window weight."""
@@ -184,9 +201,23 @@ class ComputeRABCWeights(DataTransformFn):
             return float(np.min(vel))
         if self.velocity_aggregator == "max":
             return float(np.max(vel))
+        if self.velocity_aggregator == "mean_lookahead":
+            if self.action_horizon <= 0:
+                raise ValueError(
+                    "velocity_aggregator='mean_lookahead' requires action_horizon "
+                    "to be set on ComputeRABCWeights (the action chunk length)."
+                )
+            tail = vel[self.action_horizon:]
+            if len(tail) == 0:
+                raise ValueError(
+                    f"velocity_aggregator='mean_lookahead' but fetched vel has "
+                    f"{len(vel)} frames <= action_horizon ({self.action_horizon}); "
+                    "set ``extra_horizon_lookahead_frames`` on the DataConfig."
+                )
+            return float(np.mean(tail))
         raise ValueError(
             f"Unknown velocity_aggregator {self.velocity_aggregator!r}. "
-            "Expected 'mean' | 'min' | 'max'."
+            "Expected 'mean' | 'min' | 'max' | 'mean_lookahead'."
         )
 
     def _threshold_from_q_norm(self, q_norm: float) -> float:
@@ -223,15 +254,22 @@ class ComputeRABCWeights(DataTransformFn):
             thr = self._threshold_from_q_norm(q_norm)
             if self.use_final_action_condition:
                 final_vel = float(vel[-1])
-                return float(np.clip(final_vel, None, self.clip_max)) if final_vel > thr else 0.0
-            agg_vel = self._aggregate_velocity(vel)
-            return 0.0 if agg_vel < thr else float(np.clip(agg_vel, None, self.clip_max))
+                w = float(np.clip(final_vel, None, self.clip_max)) if final_vel > thr else 0.0
+            else:
+                agg_vel = self._aggregate_velocity(vel)
+                w = 0.0 if agg_vel < thr else float(np.clip(agg_vel, None, self.clip_max))
+            return self._apply_power(w)
 
         if self.use_final_action_condition:
-            if self.threshold is None:
-                raise ValueError("use_final_action_condition=True requires `threshold` to be set.")
             final_vel = float(vel[-1])
-            weight = float(np.clip(final_vel, None, self.clip_max)) if final_vel > self.threshold else 0.0
+            if self.threshold is not None:
+                weight = float(np.clip(final_vel, None, self.clip_max)) if final_vel > self.threshold else 0.0
+            else:
+                # No threshold: pass the final-frame velocity through as the
+                # weight, clipped to [clip_min, clip_max]. With defaults
+                # (clip_min=0, clip_max=inf) negative-motion samples get 0 and
+                # are filtered by reject_zero_weighted_samples downstream.
+                weight = float(np.clip(final_vel, self.clip_min, self.clip_max))
         else:
             weight = self._aggregate_velocity(vel)
             if self.threshold is not None:
@@ -257,7 +295,16 @@ class ComputeRABCWeights(DataTransformFn):
                     f"Unknown RABC mode {self.mode!r}. Expected 'velocity_only', "
                     "'multiplicative', 'additive', or 'q_threshold'."
                 )
-        return float(weight)
+        return self._apply_power(float(weight))
+
+    def _apply_power(self, weight: float) -> float:
+        """Apply weight_power: w → min(max(w, 0)^p, clip_max). Default p=1 is
+        a no-op modulo the cap re-application."""
+        if self.weight_power == 1.0:
+            return weight
+        if weight <= 0.0:
+            return 0.0
+        return float(min(weight ** self.weight_power, self.clip_max))
 
     def __call__(self, data: DataDict) -> DataDict:
         # Schema migration: read repromo_signed_magnitude (canonical, post

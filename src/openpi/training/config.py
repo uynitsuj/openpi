@@ -121,6 +121,12 @@ class DataConfig:
     reject_zero_weighted_samples: bool = True
     reject_zero_weighted_mode: str = "subset"
 
+    # When >0, the loader fetches action_horizon + this-many frames for each
+    # key in ``extra_horizon_keys``. Lets RABC aggregators look beyond the
+    # action chunk (e.g. velocity_aggregator='mean_lookahead' averages over
+    # the trailing portion only). Default 0 = no lookahead.
+    extra_horizon_lookahead_frames: int = 0
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -835,6 +841,16 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
     # "min" picks the lowest velocity in the chunk — stricter, penalizes any
     # frame in the window dipping into anti-progress. "max" picks the highest.
     rabc_velocity_aggregator: str = "mean"
+    # Extend the velocity window beyond action_horizon by this many frames so
+    # gates like velocity_aggregator='mean_lookahead' can see 1s of motion
+    # past the action chunk. Default 0 = no lookahead.
+    rabc_lookahead_frames: int = 0
+    # Non-linear post-process: weight → min(max(weight, 0)^p, clip_max). With
+    # weight_power=2 + clip_max=1 you get min(weight^2, 1) — suppresses
+    # medium-magnitude samples more than high-magnitude ones, indirectly
+    # penalizing long episodes whose per-frame vel sits at ~0.5. Default 1.0
+    # = linear (historical behavior).
+    rabc_weight_power: float = 1.0
     # Hard Q-filter: keep only the top fraction of episodes by mean rorm_q.
     top_q_frac: float | None = None
     # Length filter: keep only the shortest fraction of episodes by frame count.
@@ -904,6 +920,8 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
                 q_threshold_center=self.q_threshold_center,
                 q_threshold_steepness=self.q_threshold_steepness,
                 velocity_aggregator=self.rabc_velocity_aggregator,
+                action_horizon=getattr(model_config, "action_horizon", 0),
+                weight_power=self.rabc_weight_power,
             ),
             yam_policy.YamInputs(action_dim=model_config.action_dim, model_type=model_config.model_type),
         ]
@@ -954,6 +972,7 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
             val_episodes=val_episodes,
             reject_zero_weighted_samples=self.rabc_reject_zero_weighted,
             reject_zero_weighted_mode=self.rabc_reject_zero_weighted_mode,
+            extra_horizon_lookahead_frames=self.rabc_lookahead_frames,
         )
 
 
@@ -1771,6 +1790,137 @@ _CONFIGS = [
         keep_period=30_000,
         rabc_enabled=True,
     ),
+    # mean2s / mean1s_offset gates on merged90/120: aggregate vel over the
+    # action chunk + 1s after it (60-frame window = 2s @ 30fps), or only the
+    # 1s lookahead portion. Tests whether the model wants to be told about
+    # what comes AFTER the action it's predicting, not just within it.
+    # Defaults: thr=0.75 NOMAX (kept-weight = raw mean; no upper cap).
+    *[
+        TrainConfig(
+            name=f"pi0_merged{cap}_rabc_{aggname}_thr{int(thr*100):03d}_nomax",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=f"hlm_plus_d405_under{cap}s_gop10",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=False,
+                rabc_threshold=thr,
+                rabc_clip_max=float("inf"),
+                rabc_velocity_aggregator=agg,
+                rabc_lookahead_frames=30,  # 1s lookahead at fps=30
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+            num_train_steps=60_000,
+            save_interval=30_000,
+            keep_period=30_000,
+            rabc_enabled=True,
+        )
+        for cap in (90, 120)
+        for agg, aggname in (("mean", "mean2s"), ("mean_lookahead", "mean1s_offset"))
+        for thr in (0.75, 1.00)
+    ],
+    # min(weight^2, 1) variants for merged90 / merged120 × {finalaction,
+    # mean2s, mean1s_offset}. Same as the nothr_nomax recipe except
+    # weight_power=2 and clip_max=1.0 (capped at 1 by construction). Suppresses
+    # medium-magnitude samples (which concentrate in long episodes) by ~12%
+    # more than the linear version per simulation.
+    *[
+        TrainConfig(
+            name=f"pi0_merged{cap}_rabc_{aggname}_sqclip",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=f"hlm_plus_d405_under{cap}s_gop10",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=use_fac,
+                rabc_threshold=None,
+                rabc_clip_max=1.0,
+                rabc_velocity_aggregator=agg,
+                rabc_lookahead_frames=lookahead,
+                rabc_weight_power=2.0,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+            num_train_steps=60_000,
+            save_interval=30_000,
+            keep_period=30_000,
+            rabc_enabled=True,
+        )
+        for cap in (90, 120)
+        for use_fac, agg, aggname, lookahead in (
+            (True, "mean", "finalaction", 0),
+            (False, "mean", "mean2s", 30),
+            (False, "mean_lookahead", "mean1s_offset", 30),
+        )
+    ],
+    # sarm dataset × {finalaction, mean2s, mean1s_offset}, all thr=None NOMAX.
+    # Re-uses the d405-short25 RM injection (separately scored via launch_score
+    # on sarm — uses repromo_signed_magnitude / repromo_quality columns).
+    *[
+        TrainConfig(
+            name=f"pi0_sarm_dense_sparse_rabc_{aggname}_nothr_nomax",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id="sarm_dense_and_sparse_only_gop10",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=use_fac,
+                rabc_threshold=None,
+                rabc_clip_max=float("inf"),
+                rabc_velocity_aggregator=agg,
+                rabc_lookahead_frames=lookahead,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+            num_train_steps=60_000,
+            save_interval=30_000,
+            keep_period=30_000,
+            rabc_enabled=True,
+        )
+        for use_fac, agg, aggname, lookahead in (
+            (True, "mean", "finalaction", 0),
+            (False, "mean", "mean2s", 30),
+            (False, "mean_lookahead", "mean1s_offset", 30),
+        )
+    ],
+    # No-threshold + no-max-cap variants for merged60/90/120 × {finalaction,
+    # mean2s, mean1s_offset}. With threshold=None and clip_max=inf the weight
+    # is raw vel passed through (clipped at clip_min=0 floor so negative
+    # motion → 0 → filtered by subset). Tests whether removing the threshold
+    # entirely and just letting magnitude flow is better than gating.
+    *[
+        TrainConfig(
+            name=f"pi0_merged{cap}_rabc_{aggname}_nothr_nomax",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=f"hlm_plus_d405_under{cap}s_gop10",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=use_fac,
+                rabc_threshold=None,
+                rabc_clip_max=float("inf"),
+                rabc_velocity_aggregator=agg,
+                rabc_lookahead_frames=lookahead,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+            num_train_steps=60_000,
+            save_interval=30_000,
+            keep_period=30_000,
+            rabc_enabled=True,
+        )
+        for cap in (60, 90, 120)
+        for use_fac, agg, aggname, lookahead in (
+            (True, "mean", "finalaction", 0),  # vel[-1] passthrough
+            (False, "mean", "mean2s", 30),     # mean over 60-frame window
+            (False, "mean_lookahead", "mean1s_offset", 30),  # mean over lookahead 30 frames
+        )
+    ],
     # 60s-cap variant: thr=1.00 strict finalaction on hlm + d405<60s.
     TrainConfig(
         name="pi0_merged60_rabc_finalaction_thr100",

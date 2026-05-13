@@ -199,9 +199,16 @@ def create_torch_dataset(
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     delta_ts = [t / dataset_meta.fps for t in range(action_horizon)]
     delta_timestamps = {key: delta_ts for key in data_config.action_sequence_keys}
-    # Extra keys (e.g., rorm_velocity) fetched with the same horizon window
+    # Extra keys (e.g., repromo_signed_magnitude) get a possibly-longer
+    # window when extra_horizon_lookahead_frames > 0 (so RABC aggregators
+    # like 'mean_lookahead' can see vel beyond the action chunk).
+    extra_lookahead = getattr(data_config, "extra_horizon_lookahead_frames", 0)
+    if extra_lookahead > 0:
+        delta_ts_extra = [t / dataset_meta.fps for t in range(action_horizon + extra_lookahead)]
+    else:
+        delta_ts_extra = delta_ts
     for key in data_config.extra_horizon_keys:
-        delta_timestamps[key] = delta_ts
+        delta_timestamps[key] = delta_ts_extra
     episodes = list(data_config.episodes) if data_config.episodes is not None else None
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
@@ -253,16 +260,17 @@ def _rabc_cache_key(
     action_horizon: int,
     rabc: _transforms.ComputeRABCWeights,
     episodes: tuple[int, ...] | None,
+    lookahead_frames: int = 0,
 ) -> str:
     """Stable hash for the precomputed valid_indices file. Includes everything
     that changes which samples pass the gate: dataset, horizon, RABC params,
-    and the episode-filter tuple (so a shortest-frac config doesn't reuse the
-    full-dataset cache)."""
+    the episode-filter tuple, and the lookahead frame count."""
     payload = {
         "repo_id": repo_id,
         "action_horizon": action_horizon,
         "rabc": dataclasses.asdict(rabc),
         "episodes": sorted(episodes) if episodes is not None else "all",
+        "lookahead_frames": lookahead_frames,
     }
     blob = json.dumps(payload, sort_keys=True, default=str).encode()
     return hashlib.sha1(blob).hexdigest()[:16]
@@ -274,6 +282,7 @@ def precompute_valid_indices(
     rabc: _transforms.ComputeRABCWeights,
     *,
     episodes: tuple[int, ...] | None = None,
+    lookahead_frames: int = 0,
     cache_dir: pathlib.Path | None = None,
     spot_check: bool = True,
 ) -> np.ndarray:
@@ -303,7 +312,7 @@ def precompute_valid_indices(
             else pathlib.Path.home() / ".cache" / "openpi" / "rabc_valid_indices"
         )
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / f"{_rabc_cache_key(repo_id, action_horizon, rabc, episodes)}.npy"
+    cache_path = cache_dir / f"{_rabc_cache_key(repo_id, action_horizon, rabc, episodes, lookahead_frames)}.npy"
     logging.info(
         f"[rabc_precompute] {repo_id} H={action_horizon} mode={rabc.mode} "
         f"episodes={'all' if episodes is None else f'{len(episodes)} eps'} "
@@ -385,7 +394,7 @@ def precompute_valid_indices(
     # the same way lerobot does (truncate at episode end + pad with last frame).
     filtered_indices: list[int] = []
     decide = rabc.decide_weight
-    H = int(action_horizon)
+    H = int(action_horizon) + int(lookahead_frames)
     cursor = 0  # filtered flat index cursor
     for ep in ordered_eps:
         meta = ep_lookup[int(ep)]
@@ -425,7 +434,7 @@ def precompute_valid_indices(
     )
 
     if spot_check and len(valid) > 0:
-        _spot_check_valid_indices(repo_id, action_horizon, rabc, episodes, valid)
+        _spot_check_valid_indices(repo_id, action_horizon, rabc, episodes, valid, lookahead_frames=lookahead_frames)
 
     np.save(cache_path, valid)
     logging.info(f"[rabc_precompute] cached → {cache_path}")
@@ -439,18 +448,21 @@ def _spot_check_valid_indices(
     episodes: tuple[int, ...] | None,
     valid: np.ndarray,
     n_checks: int = 5,
+    lookahead_frames: int = 0,
 ) -> None:
     """Cross-validate precomputed valid_indices against a fresh LeRobotDataset
     fetch. Asserts that ``decide_weight(dataset[k]['velocity'], q) > 0`` for
     sampled k. Cost: ~n_checks video decodes; pays for itself by catching
     flat-index mismatches before they silently corrupt training."""
-    delta_ts = [t / 30.0 for t in range(action_horizon)]  # fps inferred below
     meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    delta_ts = [t / meta.fps for t in range(action_horizon)]
+    H_total = action_horizon + lookahead_frames
+    delta_ts_extra = [t / meta.fps for t in range(H_total)]
+    delta_ts_actions = [t / meta.fps for t in range(action_horizon)]
     extra = ["repromo_signed_magnitude"]
     if rabc.mode != "velocity_only" and rabc.q_min is not None:
         extra.append("repromo_quality")
-    delta_timestamps = {k: delta_ts for k in (*extra, "actions")}
+    delta_timestamps = {k: delta_ts_extra for k in extra}
+    delta_timestamps["actions"] = delta_ts_actions
     ds = lerobot_dataset.LeRobotDataset(
         repo_id,
         delta_timestamps=delta_timestamps,
@@ -645,6 +657,7 @@ def create_torch_data_loader(
                 action_horizon=action_horizon,
                 rabc=rabc,
                 episodes=data_config.episodes,
+                lookahead_frames=getattr(data_config, "extra_horizon_lookahead_frames", 0),
             )
             if len(valid_indices) == 0:
                 raise RuntimeError(

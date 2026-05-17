@@ -2476,6 +2476,27 @@ _CONFIGS = [
         rabc_enabled=True,
         rabc_normalize_weights=True,
     ),
+    # ── SARM cached RABC sparse head — centered+d405 under90s dataset ───
+    TrainConfig(
+        name="pi0_yam_tshirt_sarm_rabc_sparse_under90s",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sarm_dense_and_sparse_centered_with_d405_under90s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_mode="sarm_progress_delta",
+            sarm_kappa=0.01,
+            sarm_progress_key="sarm_sparse_progress",
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=60_000,
+        save_interval=20_000,
+        keep_period=20_000,
+        rabc_enabled=True,
+        rabc_normalize_weights=True,
+    ),
     # ── SARM cached RABC (pre-computed dense progress predictions) ──────
     TrainConfig(
         name="pi0_yam_tshirt_sarm_rabc",

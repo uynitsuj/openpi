@@ -74,12 +74,23 @@ def main(cfg: SkyPilotTrainingConfig):
             f"Make sure the dataset for repo_id={data_config.repo_id} is downloaded."
         )
 
-    # Check for norm stats
+    # Norm stats: if not present locally, write a tiny stub to the asset
+    # dir so the rest of the pipeline (config build, S3 upload step) can run.
+    # The worker run-script detects the stub via file-size and runs
+    # compute_norm_stats.py with --max-frames 50000 before training, then
+    # uploads the real norm_stats back to S3 for parallel/future jobs to
+    # reuse. Skipping local compute is required when videos haven't been
+    # downloaded locally (torchcodec can't decode placeholders).
     if data_config.norm_stats is None:
-        raise FileNotFoundError(
-            "Normalization stats not found. "
-            f"Make sure to run: \nuv run scripts/compute_norm_stats.py --config-name={cfg.config_name}"
-        )
+        import json
+        asset_id_for_stub = data_config.asset_id or data_config.repo_id
+        stub_dir = Path(config.assets_dirs) / asset_id_for_stub
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub_path = stub_dir / "norm_stats.json"
+        if not stub_path.exists() or stub_path.stat().st_size < 200:
+            stub_path.write_text(json.dumps({"norm_stats": {}}))
+            print(f"[WARN] Local norm_stats missing; wrote stub at {stub_path}.")
+            print("[WARN] Worker will compute real norm_stats with --max-frames=50000 before training.")
 
     # Generate experiment name if not provided. Resume mode requires the user
     # to specify the original exp_name explicitly so we point at the same

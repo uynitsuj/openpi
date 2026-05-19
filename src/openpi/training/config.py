@@ -84,6 +84,14 @@ class DataConfig:
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantile_norm: bool = False
 
+    # RABC: when True, the dataloader wraps the transformed dataset with
+    # RejectionSamplingTransformedDataset so chunks emitting
+    # sample_weights == 0 (e.g., final-action gate failed) are replaced by a
+    # fresh uniform draw rather than consuming a batch slot with zero gradient.
+    # Default True matches the behavior on origin/rorm-rabc (cherry-picked
+    # 2026-05-18). No-op if no transform emits sample_weights.
+    rabc_reject_zero_weighted: bool = True
+
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
@@ -943,9 +951,14 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
             if self.sarm_progress_key in schema_cols:
                 repack_keys[self.sarm_progress_key] = self.sarm_progress_key
         else:
+            # Pick the FIRST available velocity column (transform falls back
+            # among them via the same precedence). Adding all that exist
+            # forces lerobot to query every one per-frame, which crashes if
+            # any legacy column (e.g. rorm_velocity) has null rows.
             for col in ("repromo_signed_magnitude", "rorm_velocity", "sarm_dense_signed_magnitude"):
                 if col in schema_cols:
                     repack_keys[col] = col
+                    break
             if use_q:
                 for col in ("repromo_quality", "rorm_q", "sarm_dense_quality"):
                     if col in schema_cols:
@@ -2517,6 +2530,55 @@ _CONFIGS = [
         rabc_enabled=True,
         rabc_normalize_weights=True,
     ),
+    # ── SARM sparse — under60s + full variants of the centered_with_d405 set
+    *[
+        TrainConfig(
+            name=f"pi0_yam_tshirt_sarm_rabc_sparse_{tag}",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=f"sarm_dense_and_sparse_centered_with_d405_{tag}_gop10",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_mode="sarm_progress_delta",
+                sarm_kappa=0.01,
+                sarm_progress_key="sarm_sparse_progress",
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            num_train_steps=60_000,
+            save_interval=20_000,
+            keep_period=20_000,
+            rabc_enabled=True,
+            rabc_normalize_weights=True,
+        )
+        for tag in ("full", "under60s")
+    ],
+    # ── d405-short25 RM (repromo_signed_magnitude) finalaction thr=1.0 NOMAX
+    #    on the same 3 centered_with_d405 datasets — A/B vs the SARM method.
+    *[
+        TrainConfig(
+            name=f"pi0_yam_tshirt_d405short25_finalaction_thr100_nomax_{tag}",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=f"sarm_dense_and_sparse_centered_with_d405_{tag}_gop10",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_mode="velocity_only",
+                rabc_use_final_action_condition=True,
+                rabc_threshold=1.00,
+                rabc_clip_max=float("inf"),
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            num_train_steps=60_000,
+            save_interval=20_000,
+            keep_period=20_000,
+            rabc_enabled=True,
+        )
+        for tag in ("full", "under90s", "under60s")
+    ],
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

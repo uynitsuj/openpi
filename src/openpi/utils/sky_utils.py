@@ -63,7 +63,17 @@ def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_
 
     print(f"[INFO] Uploading dataset from {dataset_path} to {s3_path}")
 
-    upload_cmd = f"aws s3 sync {dataset_path} {s3_path} --exclude 'dp_dataset/*' --exclude 'jpg/*' --exclude 'norm_stats/*' --delete"
+    # Dropped --delete + excluded videos/*: collaborator uploads canonical
+    # dataset (incl. videos) to S3 first; local copy may be partial
+    # (data+meta only, possibly with 0-byte placeholder mp4s). Without
+    # excluding videos/*, --size-only would overwrite S3's real videos with
+    # local 0-byte stubs. Letting local push data+meta is fine — they're
+    # small and idempotent — but videos must stay S3-canonical.
+    upload_cmd = (
+        f"aws s3 sync {dataset_path} {s3_path} "
+        f"--exclude 'dp_dataset/*' --exclude 'jpg/*' "
+        f"--exclude 'norm_stats/*' --exclude 'videos/*' --size-only"
+    )
     run_command(upload_cmd)
 
     print("[INFO] Verifying upload...")
@@ -76,8 +86,13 @@ def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_
     print(f"[OK] Dataset successfully uploaded to {s3_path}")
 
     norm_stats_dir = Path(norm_stats_dir)
-    if not norm_stats_dir.exists():
-        raise FileNotFoundError(f"Norm stats directory does not exist: {norm_stats_dir}")
+    norm_stats_file = norm_stats_dir / "norm_stats.json"
+    # If norm_stats is missing OR a tiny stub (<200B), skip the upload.
+    # The worker run-script will detect the missing/stub case after S3 sync
+    # and run compute_norm_stats locally, then upload back to S3.
+    if not norm_stats_file.exists() or norm_stats_file.stat().st_size < 200:
+        print(f"[INFO] Local norm_stats missing/stub at {norm_stats_file}; worker will compute.")
+        return s3_path
 
     upload_cmd = f"aws s3 sync '{norm_stats_dir}' '{s3_path}/norm_stats' --delete"
     run_command(upload_cmd)
@@ -165,9 +180,40 @@ def _build_run_script() -> str:
         'mkdir -p ~/.cache/huggingface/lerobot/',
         'aws s3 sync "$DATASET_PATH" "$HOME/.cache/huggingface/lerobot/${REPO_ID}"',
         '',
-        '# Sync norm stats from S3',
+        '# Sync norm stats from S3 (may be empty if dataset is fresh).',
         'echo "[INFO] Syncing norm stats"',
-        'aws s3 sync "$DATASET_PATH/norm_stats" "$HOME/sky_workdir/assets/$CONFIG_NAME/${REPO_ID}"',
+        'NORM_STATS_DIR="$HOME/sky_workdir/assets/$CONFIG_NAME/${REPO_ID}"',
+        'mkdir -p "$NORM_STATS_DIR"',
+        'aws s3 sync "$DATASET_PATH/norm_stats" "$NORM_STATS_DIR"',
+        '',
+        '# If norm_stats absent on S3 (or stub), compute on this worker with',
+        '# bounded frames (--max-frames 50000 keeps wall time ~30min instead',
+        '# of full-dataset iteration ~3hr). Use .venv/bin/python directly to',
+        '# avoid `uv run` triggering a uv sync mid-train.',
+        'NORM_STATS_FILE="$NORM_STATS_DIR/norm_stats.json"',
+        'NORM_STATS_SIZE=$(stat -c%s "$NORM_STATS_FILE" 2>/dev/null || echo 0)',
+        'if [ "$NORM_STATS_SIZE" -lt 200 ]; then',
+        '  echo "[INFO] norm_stats missing/stub (size=$NORM_STATS_SIZE); computing on worker"',
+        '  .venv/bin/python scripts/compute_norm_stats.py --config-name=$CONFIG_NAME --max-frames=50000',
+        '  COMPUTE_EXIT=$?',
+        '  # Fail-fast: if compute_norm_stats crashed, do NOT upload the local',
+        '  # stub (would pollute S3 for parallel jobs) and do NOT proceed to',
+        '  # training with empty norm_stats (silently corrupts the run).',
+        '  if [ "$COMPUTE_EXIT" -ne 0 ]; then',
+        '    echo "[ERROR] compute_norm_stats.py exited $COMPUTE_EXIT — aborting before training to avoid silent corruption"',
+        '    exit $COMPUTE_EXIT',
+        '  fi',
+        '  # Verify the produced file is non-stub before uploading.',
+        '  NEW_SIZE=$(stat -c%s "$NORM_STATS_FILE" 2>/dev/null || echo 0)',
+        '  if [ "$NEW_SIZE" -lt 200 ]; then',
+        '    echo "[ERROR] compute_norm_stats.py exited 0 but produced a stub ($NEW_SIZE bytes); aborting"',
+        '    exit 1',
+        '  fi',
+        '  echo "[INFO] Uploading computed norm_stats ($NEW_SIZE bytes) to S3 for reuse by parallel jobs"',
+        '  aws s3 cp "$NORM_STATS_FILE" "$DATASET_PATH/norm_stats/norm_stats.json"',
+        'else',
+        '  echo "[INFO] Using existing norm_stats ($NORM_STATS_SIZE bytes)"',
+        'fi',
         '',
         '# Export SkyPilot metadata for wandb tagging',
         'export SKYPILOT_CLUSTER_NAME=$(echo $SKYPILOT_CLUSTER_INFO | python3 -c "import sys,json; print(json.load(sys.stdin)[\'cluster_name\'])" 2>/dev/null || echo "unknown")',

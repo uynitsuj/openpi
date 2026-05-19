@@ -63,6 +63,59 @@ class TransformedDataset(Dataset[T_co]):
         return len(self._dataset)
 
 
+class RejectionSamplingTransformedDataset(Dataset[T_co]):
+    """TransformedDataset variant that rejects post-transform samples whose
+    ``sample_weights`` is zero (or absent floats <= 0) and replaces them with a
+    fresh uniform random draw from the dataset until acceptance, capped at
+    ``max_retries``.
+
+    Why: ``ComputeRABCWeights`` may emit ``sample_weights == 0`` for chunks
+    rejected by the final-action / threshold gate. Without rejection, those
+    samples still consume forward+backward FLOPs but contribute exactly zero
+    gradient, and the *effective* batch size fluctuates step-to-step. With
+    rejection, every sample in every batch has weight > 0 — stable effective
+    batch size, no wasted GPU compute. No-op for samples that don't carry a
+    ``sample_weights`` key (rabc disabled).
+
+    Cherry-picked from origin/rorm-rabc on 2026-05-18.
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        transforms: Sequence[_transforms.DataTransformFn],
+        *,
+        max_retries: int = 64,
+        weight_key: str = "sample_weights",
+    ):
+        self._dataset = dataset
+        self._transform = _transforms.compose(transforms)
+        self._max_retries = max_retries
+        self._weight_key = weight_key
+        self._n = len(dataset)
+        self._rng = np.random.default_rng()
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        idx = int(index)
+        sample = self._transform(self._dataset[idx])
+        for _ in range(self._max_retries):
+            w = sample.get(self._weight_key) if isinstance(sample, dict) else None
+            if w is None:
+                return sample  # No weight emitted (rabc disabled / non-rabc transform)
+            wf = float(np.asarray(w).reshape(-1)[0])
+            if wf > 0.0:
+                return sample
+            idx = int(self._rng.integers(0, self._n))
+            sample = self._transform(self._dataset[idx])
+        # Retry cap exceeded — return the last sample (gradient still ~0,
+        # but training proceeds). Rare in practice; >max_retries consecutive
+        # rejections suggests reject-rate is pathologically high.
+        return sample
+
+    def __len__(self) -> int:
+        return self._n
+
+
 class IterableTransformedDataset(IterableDataset[T_co]):
     def __init__(
         self,
@@ -193,15 +246,19 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             )
         norm_stats = data_config.norm_stats
 
-    return TransformedDataset(
-        dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.model_transforms.inputs,
-        ],
-    )
+    pipeline = [
+        *data_config.repack_transforms.inputs,
+        *data_config.data_transforms.inputs,
+        _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        *data_config.model_transforms.inputs,
+    ]
+    # RABC: wrap with rejection sampling so zero-weighted chunks (vel[-1] <= thr)
+    # don't consume batch slots. Cherry-picked from origin/rorm-rabc on
+    # 2026-05-18 — was missing on sarm_rabc_dataset and caused RM-RABC trains
+    # to silently halve their effective batch size.
+    if getattr(data_config, "rabc_reject_zero_weighted", False):
+        return RejectionSamplingTransformedDataset(dataset, pipeline)
+    return TransformedDataset(dataset, pipeline)
 
 
 def transform_iterable_dataset(

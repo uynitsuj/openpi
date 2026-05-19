@@ -124,11 +124,14 @@ class ComputeRABCWeights(DataTransformFn):
     weight below the threshold are zeroed out instead of clipped to clip_min.
 
     When ``use_final_action_condition`` is True, skips integration and instead
-    keeps the sample iff either of these holds at the final action in the chunk:
-      1. velocity is positive AND dv/dt is positive (accelerating upward), OR
-      2. velocity is above ``threshold``.
+    gates purely on the chunk's final velocity:
+      keep iff vel[-1] > ``threshold``
     Kept samples get weight = clip(vel[-1], None, clip_max); rejected samples
-    get weight = 0. ``threshold`` must be set in this mode.
+    get weight = 0. ``threshold`` must be set in this mode. (Historical versions
+    additionally kept samples whose velocity was small but accelerating —
+    `dv/dt > 0`. That `cond_accel` branch was removed 2026-05-18 to make the
+    gate strictly threshold-based; configs that relied on it should set
+    ``threshold`` explicitly.)
 
     q_threshold mode: compute q_norm via the same min-max normalization the
     multiplicative/additive modes use:
@@ -289,13 +292,10 @@ class ComputeRABCWeights(DataTransformFn):
             if self.use_final_action_condition:
                 # Per-episode q-derived threshold replaces the static
                 # ``threshold`` in the final-action keep rule:
-                #   keep iff (vel[-1] > 0 AND dv/dt > 0) OR vel[-1] > thr
+                #   keep iff vel[-1] > thr
                 # Kept samples weight = clip(vel[-1], None, clip_max), else 0.
                 final_vel = float(vel[-1])
-                dv_dt = float(vel[-1] - vel[-2]) if len(vel) >= 2 else 0.0
-                cond_accel = final_vel > 0.0 and dv_dt > 0.0
-                cond_above = final_vel > thr
-                weight = float(np.clip(final_vel, None, self.clip_max)) if (cond_accel or cond_above) else 0.0
+                weight = float(np.clip(final_vel, None, self.clip_max)) if final_vel > thr else 0.0
             else:
                 agg_vel = self._aggregate_velocity(vel)
                 weight = 0.0 if agg_vel < thr else float(np.clip(agg_vel, None, self.clip_max))
@@ -310,10 +310,7 @@ class ComputeRABCWeights(DataTransformFn):
             if self.threshold is None:
                 raise ValueError("use_final_action_condition=True requires `threshold` to be set.")
             final_vel = float(vel[-1])
-            dv_dt = float(vel[-1] - vel[-2]) if len(vel) >= 2 else 0.0
-            cond_accel = final_vel > 0.0 and dv_dt > 0.0
-            cond_above = final_vel > self.threshold
-            weight = float(np.clip(final_vel, None, self.clip_max)) if (cond_accel or cond_above) else 0.0
+            weight = float(np.clip(final_vel, None, self.clip_max)) if final_vel > self.threshold else 0.0
         else:
             weight = self._aggregate_velocity(vel)
             if self.threshold is not None:

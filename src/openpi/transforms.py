@@ -132,6 +132,17 @@ class ComputeRABCWeights(DataTransformFn):
     branch was a heuristic that bypassed the threshold and has been removed
     so the gate matches its name.)
 
+    ``sarm_progress_delta`` mode: reads absolute progress (``sarm_progress_key``)
+    instead of velocity, computes ``reward = progress[-1] - progress[0]`` over
+    the action horizon, then derives weight via the SARM-paper formula:
+        w̃ = clip((reward - (μ - 2σ)) / (4σ + ε), 0, 1)
+        w = 1 if reward > κ else (w̃ if reward ≥ 0 else 0)
+    μ/σ come from ``sarm_reward_mu``/``sarm_reward_sigma`` (pre-computed from
+    the dataset); κ is ``sarm_kappa``. Velocity/q params are ignored. Subset
+    precompute is not supported in this mode (decide_weight reads velocity),
+    so LeRobotRABCDataConfig forces ``rabc_reject_zero_weighted_mode='rejection'``
+    when ``rabc_mode='sarm_progress_delta'``.
+
     q_threshold mode: compute q_norm via the same min-max normalization the
     multiplicative/additive modes use:
       q_norm = clip((rorm_q - q_min) / (q_max - q_min), 0, 1)
@@ -191,6 +202,22 @@ class ComputeRABCWeights(DataTransformFn):
     # extra ~12% relative to linear weighting. weight_power=1 (default) is the
     # historical linear behavior.
     weight_power: float = 1.0
+    # Multiplicative scale applied to the velocity vector before aggregation/
+    # clipping. Useful when raw velocities are on a very different scale than
+    # the [0, 1] range expected by clipping/thresholding (e.g. SARM per-frame
+    # progress deltas are ~0.0005 per frame).
+    velocity_scale: float = 1.0
+    # sarm_progress_delta mode params. Reads absolute progress over the action
+    # horizon and computes reward = progress[-1] - progress[0]. Weights are
+    # derived via the SARM paper formula:
+    #   w̃ = clip((r - (μ - 2σ)) / (4σ + ε), 0, 1)
+    #   w = 1 if r > κ, else w̃
+    # μ and σ are pre-computed from the dataset (or supplied explicitly).
+    sarm_reward_mu: float = 0.0
+    sarm_reward_sigma: float = 1.0
+    sarm_kappa: float = 0.01
+    # Column name for absolute progress values.
+    sarm_progress_key: str = "sarm_dense_progress"
 
     def _aggregate_velocity(self, vel: np.ndarray) -> float:
         """Collapse the per-frame velocity vector to a scalar window weight."""
@@ -236,8 +263,14 @@ class ComputeRABCWeights(DataTransformFn):
         quality scalar, return the sample weight. No data dict, no key
         migration — used by both ``__call__`` and the precompute path that
         builds ``valid_indices`` for SubsetRandomSampler / Subset.
+
+        ``velocity_scale`` is applied here (not in ``__call__``) so the
+        precompute filter and the runtime weight agree when the caller sets
+        ``rabc_velocity_scale != 1.0``.
         """
         vel = np.asarray(vel, dtype=np.float32)
+        if self.velocity_scale != 1.0:
+            vel = vel * self.velocity_scale
         if self.mode == "q_threshold":
             if self.q_min is None or self.q_max is None:
                 raise ValueError(
@@ -307,18 +340,63 @@ class ComputeRABCWeights(DataTransformFn):
         return float(min(weight ** self.weight_power, self.clip_max))
 
     def __call__(self, data: DataDict) -> DataDict:
+        # ── SARM progress-delta mode ──────────────────────────────────────
+        # Computes reward = progress[-1] - progress[0] from absolute progress
+        # predictions over the action horizon, then applies SARM-style soft
+        # weighting:
+        #   w̃ = clip((r - (μ-2σ)) / (4σ+ε), 0, 1)
+        #   w = 1 if r > κ, w̃ if 0 ≤ r ≤ κ, 0 if r < 0
+        if self.mode == "sarm_progress_delta":
+            prog_key = self.sarm_progress_key
+            if prog_key not in data:
+                return data
+            prog = np.asarray(data[prog_key], dtype=np.float32).ravel()
+            if len(prog) < 2:
+                data = {**data, "sample_weights": np.float32(0.0)}
+                data.pop(prog_key, None)
+                return data
+            reward = float(prog[-1] - prog[0])
+            # SARM paper: μ ← max(μ, 0) to prevent negative-mean datasets
+            # from shifting the normalization window too far left.
+            mu = max(self.sarm_reward_mu, 0.0)
+            sigma = self.sarm_reward_sigma
+            eps = 1e-6
+            lo = mu - 2.0 * sigma
+            denom = max(4.0 * sigma, eps)
+            w_soft = float(np.clip((reward - lo) / denom, 0.0, 1.0))
+            if reward > self.sarm_kappa:
+                weight = 1.0
+            elif reward >= 0.0:
+                weight = w_soft
+            else:
+                weight = 0.0
+            data = {**data, "sample_weights": np.float32(weight)}
+            data.pop(prog_key, None)
+            for k in ("sarm_dense_signed_magnitude", "sarm_dense_quality",
+                       "sarm_sparse_progress", "sarm_sparse_signed_magnitude", "sarm_sparse_quality"):
+                data.pop(k, None)
+            return data
+
+        # ── Velocity-based modes ──────────────────────────────────────────
         # Schema migration: read repromo_signed_magnitude (canonical, post
         # Repromo rename) or fall back to rorm_velocity (legacy, pre-rename).
         # Same for repromo_quality vs rorm_q on the quality side.
         vel_key = next(
-            (k for k in ("repromo_signed_magnitude", "rorm_velocity") if k in data),
+            (k for k in ("repromo_signed_magnitude", "rorm_velocity", "sarm_dense_signed_magnitude") if k in data),
             None,
         )
         if vel_key is None:
             return data
         vel = np.asarray(data[vel_key], dtype=np.float32)
+        if len(vel) == 0:
+            return data
+        # velocity_scale is applied inside decide_weight() so __call__ and the
+        # subset-precompute path stay in sync; don't scale here.
 
-        q_key = next((k for k in ("repromo_quality", "rorm_q") if k in data), None)
+        q_key = next(
+            (k for k in ("repromo_quality", "rorm_q", "sarm_dense_quality") if k in data),
+            None,
+        )
         q_val: float | None = None
         if q_key is not None:
             q_val = float(np.asarray(data[q_key], dtype=np.float32).reshape(-1)[0])

@@ -152,13 +152,11 @@ def train_step(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        # RABC: weight per-sample loss by integrated velocity over action horizon
-        print(f"RABC_ENABLED: {config.rabc_enabled}")
-        print(f"observation.sample_weights: {observation.sample_weights}")
-        if config.rabc_enabled and observation.sample_weights is not None:
+        if (config.rabc_enabled or config.online_rm_enabled) and observation.sample_weights is not None:
             per_sample_loss = jnp.mean(chunked_loss, axis=-1)  # [B]
             weighted_loss = per_sample_loss * observation.sample_weights  # [B]
-            # print(f"{observation.sample_weights}")
+            if config.rabc_normalize_weights:
+                return jnp.sum(weighted_loss) / (jnp.sum(observation.sample_weights) + 1e-6)
             return jnp.mean(weighted_loss)
         return jnp.mean(chunked_loss)
 
@@ -200,7 +198,7 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
-    if config.rabc_enabled and observation.sample_weights is not None:
+    if (config.rabc_enabled or config.online_rm_enabled) and observation.sample_weights is not None:
         sample_weights = observation.sample_weights
         info.update(
             {
@@ -211,6 +209,51 @@ def train_step(
             }
         )
     return new_state, info
+
+
+def compute_weighted_fac_float(
+    raw_reward: np.ndarray,
+    reward: np.ndarray,
+    valid_rm_mask: np.ndarray,
+    rms,
+    beta: float = 2.0,
+    eps: float = 1e-8,
+    th: float = 8e-3,
+) -> tuple[np.ndarray, float, float]:
+    reward = np.asarray(reward, dtype=np.float64).ravel()
+    valid_rm_mask = np.asarray(valid_rm_mask, dtype=bool).ravel()
+    assert reward.shape == valid_rm_mask.shape
+
+    rms.update(np.asarray(raw_reward, dtype=np.float64).ravel())
+
+    mu = float(max(rms.mean, 0.0))
+    sigma = float(rms.std)
+    denom = max(4.0 * sigma, eps)
+    lo = mu - beta * sigma
+
+    fac = np.clip((reward - lo) / denom, 0.0, 1.0)
+    fac = np.where(reward > +th, 1.0, fac)
+    fac = np.where(reward < -th, 0.0, fac)
+    fac = fac * valid_rm_mask.astype(np.float64)
+
+    return fac.astype(np.float32), fac.mean(), rms.mean
+
+
+def compute_weighted_fac_binary(
+    raw_reward: np.ndarray,
+    reward: np.ndarray,
+    valid_rm_mask: np.ndarray,
+    rms,
+) -> np.ndarray:
+    reward = np.asarray(reward, dtype=np.float64).ravel()
+    valid_rm_mask = np.asarray(valid_rm_mask, dtype=bool).ravel()
+    assert reward.shape == valid_rm_mask.shape
+
+    thr = 5.0e-3
+    fac = (reward > thr).astype(np.float32)
+    fac = fac * valid_rm_mask.astype(np.float32)
+
+    return fac
 
 
 def main(config: _config.TrainConfig):
@@ -248,6 +291,42 @@ def main(config: _config.TrainConfig):
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
+    # Online reward model initialization
+    rm = None
+    rm_stats = None
+    rm_data_iter = None
+    if config.online_rm_enabled:
+        from openpi.reward_model.rm_utils import (
+            HybridRM, RMConfig, RunningMeanStd, comply_rm_lerobot_batch_multi_stage,
+        )
+        rm_cfg = RMConfig()
+        rm = HybridRM(rm_cfg)
+        rm_stats = RunningMeanStd()
+        rm_data_loader = _data_loader.create_rm_data_loader(config, sharding=data_sharding, shuffle=True)
+        rm_data_iter = iter(rm_data_loader)
+        logging.info("[INIT] Online reward model initialized")
+
+        # Compute weights for the first batch
+        rm_batch = next(rm_data_iter)
+        valid_rm_mask = np.ones(batch[0].state.shape[0], dtype=bool)
+        rm_batch_curr = comply_rm_lerobot_batch_multi_stage(rm_batch['rm'])
+        rm_batch_next = comply_rm_lerobot_batch_multi_stage(rm_batch['rm_next'])
+        raw_reward, reward, mean_conf = rm.eval_reward(rm_batch_curr, rm_batch_next)
+
+        if config.online_rm_weight_method == 'binary':
+            bc_weight = compute_weighted_fac_binary(raw_reward, reward, valid_rm_mask, rm_stats)
+        else:
+            bc_weight, _, _ = compute_weighted_fac_float(raw_reward, reward, valid_rm_mask, rm_stats)
+
+        observation, actions = batch
+        bc_weight_jax = jax.device_put(
+            jnp.array(bc_weight),
+            jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS)),
+        )
+        observation = dataclasses.replace(observation, sample_weights=bc_weight_jax)
+        batch = (observation, actions)
+        logging.info(f"First batch RM weights: {bc_weight}")
+
     # Log images from first batch to sanity check.
     images_to_log = [
         wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
@@ -282,6 +361,12 @@ def main(config: _config.TrainConfig):
     running_sample_weight_sq_sum = 0.0
     running_sample_weight_zero_count = 0.0
     running_sample_weight_count = 0.0
+    # Online RM tracking variables (initialized for first log interval)
+    reward = np.array([0.0])
+    mean_conf = 0.0
+    bc_weight = np.array([0.0])
+    mean_weight = 0.0
+    rms_mean = 0.0
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
@@ -332,11 +417,44 @@ def main(config: _config.TrainConfig):
                 ):
                     reduced_info.pop(key, None)
 
+            # Online RM extra metrics
+            if config.online_rm_enabled and rm is not None:
+                reduced_info["online_rm/step_reward"] = float(np.mean(reward))
+                reduced_info["online_rm/mean_confidence"] = float(mean_conf)
+                reduced_info["online_rm/num_used_actions"] = float(np.sum(bc_weight > 0))
+                if config.online_rm_weight_method == 'float':
+                    reduced_info["online_rm/mean_weight"] = float(mean_weight)
+                    reduced_info["online_rm/rms_mean"] = float(rms_mean)
+
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
         batch = next(data_iter)
+
+        # Online RM: compute per-sample weights and inject into observation
+        if config.online_rm_enabled and rm is not None:
+            from openpi.reward_model.rm_utils import comply_rm_lerobot_batch_multi_stage
+            rm_batch = next(rm_data_iter)
+            valid_rm_mask = np.ones(batch[0].state.shape[0], dtype=bool)
+            rm_batch_curr = comply_rm_lerobot_batch_multi_stage(rm_batch['rm'])
+            rm_batch_next = comply_rm_lerobot_batch_multi_stage(rm_batch['rm_next'])
+            raw_reward, reward, mean_conf = rm.eval_reward(rm_batch_curr, rm_batch_next)
+
+            if config.online_rm_weight_method == 'binary':
+                bc_weight = compute_weighted_fac_binary(raw_reward, reward, valid_rm_mask, rm_stats)
+            else:
+                bc_weight, mean_weight, rms_mean = compute_weighted_fac_float(
+                    raw_reward, reward, valid_rm_mask, rm_stats
+                )
+
+            observation, actions = batch
+            bc_weight_jax = jax.device_put(
+                jnp.array(bc_weight),
+                jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS)),
+            )
+            observation = dataclasses.replace(observation, sample_weights=bc_weight_jax)
+            batch = (observation, actions)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step, config.s3_checkpoint_path)

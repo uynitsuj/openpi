@@ -84,6 +84,14 @@ class DataConfig:
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantile_norm: bool = False
 
+    # RABC: when True, the dataloader wraps the transformed dataset with
+    # RejectionSamplingTransformedDataset so chunks emitting
+    # sample_weights == 0 (e.g., final-action gate failed) are replaced by a
+    # fresh uniform draw rather than consuming a batch slot with zero gradient.
+    # Default True matches the behavior on origin/rorm-rabc (cherry-picked
+    # 2026-05-18). No-op if no transform emits sample_weights.
+    rabc_reject_zero_weighted: bool = True
+
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
@@ -602,12 +610,13 @@ def _episode_mean_q(repo_id: str) -> dict[int, float]:
         q_col = (
             "repromo_quality" if "repromo_quality" in schema_cols
             else "rorm_q" if "rorm_q" in schema_cols
+            else "sarm_dense_quality" if "sarm_dense_quality" in schema_cols
             else None
         )
         if q_col is None:
             raise KeyError(
-                f"Neither 'repromo_quality' nor 'rorm_q' in {f}; "
-                f"has the dataset been injected with Repromo annotations?"
+                f"Neither 'repromo_quality', 'rorm_q', nor 'sarm_dense_quality' in {f}; "
+                f"has the dataset been injected with reward annotations?"
             )
         t = pq.read_table(f, columns=["episode_index", q_col])
         eps = np.asarray(t["episode_index"]).astype(np.int64).ravel()
@@ -718,6 +727,7 @@ def _load_rabc_q_range(repo_id: str) -> tuple[float | None, float | None]:
     q_col = (
         "repromo_quality" if "repromo_quality" in schema_cols
         else "rorm_q" if "rorm_q" in schema_cols
+        else "sarm_dense_quality" if "sarm_dense_quality" in schema_cols
         else None
     )
     if q_col is None:
@@ -733,6 +743,77 @@ def _load_rabc_q_range(repo_id: str) -> tuple[float | None, float | None]:
         return None, None
     logging.info(f"_load_rabc_q_range: scanned parquets for {repo_id}, q ∈ [{q_min:.4f}, {q_max:.4f}]")
     return q_min, q_max
+
+
+def _compute_sarm_reward_stats(
+    repo_id: str, action_horizon: int, progress_col: str = "sarm_dense_progress",
+) -> tuple[float, float]:
+    """Compute mean and std of progress-delta rewards for SARM weighting.
+
+    Prefers ``meta/sarm_reward_stats.json`` (keyed by horizon) for fast startup.
+    Falls back to a full parquet scan computing reward = progress[t + horizon - 1] - progress[t]
+    for each valid frame, then returns (μ, σ) for use in the SARM weighting formula.
+    """
+    import json
+    import numpy as np
+    import pyarrow.parquet as pq
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    root = HF_LEROBOT_HOME / repo_id
+
+    # Fast path: check pre-computed cache.
+    cache_path = root / "meta" / "sarm_reward_stats.json"
+    if cache_path.exists():
+        stats = json.loads(cache_path.read_text())
+        key = f"{action_horizon}_{progress_col}"
+        # Fall back to horizon-only key only for the default column
+        # (backward compat with pre-column-aware caches).
+        if key not in stats and progress_col == "sarm_dense_progress":
+            key = str(action_horizon)
+        if key in stats and stats[key].get("mu") is not None and stats[key].get("sigma") is not None:
+            mu, sigma = float(stats[key]["mu"]), float(stats[key]["sigma"])
+            logging.info(f"_compute_sarm_reward_stats: loaded from cache ({key}): μ={mu:.6f}, σ={sigma:.6f}")
+            return mu, sigma
+
+    parquet_files = sorted((root / "data").glob("chunk-*/*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"no parquet files under {root}/data")
+
+    all_rewards: list[np.ndarray] = []
+    for f in parquet_files:
+        schema_cols = set(pq.read_schema(f).names)
+        if progress_col not in schema_cols:
+            continue
+        t = pq.read_table(f, columns=["episode_index", "frame_index", progress_col])
+        eps = np.asarray(t["episode_index"]).astype(np.int64).ravel()
+        frames = np.asarray(t["frame_index"]).astype(np.int64).ravel()
+        prog = np.asarray(t[progress_col]).astype(np.float64).ravel()
+        # Sort by (episode, frame) to guarantee temporal order.
+        order = np.lexsort((frames, eps))
+        eps, prog = eps[order], prog[order]
+        unique_eps = np.unique(eps)
+        for ep in unique_eps:
+            mask = eps == ep
+            ep_prog = prog[mask]
+            n = len(ep_prog)
+            if n < action_horizon:
+                continue
+            n_chunks = n - action_horizon + 1
+            rewards = ep_prog[action_horizon - 1:] - ep_prog[:n_chunks]
+            all_rewards.append(rewards)
+
+    if not all_rewards:
+        logging.warning(f"No valid rewards computed for {repo_id}; returning defaults (0, 1)")
+        return 0.0, 1.0
+
+    rewards = np.concatenate(all_rewards)
+    mu = float(rewards.mean())
+    sigma = float(rewards.std())
+    logging.info(
+        f"_compute_sarm_reward_stats: {repo_id}, horizon={action_horizon}, "
+        f"μ={mu:.6f}, σ={sigma:.6f}, n={len(rewards)}"
+    )
+    return mu, sigma
 
 
 @dataclasses.dataclass(frozen=True)
@@ -796,6 +877,9 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
       "velocity_only"  — classic velocity-integrated weight (default)
       "multiplicative" — v_weight * q_norm  (requires rorm_q in dataset)
       "additive"       — 0.5 * (v_weight + q_norm)  (requires rorm_q in dataset)
+      "sarm_progress_delta" — SARM-paper weighting from absolute progress.
+          Computes reward = progress[-1] - progress[0] over the action horizon,
+          then applies soft weighting with running-stats normalization.
 
     For Q-based modes, q_min/q_max are loaded from meta/rabc_stats.json unless
     explicitly provided via rabc_q_min / rabc_q_max.
@@ -851,6 +935,20 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
     # penalizing long episodes whose per-frame vel sits at ~0.5. Default 1.0
     # = linear (historical behavior).
     rabc_weight_power: float = 1.0
+    # Scale factor applied to velocity before aggregation/clipping. Useful
+    # when raw velocities are on a different scale than the [0, 1] range
+    # expected by clipping/thresholding.
+    rabc_velocity_scale: float = 1.0
+    # ── sarm_progress_delta mode params ──
+    # Pre-computed reward statistics for SARM soft weighting. When None and
+    # mode is sarm_progress_delta, auto-computed by scanning the dataset.
+    sarm_reward_mu: float | None = None
+    sarm_reward_sigma: float | None = None
+    # Hard prior-override threshold (κ in the SARM paper). Rewards above κ
+    # get weight=1 unconditionally. Paper default: 0.01.
+    sarm_kappa: float = 0.01
+    # Column name for absolute progress values.
+    sarm_progress_key: str = "sarm_dense_progress"
     # Hard Q-filter: keep only the top fraction of episodes by mean rorm_q.
     top_q_frac: float | None = None
     # Length filter: keep only the shortest fraction of episodes by frame count.
@@ -860,7 +958,8 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        use_q = self.rabc_mode != "velocity_only"
+        is_sarm = self.rabc_mode == "sarm_progress_delta"
+        use_q = self.rabc_mode not in ("velocity_only", "sarm_progress_delta")
         # Inspect the dataset parquet schema so we only request columns that exist.
         # Carry both canonical (repromo_*) and legacy (rorm_*) names through the
         # repack when present so ComputeRABCWeights can resolve whichever the
@@ -884,16 +983,24 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
             "actions": "actions",
             "prompt": "prompt",
         }
-        for col in ("repromo_signed_magnitude", "rorm_velocity"):
-            if col in schema_cols:
-                repack_keys[col] = col
-        if use_q:
-            # All Q-aware modes (multiplicative / additive / q_threshold)
-            # read per-frame quality + apply min-max normalization with q_min,
-            # q_max. q_threshold no longer uses a precomputed rank table.
-            for col in ("repromo_quality", "rorm_q"):
+
+        if is_sarm:
+            # SARM progress-delta mode: only need absolute progress column.
+            if self.sarm_progress_key in schema_cols:
+                repack_keys[self.sarm_progress_key] = self.sarm_progress_key
+        else:
+            # Pick the FIRST available velocity column (transform falls back
+            # among them via the same precedence). Adding all that exist
+            # forces lerobot to query every one per-frame, which crashes if
+            # any legacy column (e.g. rorm_velocity) has null rows.
+            for col in ("repromo_signed_magnitude", "rorm_velocity", "sarm_dense_signed_magnitude"):
                 if col in schema_cols:
                     repack_keys[col] = col
+                    break
+            if use_q:
+                for col in ("repromo_quality", "rorm_q", "sarm_dense_quality"):
+                    if col in schema_cols:
+                        repack_keys[col] = col
 
         repack_transform = _transforms.Group(
             inputs=[_transforms.RepackTransform(repack_keys)]
@@ -904,6 +1011,15 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
         q_min, q_max = self.rabc_q_min, self.rabc_q_max
         if use_q and (q_min is None or q_max is None) and self.repo_id is not None:
             q_min, q_max = _load_rabc_q_range(self.repo_id)
+
+        # SARM: auto-compute reward statistics if not explicitly provided.
+        sarm_mu, sarm_sigma = self.sarm_reward_mu, self.sarm_reward_sigma
+        if is_sarm and self.repo_id is not None:
+            info_path = HF_LEROBOT_HOME / self.repo_id / "meta" / "info.json"
+            if info_path.exists() and (sarm_mu is None or sarm_sigma is None):
+                sarm_mu, sarm_sigma = _compute_sarm_reward_stats(
+                    self.repo_id, model_config.action_horizon, self.sarm_progress_key,
+                )
 
         rabc_inputs: list[_transforms.DataTransformFn] = [
             _transforms.ComputeRABCWeights(
@@ -922,6 +1038,11 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
                 velocity_aggregator=self.rabc_velocity_aggregator,
                 action_horizon=getattr(model_config, "action_horizon", 0),
                 weight_power=self.rabc_weight_power,
+                velocity_scale=self.rabc_velocity_scale,
+                sarm_reward_mu=sarm_mu if sarm_mu is not None else 0.0,
+                sarm_reward_sigma=sarm_sigma if sarm_sigma is not None else 1.0,
+                sarm_kappa=self.sarm_kappa,
+                sarm_progress_key=self.sarm_progress_key,
             ),
             yam_policy.YamInputs(action_dim=model_config.action_dim, model_type=model_config.model_type),
         ]
@@ -931,16 +1052,19 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
             outputs=[yam_policy.YamOutputs()],
         )
 
-        # Stack velocity (and Q for q-aware modes) over action_horizon so RABC
-        # transforms see a ``(horizon,)`` array. Pick exactly one name per
-        # field: canonical (repromo_*) preferred over legacy (rorm_*). When
-        # both are in the schema after a migration, the legacy column often
-        # contains NULL placeholder rows that crash lerobot's torch.stack.
+        # Stack velocity / quality / progress over action_horizon so RABC
+        # transforms see a ``(horizon,)`` array.
         def _pick(*candidates: str) -> str | None:
             return next((c for c in candidates if c in schema_cols), None)
-        vel_key_for_horizon = _pick("repromo_signed_magnitude", "rorm_velocity")
-        q_key_for_horizon = _pick("repromo_quality", "rorm_q") if use_q else None
-        extra_horizon_keys = tuple(k for k in (vel_key_for_horizon, q_key_for_horizon) if k is not None)
+
+        if is_sarm:
+            # Only need the progress column stacked over the horizon.
+            progress_key = _pick(self.sarm_progress_key)
+            extra_horizon_keys = (progress_key,) if progress_key else ()
+        else:
+            vel_key_for_horizon = _pick("repromo_signed_magnitude", "rorm_velocity", "sarm_dense_signed_magnitude")
+            q_key_for_horizon = _pick("repromo_quality", "rorm_q", "sarm_dense_quality") if use_q else None
+            extra_horizon_keys = tuple(k for k in (vel_key_for_horizon, q_key_for_horizon) if k is not None)
 
         episodes: tuple[int, ...] | None = None
         val_episodes: tuple[int, ...] | None = None
@@ -962,6 +1086,19 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
                 f"Assumed inference-only context."
             )
 
+        # SARM progress-delta mode reads progress (not velocity), so the
+        # "subset" precompute path — which calls rabc.decide_weight() on
+        # velocity windows — would silently mis-filter. Force per-getitem
+        # "rejection" mode here so SARM configs don't need to set this
+        # explicitly.
+        reject_mode = self.rabc_reject_zero_weighted_mode
+        if is_sarm and reject_mode != "rejection":
+            logging.info(
+                f"SARM mode ({self.rabc_mode}) requires per-getitem rejection; "
+                f"overriding rabc_reject_zero_weighted_mode={reject_mode!r} → 'rejection'."
+            )
+            reject_mode = "rejection"
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             extra_horizon_keys=extra_horizon_keys,
@@ -971,7 +1108,7 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
             episodes=episodes,
             val_episodes=val_episodes,
             reject_zero_weighted_samples=self.rabc_reject_zero_weighted,
-            reject_zero_weighted_mode=self.rabc_reject_zero_weighted_mode,
+            reject_zero_weighted_mode=reject_mode,
             extra_horizon_lookahead_frames=self.rabc_lookahead_frames,
         )
 
@@ -1058,6 +1195,15 @@ class TrainConfig:
     # Clip range for the per-sample RABC weight after integration + normalization.
     rabc_clip_min: float = 0.0
     rabc_clip_max: float = 1.0
+    # When True, normalize the weighted loss by sum of weights (SARM paper):
+    #   L = Σ(w_i * ℓ_i) / (Σw_i + ε)  instead of  mean(w_i * ℓ_i)
+    rabc_normalize_weights: bool = False
+
+    # ── Online Reward Model RABC ─────────────────────────────────────────
+    # Runs a PyTorch reward model (HybridRM) at training time to compute
+    # per-sample weights. Mutually exclusive with rabc_enabled (pre-computed).
+    online_rm_enabled: bool = False
+    online_rm_weight_method: str = "float"  # "binary" or "float"
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -2644,6 +2790,172 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
+    # ── Online Reward Model RABC (David Chen's HybridRM) ─────────────────
+    TrainConfig(
+        name="pi0_yam_tshirt_online_rm_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamDataConfig(
+            repo_id="Qianzhong-Chen/tshirt_folding_10h_hlm_yam_white_0810",
+            default_prompt="fold the tshirt",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        online_rm_enabled=True,
+        online_rm_weight_method="float",
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_online_rm_rabc_binary",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamDataConfig(
+            repo_id="Qianzhong-Chen/tshirt_folding_10h_hlm_yam_white_0810",
+            default_prompt="fold the tshirt",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        online_rm_enabled=True,
+        online_rm_weight_method="binary",
+    ),
+    # ── SARM vanilla BC (no weighting, baseline comparison) ─────────────
+    TrainConfig(
+        name="pi0_yam_tshirt_sarm_bc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamDataConfig(
+            repo_id="sarm_dense_and_sparse_only_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=90_000,
+        save_interval=30_000,
+        keep_period=30_000,
+    ),
+    # ── SARM cached RABC sparse head ────────────────────────────────────
+    TrainConfig(
+        name="pi0_yam_tshirt_sarm_rabc_sparse",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sarm_dense_and_sparse_only_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_mode="sarm_progress_delta",
+            sarm_kappa=0.01,
+            sarm_progress_key="sarm_sparse_progress",
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=90_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+        rabc_normalize_weights=True,
+    ),
+    # ── SARM cached RABC sparse head — centered+d405 under90s dataset ───
+    TrainConfig(
+        name="pi0_yam_tshirt_sarm_rabc_sparse_under90s",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sarm_dense_and_sparse_centered_with_d405_under90s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_mode="sarm_progress_delta",
+            sarm_kappa=0.01,
+            sarm_progress_key="sarm_sparse_progress",
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=60_000,
+        save_interval=20_000,
+        keep_period=20_000,
+        rabc_enabled=True,
+        rabc_normalize_weights=True,
+    ),
+    # ── SARM cached RABC (pre-computed dense progress predictions) ──────
+    TrainConfig(
+        name="pi0_yam_tshirt_sarm_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sarm_dense_and_sparse_only_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_mode="sarm_progress_delta",
+            sarm_kappa=0.01,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+        rabc_normalize_weights=True,
+    ),
+    # ── SARM sparse — under60s + full variants of the centered_with_d405 set
+    *[
+        TrainConfig(
+            name=f"pi0_yam_tshirt_sarm_rabc_sparse_{tag}",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=f"sarm_dense_and_sparse_centered_with_d405_{tag}_gop10",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_mode="sarm_progress_delta",
+                sarm_kappa=0.01,
+                sarm_progress_key="sarm_sparse_progress",
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            num_train_steps=60_000,
+            save_interval=20_000,
+            keep_period=20_000,
+            rabc_enabled=True,
+            rabc_normalize_weights=True,
+        )
+        for tag in ("full", "under60s")
+    ],
+    # ── d405-short25 RM (repromo_signed_magnitude) finalaction thr=1.0 NOMAX
+    #    on the same 3 centered_with_d405 datasets — A/B vs the SARM method.
+    *[
+        TrainConfig(
+            name=f"pi0_yam_tshirt_d405short25_finalaction_thr100_nomax_{tag}",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=f"sarm_dense_and_sparse_centered_with_d405_{tag}_gop10",
+                default_prompt="Folding tshirt pile and stacking",
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_mode="velocity_only",
+                rabc_use_final_action_condition=True,
+                rabc_threshold=1.00,
+                rabc_clip_max=float("inf"),
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            num_train_steps=60_000,
+            save_interval=20_000,
+            keep_period=20_000,
+            rabc_enabled=True,
+        )
+        for tag in ("full", "under90s", "under60s")
+    ],
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

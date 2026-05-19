@@ -1,5 +1,6 @@
 from collections.abc import Iterator, Sequence
 import dataclasses
+from dataclasses import dataclass, field, asdict
 import hashlib
 import json
 import logging
@@ -8,7 +9,7 @@ import os
 import pathlib
 import time
 import typing
-from typing import Literal, Protocol, SupportsIndex, TypeVar
+from typing import List, Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -912,3 +913,136 @@ class DataLoaderImpl(DataLoader):
     def __iter__(self):
         for batch in self._data_loader:
             yield _model.Observation.from_dict(batch), batch["actions"]
+
+
+# ---------------------------------------------------------------------------
+# Online Reward Model data loader
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RMDatasetConfig:
+    repo_id: str = "Qianzhong-Chen/tshirt_folding_10h_hlm_yam_white_0810"
+    n_obs_steps: int = 8
+    frame_gap: int = 30
+    horizon: int = 8
+    max_rewind_steps: int = 4
+    image_names: List[str] = field(default_factory=lambda: ["top_camera-images-rgb"])
+    dense_annotation: bool = False
+    video_eval: bool = True
+
+
+@dataclass
+class XdofLerobotDatasetConfig:
+    repo_id: str = "Qianzhong-Chen/tshirt_folding_10h_hlm_yam_white_0810"
+    n_obs_steps: int = 1
+    horizon: int = 26
+
+
+def create_rm_dataset(data_config: _config.DataConfig, action_horizon: int) -> "Dataset":
+    from openpi.training.rm_datasets import HybirdLeRobotDataset
+
+    rm_cfg = RMDatasetConfig(repo_id=data_config.repo_id)
+    xdof_cfg = XdofLerobotDatasetConfig(repo_id=data_config.repo_id, horizon=action_horizon + 1)
+
+    rm = getattr(data_config, "reward_model", None)
+    if rm is not None:
+        rm_cfg.n_obs_steps = getattr(rm, "n_obs_steps", rm_cfg.n_obs_steps)
+        rm_cfg.frame_gap = getattr(rm, "frame_gap", rm_cfg.frame_gap)
+        rm_cfg.horizon = getattr(rm, "horizon", rm_cfg.horizon)
+        rm_cfg.max_rewind_steps = getattr(rm, "max_rewind_steps", rm_cfg.max_rewind_steps)
+        rm_cfg.image_names = list(getattr(rm, "camera_names", rm_cfg.image_names))
+        rm_cfg.dense_annotation = getattr(rm, "dense_annotation", rm_cfg.dense_annotation)
+
+    return HybirdLeRobotDataset(
+        frame_gap_dataset_kwargs=asdict(rm_cfg),
+        xdof_dataset_kwargs=asdict(xdof_cfg),
+    )
+
+
+class RMTorchDataLoader:
+    """Data loader for the online reward model. Yields raw batch dicts (not Observations)."""
+
+    def __init__(
+        self,
+        dataset,
+        local_batch_size: int,
+        *,
+        shuffle: bool = False,
+        num_batches: int | None = None,
+        num_workers: int = 0,
+        seed: int = 0,
+    ):
+        if len(dataset) < local_batch_size:
+            raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
+
+        self._num_batches = num_batches
+
+        mp_context = None
+        if num_workers > 0:
+            mp_context = multiprocessing.get_context("spawn")
+
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        self._data_loader = torch.utils.data.DataLoader(
+            typing.cast(torch.utils.data.Dataset, dataset),
+            batch_size=local_batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            multiprocessing_context=mp_context,
+            persistent_workers=num_workers > 0,
+            collate_fn=_collate_fn,
+            worker_init_fn=_worker_init_fn,
+            drop_last=True,
+            generator=generator,
+        )
+
+    def __iter__(self):
+        num_items = 0
+        while True:
+            data_iter = iter(self._data_loader)
+            while True:
+                if self._num_batches is not None and num_items >= self._num_batches:
+                    return
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    break
+                num_items += 1
+                yield batch
+
+
+class RMDataLoaderImpl:
+    """Wrapper that yields raw RM batch dicts."""
+
+    def __init__(self, data_config: _config.DataConfig, data_loader: RMTorchDataLoader):
+        self._data_config = data_config
+        self._data_loader = data_loader
+
+    def data_config(self) -> _config.DataConfig:
+        return self._data_config
+
+    def __iter__(self):
+        for batch in self._data_loader:
+            yield batch
+
+
+def create_rm_data_loader(
+    config: _config.TrainConfig,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+) -> RMDataLoaderImpl:
+    data_config = config.data.create(config.assets_dirs, config.model)
+    dataset = create_rm_dataset(data_config, config.model.action_horizon)
+
+    data_loader = RMTorchDataLoader(
+        dataset,
+        local_batch_size=config.batch_size // jax.process_count(),
+        shuffle=shuffle,
+        num_batches=num_batches,
+        num_workers=config.num_workers,
+        seed=config.seed,
+    )
+
+    return RMDataLoaderImpl(data_config, data_loader)

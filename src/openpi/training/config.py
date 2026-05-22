@@ -2202,6 +2202,30 @@ _CONFIGS = [
         keep_period=30_000,
         rabc_enabled=True,
     ),
+    # Mean-over-chunk sibling of the above: same dataset and thr/nomax, but
+    # uses the default velocity_aggregator="mean" path instead of the final-
+    # action gate. Keep iff mean(vel[t:t+H]) > 1.0; kept weight = clip(mean,
+    # None, inf) = mean. clip_max=inf so high-velocity stretches retain their
+    # magnitude rather than saturating at 1.0.
+    TrainConfig(
+        name="pi0_merged90_rabc_mean_thr100_nomax",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_plus_d405_under90s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=False,
+            rabc_threshold=1.00,
+            rabc_clip_max=float("inf"),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
     # NOMAX sibling for merged60 thr=1.0 strict (same dataset as
     # pi0_merged60_rabc_finalaction_thr100 but no upper cap).
     TrainConfig(
@@ -2880,7 +2904,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
         num_train_steps=60_000,
         save_interval=20_000,
         keep_period=20_000,
@@ -2922,7 +2946,7 @@ _CONFIGS = [
             ),
             batch_size=32,
             num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
             num_train_steps=60_000,
             save_interval=20_000,
             keep_period=20_000,
@@ -2948,7 +2972,7 @@ _CONFIGS = [
             ),
             batch_size=32,
             num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
             num_train_steps=60_000,
             save_interval=20_000,
             keep_period=20_000,

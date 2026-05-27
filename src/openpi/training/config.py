@@ -953,6 +953,13 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
     top_q_frac: float | None = None
     # Length filter: keep only the shortest fraction of episodes by frame count.
     top_shortest_frac: float | None = None
+    # Deminf-curation baseline: path to a JSON file with an explicit list of
+    # episode indices to keep (see assets/deminf_baselines/*.json). When set,
+    # this overrides val/top_q/top_shortest selection — the listed episodes
+    # are used directly as the training set (val_eps are still excluded if
+    # val_frac > 0). Intended for "deminf-as-curation" baselines that match a
+    # WARP-BC keep-fraction at matched training-sample count.
+    deminf_keep_episodes_path: str | None = None
     val_frac: float = 0.0
     val_seed: int = 0
 
@@ -1074,7 +1081,19 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
         if info_path is not None and info_path.exists():
             val_eps, non_val_eps = _split_val_episodes(self.repo_id, self.val_frac, self.val_seed)
             val_episodes = val_eps if val_eps else None
-            if self.top_q_frac is not None:
+            if self.deminf_keep_episodes_path is not None:
+                import json as _json
+                with open(self.deminf_keep_episodes_path) as _f:
+                    _blob = _json.load(_f)
+                _kept = set(int(e) for e in _blob["episodes"])
+                _val_set = set(val_eps or ())
+                episodes = tuple(sorted(_kept - _val_set))
+                logging.info(
+                    f"[deminf_keep] {self.deminf_keep_episodes_path}: "
+                    f"loaded {len(_kept)} episodes ({_blob.get('achieved_sample_frac', '?')} of samples); "
+                    f"after val-exclusion training on {len(episodes)} eps."
+                )
+            elif self.top_q_frac is not None:
                 episodes = tuple(_top_q_episodes(self.repo_id, self.top_q_frac, exclude_eps=val_eps))
             elif self.top_shortest_frac is not None:
                 episodes = tuple(_shortest_episodes(self.repo_id, self.top_shortest_frac, exclude_eps=val_eps))
@@ -2936,6 +2955,51 @@ _CONFIGS = [
         keep_period=20_000,
         rabc_enabled=True,
         rabc_normalize_weights=True,
+    ),
+    # ── DemInf-curation BASELINES on the SARM centered_with_d405 datasets ─
+    # Plain BC (no RABC); deminf is the sole curation signal. Episode list is
+    # the top-X% of episodes by training-sample count, ranked by deminf
+    # `ep_idx` log-density score (higher = closer to demo distribution).
+    # The keep-fractions (45.6% on under60s, 33.7% on under90s) match the
+    # effective training-sample budgets of the WARP-BC twins, so the head-to-
+    # head answers "is episode-level deminf curation as good as chunk-level
+    # WARP-BC at matched data budget?". See assets/deminf_baselines/*.json
+    # for the exact episode lists + selection metadata.
+    TrainConfig(
+        name="pi0_sarm_under60s_no_rabc_deminf_top456",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sarm_dense_and_sparse_centered_with_d405_under60s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_reject_zero_weighted=False,
+            deminf_keep_episodes_path="assets/deminf_baselines/sarm_dense_and_sparse_centered_with_d405_under60s_gop10_top456.json",
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi0_sarm_under90s_no_rabc_deminf_top337",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sarm_dense_and_sparse_centered_with_d405_under90s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_reject_zero_weighted=False,
+            deminf_keep_episodes_path="assets/deminf_baselines/sarm_dense_and_sparse_centered_with_d405_under90s_gop10_top337.json",
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=False,
     ),
     # ── SARM cached RABC (pre-computed dense progress predictions) ──────
     TrainConfig(

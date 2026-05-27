@@ -486,6 +486,15 @@ def _load_scizor_sidecar(
     """
     import pyarrow.parquet as _pq  # local import: optional dep
 
+    # Remote sidecars (s3://, gs://) are fetched once to a local cache. The
+    # subset precompute in data_loader.precompute_valid_indices reads the
+    # sidecar in the main process before the torch DataLoader spawns workers,
+    # so this download happens exactly once per run; maybe_download is a
+    # passthrough (no-op) for already-local paths.
+    if "://" in sidecar_path:
+        from openpi.shared import download as _download
+        sidecar_path = str(_download.maybe_download(sidecar_path))
+
     resolved = str(pathlib.Path(sidecar_path).resolve())
     stat = pathlib.Path(resolved).stat()
     cache_key = (resolved, stat.st_mtime, stat.st_size, score_column)

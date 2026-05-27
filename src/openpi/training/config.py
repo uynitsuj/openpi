@@ -1870,6 +1870,37 @@ _CONFIGS = [
         keep_period=30_000,
         rabc_enabled=True,
     ),
+    # ── SCIZOR baseline on the SARM centered_with_d405 datasets ──────────
+    # Same datasets as the SARM-RABC / deminf / WARP-BC baselines (under60s,
+    # under90s), rescored by SCIZOR so all curation methods compare on an
+    # identical demonstration pool. Sidecars live on S3 at
+    # repromo/baselines/scizor/<repo_id>/scizor_predictions.parquet (same
+    # filename convention as the singlefold sidecars); _load_scizor_sidecar
+    # fetches the s3:// path to a local cache once in the main process.
+    # ε_s=0.58, binary gate, no_rabc pretrained init, 60k steps — matched to
+    # the other baselines.
+    *[
+        TrainConfig(
+            name=f"pi0_yam_tshirt_scizor_sidecar_sarm_{tag}",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotScizorSidecarDataConfig(
+                repo_id=f"sarm_dense_and_sparse_centered_with_d405_{tag}_gop10",
+                default_prompt="Folding tshirt pile and stacking",
+                scizor_sidecar_path=f"s3://xdof-internal-research/repromo/baselines/scizor/sarm_dense_and_sparse_centered_with_d405_{tag}_gop10/scizor_predictions.parquet",
+                scizor_eps_s=0.58,
+                scizor_weight_mode="binary",
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+            num_train_steps=60_000,
+            save_interval=30_000,
+            keep_period=30_000,
+            rabc_enabled=True,
+        )
+        for tag in ("under60s", "under90s")
+    ],
     TrainConfig(
         name="pi0_yam_tshirt_no_rabc_d405",
         model=pi0_config.Pi0Config(action_horizon=30),

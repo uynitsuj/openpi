@@ -1,6 +1,9 @@
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
+import logging
+import pathlib
 import re
+import threading
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
 import flax.traverse_util as traverse_util
@@ -218,6 +221,16 @@ class ComputeRABCWeights(DataTransformFn):
     sarm_kappa: float = 0.01
     # Column name for absolute progress values.
     sarm_progress_key: str = "sarm_dense_progress"
+    # ── scizor_anchor mode params ──
+    # Paper-faithful SCIZOR gating (Zhang et al. 2026, §3.2). Reads a scalar
+    # per-sample anchor score from data["scizor_score"] (injected upstream by
+    # LoadScizorSidecar from the SCIZOR sidecar parquet) and decides keep/drop
+    # at the chunk's anchor frame only — no aggregation over the action
+    # horizon. ``threshold`` is reused as ε_s (paper default 0.58).
+    #   scizor_weight_mode='binary':     w = 1 if score <= ε_s else 0
+    #   scizor_weight_mode='continuous': w = clip(1 - score, clip_min, clip_max)
+    scizor_weight_mode: str = "binary"
+    scizor_score_key: str = "scizor_score"
 
     def _aggregate_velocity(self, vel: np.ndarray) -> float:
         """Collapse the per-frame velocity vector to a scalar window weight."""
@@ -269,6 +282,26 @@ class ComputeRABCWeights(DataTransformFn):
         ``rabc_velocity_scale != 1.0``.
         """
         vel = np.asarray(vel, dtype=np.float32)
+        if self.mode == "scizor_anchor":
+            # Anchor-frame gate. The caller passes a length-1 array (or a
+            # scalar broadcast to one); we read only vel[0]. velocity_scale
+            # is intentionally NOT applied — SCIZOR scores are already in
+            # [0, 1] and have a paper-fixed threshold (ε_s).
+            if self.threshold is None:
+                raise ValueError(
+                    "mode='scizor_anchor' requires threshold (ε_s) to be set."
+                )
+            score = float(vel.reshape(-1)[0])
+            if self.scizor_weight_mode == "binary":
+                w = 1.0 if score <= self.threshold else 0.0
+            elif self.scizor_weight_mode == "continuous":
+                w = float(np.clip(1.0 - score, self.clip_min, self.clip_max))
+            else:
+                raise ValueError(
+                    f"Unknown scizor_weight_mode {self.scizor_weight_mode!r}. "
+                    "Expected 'binary' or 'continuous'."
+                )
+            return self._apply_power(w)
         if self.velocity_scale != 1.0:
             vel = vel * self.velocity_scale
         if self.mode == "q_threshold":
@@ -340,6 +373,22 @@ class ComputeRABCWeights(DataTransformFn):
         return float(min(weight ** self.weight_power, self.clip_max))
 
     def __call__(self, data: DataDict) -> DataDict:
+        # ── SCIZOR anchor-frame mode ─────────────────────────────────────
+        # Paper-faithful filter: read the per-anchor scalar score injected
+        # by LoadScizorSidecar and gate on ε_s. No aggregation, no velocity.
+        if self.mode == "scizor_anchor":
+            score_key = self.scizor_score_key
+            if score_key not in data:
+                # No sidecar lookup happened — leave sample_weights unset so
+                # downstream code falls back to vanilla BC (matches the
+                # behavior of velocity_only when no velocity column exists).
+                return data
+            score_val = float(np.asarray(data[score_key], dtype=np.float32).reshape(-1)[0])
+            weight = self.decide_weight(np.asarray([score_val], dtype=np.float32))
+            data = {**data, "sample_weights": np.float32(weight)}
+            data.pop(score_key, None)
+            return data
+
         # ── SARM progress-delta mode ──────────────────────────────────────
         # Computes reward = progress[-1] - progress[0] from absolute progress
         # predictions over the action horizon, then applies SARM-style soft
@@ -408,6 +457,132 @@ class ComputeRABCWeights(DataTransformFn):
         if q_key is not None:
             data.pop(q_key, None)
         data.pop("episode_q_norm", None)
+        return data
+
+
+# Module-level cache for sidecar parquet contents. Keyed on the sidecar path
+# (resolved) + (mtime, size) so swapping sidecar files between runs in the
+# same process invalidates correctly. Holds a (per_episode dict, score_column)
+# pair: { episode_index → np.ndarray[length_of_episode, float32] }.
+_SCIZOR_SIDECAR_CACHE: dict[
+    tuple[str, float, int, str], dict[int, np.ndarray]
+] = {}
+_SCIZOR_SIDECAR_LOCK = threading.Lock()
+
+
+def _load_scizor_sidecar(
+    sidecar_path: str, score_column: str = "scizor_score"
+) -> dict[int, np.ndarray]:
+    """Read a SCIZOR sidecar parquet and return per-episode score arrays.
+
+    The sidecar (output of
+    ``SCIZOR_Baseline/curation/video_encoding/score_lerobot.py``) has columns
+    ``episode_index, frame_index, scizor_score[, scizor_score_local,
+    scizor_score_traj_mean]``. We materialise ``{episode_index:
+    np.ndarray[length]}`` so that per-sample lookup is O(1) and memory is
+    proportional to the dataset (≈4 bytes / frame).
+
+    Cached at module level; loading is process-global and thread-safe.
+    """
+    import pyarrow.parquet as _pq  # local import: optional dep
+
+    resolved = str(pathlib.Path(sidecar_path).resolve())
+    stat = pathlib.Path(resolved).stat()
+    cache_key = (resolved, stat.st_mtime, stat.st_size, score_column)
+    with _SCIZOR_SIDECAR_LOCK:
+        cached = _SCIZOR_SIDECAR_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        table = _pq.read_table(
+            resolved, columns=["episode_index", "frame_index", score_column]
+        )
+        ep = table["episode_index"].to_numpy().astype(np.int64)
+        fr = table["frame_index"].to_numpy().astype(np.int64)
+        sc = table[score_column].to_numpy().astype(np.float32)
+
+        out: dict[int, np.ndarray] = {}
+        # Build per-episode dense arrays in one pass. Assumes each
+        # (episode_index, frame_index) appears at most once (true of the
+        # SCIZOR sidecar). Missing trailing frames (the classifier window
+        # cannot reach frames within goal_time*fps of the episode end) are
+        # padded with the last available score so anchor lookups near the
+        # end of an episode never KeyError.
+        order = np.lexsort((fr, ep))
+        ep_s, fr_s, sc_s = ep[order], fr[order], sc[order]
+        # Group bounds via diff on episode index.
+        boundaries = np.flatnonzero(np.diff(ep_s)) + 1
+        starts = np.concatenate([[0], boundaries])
+        stops = np.concatenate([boundaries, [len(ep_s)]])
+        for s, e in zip(starts, stops):
+            ep_id = int(ep_s[s])
+            length = int(fr_s[e - 1]) + 1
+            arr = np.empty(length, dtype=np.float32)
+            arr[fr_s[s:e]] = sc_s[s:e]
+            # Fill any gaps (rare but defend) with the last seen score.
+            # Simple forward-fill via cumulative-max-of-index trick:
+            missing = np.setdiff1d(np.arange(length), fr_s[s:e], assume_unique=True)
+            if len(missing) > 0:
+                # Forward-fill from previous valid index; if at the start,
+                # use the first valid score.
+                valid_mask = np.zeros(length, dtype=bool)
+                valid_mask[fr_s[s:e]] = True
+                last_valid = -1
+                first_valid_val = float(sc_s[s])
+                for i in range(length):
+                    if valid_mask[i]:
+                        last_valid = i
+                    else:
+                        arr[i] = arr[last_valid] if last_valid >= 0 else first_valid_val
+            out[ep_id] = arr
+        _SCIZOR_SIDECAR_CACHE[cache_key] = out
+        logging.info(
+            "[scizor_sidecar] loaded %s (%d episodes, %d frames) col=%s",
+            resolved, len(out), sum(len(v) for v in out.values()), score_column,
+        )
+        return out
+
+
+@dataclasses.dataclass(frozen=True)
+class LoadScizorSidecar(DataTransformFn):
+    """Inject SCIZOR per-frame suboptimality scores into each training sample.
+
+    Reads a sidecar parquet produced by SCIZOR's ``score_lerobot.py`` and
+    writes ``data[score_key]`` as a scalar float32 — the score at the
+    sample's *anchor frame* (the chunk's first frame). Designed to be
+    composed with ``ComputeRABCWeights(mode='scizor_anchor')``, which
+    consumes the same key.
+
+    The transform does NOT modify the underlying LeRobot dataset — scores
+    live in a separate parquet and are joined by (episode_index,
+    frame_index) at sample time. This makes head-to-head comparison of
+    different SCIZOR checkpoints a pure config swap.
+
+    Anchor-frame semantics match SCIZOR's reference octo pipeline
+    (``octo/octo/data/dataset.py:612``): the per-frame mask attached to
+    each chunk is read at the chunk's start frame `t`, not aggregated over
+    the action horizon. See the openpi RA-BC scizor docs for the full
+    methodology.
+    """
+
+    sidecar_path: str
+    score_key: str = "scizor_score"
+    score_column: str = "scizor_score"
+
+    def __call__(self, data: DataDict) -> DataDict:
+        ep_idx = int(np.asarray(data["episode_index"]).reshape(-1)[0])
+        frame_idx = int(np.asarray(data["frame_index"]).reshape(-1)[0])
+        scores_by_ep = _load_scizor_sidecar(self.sidecar_path, self.score_column)
+        ep_scores = scores_by_ep.get(ep_idx)
+        if ep_scores is None:
+            # Defensive: episode missing from sidecar → zero-weight sample.
+            # decide_weight will gate it out cleanly downstream.
+            data = {**data, self.score_key: np.float32(np.inf)}
+            return data
+        # Clamp frame_idx to last valid score (handles the trailing-window
+        # tail where the classifier could not produce a real score).
+        fi = min(frame_idx, len(ep_scores) - 1)
+        data = {**data, self.score_key: np.float32(ep_scores[fi])}
         return data
 
 

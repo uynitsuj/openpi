@@ -256,23 +256,42 @@ def _find_rabc_transform(data_config: _config.DataConfig) -> _transforms.Compute
     return None
 
 
+def _find_scizor_sidecar_transform(
+    data_config: _config.DataConfig,
+) -> _transforms.LoadScizorSidecar | None:
+    """Locate the LoadScizorSidecar instance in data_config (if any)."""
+    for t in data_config.data_transforms.inputs:
+        if isinstance(t, _transforms.LoadScizorSidecar):
+            return t
+    return None
+
+
 def _rabc_cache_key(
     repo_id: str,
     action_horizon: int,
     rabc: _transforms.ComputeRABCWeights,
     episodes: tuple[int, ...] | None,
     lookahead_frames: int = 0,
+    scizor_sidecar_path: str | None = None,
 ) -> str:
     """Stable hash for the precomputed valid_indices file. Includes everything
     that changes which samples pass the gate: dataset, horizon, RABC params,
-    the episode-filter tuple, and the lookahead frame count."""
-    payload = {
+    the episode-filter tuple, the lookahead frame count, and (for
+    mode='scizor_anchor') the sidecar parquet's path / mtime / size so
+    swapping SCIZOR checkpoints invalidates the cache correctly."""
+    payload: dict = {
         "repo_id": repo_id,
         "action_horizon": action_horizon,
         "rabc": dataclasses.asdict(rabc),
         "episodes": sorted(episodes) if episodes is not None else "all",
         "lookahead_frames": lookahead_frames,
     }
+    if scizor_sidecar_path:
+        resolved = str(pathlib.Path(scizor_sidecar_path).resolve())
+        stat = pathlib.Path(resolved).stat()
+        payload["scizor_sidecar"] = {
+            "path": resolved, "mtime": stat.st_mtime, "size": stat.st_size,
+        }
     blob = json.dumps(payload, sort_keys=True, default=str).encode()
     return hashlib.sha1(blob).hexdigest()[:16]
 
@@ -286,6 +305,8 @@ def precompute_valid_indices(
     lookahead_frames: int = 0,
     cache_dir: pathlib.Path | None = None,
     spot_check: bool = True,
+    scizor_sidecar_path: str | None = None,
+    scizor_score_column: str = "scizor_score",
 ) -> np.ndarray:
     """Walk the lerobot v3 parquets, apply the RABC gate offline, and return
     the flat (post-episode-filter) indices of samples whose weight > 0.
@@ -313,7 +334,9 @@ def precompute_valid_indices(
             else pathlib.Path.home() / ".cache" / "openpi" / "rabc_valid_indices"
         )
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / f"{_rabc_cache_key(repo_id, action_horizon, rabc, episodes, lookahead_frames)}.npy"
+    cache_path = cache_dir / (
+        f"{_rabc_cache_key(repo_id, action_horizon, rabc, episodes, lookahead_frames, scizor_sidecar_path)}.npy"
+    )
     logging.info(
         f"[rabc_precompute] {repo_id} H={action_horizon} mode={rabc.mode} "
         f"episodes={'all' if episodes is None else f'{len(episodes)} eps'} "
@@ -337,6 +360,63 @@ def precompute_valid_indices(
     ep_files = sorted((root / "meta" / "episodes").rglob("*.parquet"))
     ep_df = _pq.read_table(ep_files).to_pandas()
     ep_df = ep_df.sort_values("episode_index").reset_index(drop=True)
+
+    # ── SCIZOR sidecar branch ────────────────────────────────────────────
+    # Read suboptimality scores from an external parquet (NOT the lerobot
+    # dataset). Per-anchor-frame keep/drop matches the paper's filter
+    # exactly (no aggregation across action_horizon).
+    if rabc.mode == "scizor_anchor":
+        if not scizor_sidecar_path:
+            raise ValueError(
+                "precompute_valid_indices: rabc.mode='scizor_anchor' requires "
+                "scizor_sidecar_path to be set."
+            )
+        scores_by_ep = _transforms._load_scizor_sidecar(
+            scizor_sidecar_path, scizor_score_column,
+        )
+        if episodes is None:
+            ordered_eps = sorted(ep_df["episode_index"].astype(int).tolist())
+        else:
+            all_eps = set(ep_df["episode_index"].astype(int).tolist())
+            missing = [e for e in episodes if e not in all_eps]
+            if missing:
+                raise ValueError(f"episodes not in dataset metadata: {missing[:10]}")
+            ordered_eps = sorted(int(e) for e in episodes)
+        ep_lookup = {int(r["episode_index"]): r for _, r in ep_df.iterrows()}
+        filtered_indices: list[int] = []
+        decide = rabc.decide_weight
+        cursor = 0
+        for ep in ordered_eps:
+            meta = ep_lookup[int(ep)]
+            L = int(meta["length"])
+            ep_scores = scores_by_ep.get(int(ep))
+            if ep_scores is None:
+                # Episode missing from sidecar — drop the whole episode.
+                cursor += L
+                continue
+            for offset in range(L):
+                anchor_idx = min(offset, len(ep_scores) - 1)
+                w = decide(np.asarray([ep_scores[anchor_idx]], dtype=np.float32))
+                if w > 0.0:
+                    filtered_indices.append(cursor)
+                cursor += 1
+        valid = np.asarray(filtered_indices, dtype=np.int64)
+        n_filtered = cursor
+        keep_frac = (len(valid) / n_filtered) if n_filtered > 0 else 0.0
+        elapsed = time.time() - t0
+        logging.info(
+            f"[rabc_precompute][scizor] {repo_id} ε_s={rabc.threshold} "
+            f"mode={rabc.scizor_weight_mode}: {len(valid):,}/{n_filtered:,} "
+            f"kept ({keep_frac:.1%}) in {elapsed:.1f}s"
+        )
+        if spot_check and len(valid) > 0:
+            _spot_check_scizor_valid_indices(
+                repo_id, action_horizon, rabc, episodes, valid,
+                scizor_sidecar_path, scizor_score_column,
+            )
+        np.save(cache_path, valid)
+        logging.info(f"[rabc_precompute] cached → {cache_path}")
+        return valid
 
     # 2) Read data parquets. Only pull the columns we need (velocity, optional
     # quality, and the parquet 'index' column to verify global flat ordering).
@@ -440,6 +520,44 @@ def precompute_valid_indices(
     np.save(cache_path, valid)
     logging.info(f"[rabc_precompute] cached → {cache_path}")
     return valid
+
+
+def _spot_check_scizor_valid_indices(
+    repo_id: str,
+    action_horizon: int,
+    rabc: _transforms.ComputeRABCWeights,
+    episodes: tuple[int, ...] | None,
+    valid: np.ndarray,
+    scizor_sidecar_path: str,
+    scizor_score_column: str,
+    n_checks: int = 5,
+) -> None:
+    """Cross-validate the scizor precompute against a fresh LeRobot fetch +
+    sidecar lookup. Cheap: each check is a single video frame decode plus a
+    dict lookup."""
+    delta_ts_actions = [t / lerobot_dataset.LeRobotDatasetMetadata(repo_id).fps for t in range(action_horizon)]
+    ds = lerobot_dataset.LeRobotDataset(
+        repo_id,
+        delta_timestamps={"actions": delta_ts_actions},
+        tolerance_s=0.04,
+        episodes=list(episodes) if episodes is not None else None,
+    )
+    scores_by_ep = _transforms._load_scizor_sidecar(scizor_sidecar_path, scizor_score_column)
+    rng = np.random.default_rng(0)
+    sampled = rng.choice(valid, size=min(n_checks, len(valid)), replace=False)
+    for k in sampled:
+        s = ds[int(k)]
+        ep = int(np.asarray(s["episode_index"]).reshape(-1)[0])
+        fi = int(np.asarray(s["frame_index"]).reshape(-1)[0])
+        ep_scores = scores_by_ep[ep]
+        anchor_score = float(ep_scores[min(fi, len(ep_scores) - 1)])
+        w = rabc.decide_weight(np.asarray([anchor_score], dtype=np.float32))
+        if w <= 0.0:
+            raise AssertionError(
+                f"[rabc_precompute][scizor] spot-check failed at idx {int(k)}: "
+                f"ep={ep} frame={fi} score={anchor_score:.4f} ε_s={rabc.threshold} → w={w}"
+            )
+    logging.info(f"[rabc_precompute][scizor] spot-check OK on {len(sampled)} samples")
 
 
 def _spot_check_valid_indices(
@@ -653,12 +771,15 @@ def create_torch_data_loader(
     ):
         rabc = _find_rabc_transform(data_config)
         if rabc is not None and data_config.repo_id not in (None, "fake"):
+            scizor_xf = _find_scizor_sidecar_transform(data_config)
             valid_indices = precompute_valid_indices(
                 data_config.repo_id,
                 action_horizon=action_horizon,
                 rabc=rabc,
                 episodes=data_config.episodes,
                 lookahead_frames=getattr(data_config, "extra_horizon_lookahead_frames", 0),
+                scizor_sidecar_path=scizor_xf.sidecar_path if scizor_xf is not None else None,
+                scizor_score_column=scizor_xf.score_column if scizor_xf is not None else "scizor_score",
             )
             if len(valid_indices) == 0:
                 raise RuntimeError(

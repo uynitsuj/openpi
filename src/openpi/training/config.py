@@ -1114,6 +1114,112 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotScizorSidecarDataConfig(LeRobotYamRormDataConfig):
+    """Paper-faithful SCIZOR gating for RA-BC training.
+
+    Reads per-frame SCIZOR suboptimality scores from a sidecar parquet
+    (``scizor_predictions.parquet``, output of SCIZOR's ``score_lerobot.py``)
+    and gates each (obs_window, action_chunk) BC sample at its anchor frame
+    using the paper threshold ε_s. The underlying LeRobot dataset is NOT
+    modified — scores are joined at sample time via (episode_index,
+    frame_index).
+
+    See ``docs/scizor_sidecar_rabc.md`` for the methodology writeup.
+
+    Fields:
+      scizor_sidecar_path: path to ``scizor_predictions.parquet``.
+      scizor_eps_s:        keep iff score <= ε_s. Paper default 0.58 (App. A.1).
+      scizor_weight_mode:  "binary" (paper) or "continuous" (1 - score).
+      scizor_score_column: which sidecar column to read. Default
+                           ``scizor_score`` (paper-final: α-mixed with
+                           trajectory mean). ``scizor_score_local`` is the
+                           pre-mix per-frame score (for ablations).
+    """
+
+    scizor_sidecar_path: str = ""
+    scizor_eps_s: float = 0.58
+    scizor_weight_mode: str = "binary"
+    scizor_score_column: str = "scizor_score"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if not self.scizor_sidecar_path:
+            raise ValueError(
+                "LeRobotScizorSidecarDataConfig requires scizor_sidecar_path "
+                "to point at a scizor_predictions.parquet file."
+            )
+        # Build a minimal repack that carries episode_index/frame_index (needed
+        # by LoadScizorSidecar for its anchor lookup) and skips all RORM
+        # velocity/quality columns (we read nothing from the dataset parquets).
+        repack_keys = {
+            "left_camera-images-rgb": "left_camera-images-rgb",
+            "right_camera-images-rgb": "right_camera-images-rgb",
+            "top_camera-images-rgb": "top_camera-images-rgb",
+            "state": "state",
+            "actions": "actions",
+            "prompt": "prompt",
+            "episode_index": "episode_index",
+            "frame_index": "frame_index",
+        }
+        repack_transform = _transforms.Group(
+            inputs=[_transforms.RepackTransform(repack_keys)]
+        )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                _transforms.LoadScizorSidecar(
+                    sidecar_path=self.scizor_sidecar_path,
+                    score_column=self.scizor_score_column,
+                ),
+                _transforms.ComputeRABCWeights(
+                    mode="scizor_anchor",
+                    threshold=self.scizor_eps_s,
+                    scizor_weight_mode=self.scizor_weight_mode,
+                    clip_min=0.0,
+                    clip_max=1.0,
+                    action_horizon=getattr(model_config, "action_horizon", 0),
+                ),
+                yam_policy.YamInputs(action_dim=model_config.action_dim, model_type=model_config.model_type),
+            ],
+            outputs=[yam_policy.YamOutputs()],
+        )
+
+        # Episode split (val/train) handling — copied from the parent so we
+        # honor val_frac / val_seed / top_q_frac / top_shortest_frac the same
+        # way and so val episodes stay comparable across ablation conditions.
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+        episodes: tuple[int, ...] | None = None
+        val_episodes: tuple[int, ...] | None = None
+        info_path = HF_LEROBOT_HOME / self.repo_id / "meta" / "info.json" if self.repo_id is not None else None
+        if info_path is not None and info_path.exists():
+            val_eps, non_val_eps = _split_val_episodes(self.repo_id, self.val_frac, self.val_seed)
+            val_episodes = val_eps if val_eps else None
+            if self.top_q_frac is not None:
+                episodes = tuple(_top_q_episodes(self.repo_id, self.top_q_frac, exclude_eps=val_eps))
+            elif self.top_shortest_frac is not None:
+                episodes = tuple(_shortest_episodes(self.repo_id, self.top_shortest_frac, exclude_eps=val_eps))
+            elif non_val_eps:
+                episodes = non_val_eps
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            extra_horizon_keys=(),  # sidecar reads one scalar per sample, no horizon fetch
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            episodes=episodes,
+            val_episodes=val_episodes,
+            reject_zero_weighted_samples=self.rabc_reject_zero_weighted,
+            # Force subset mode — matches SCIZOR's dataset.filter(...) semantics
+            # (dropped samples contribute 0 FLOPs, no rejection-sampling retry).
+            reject_zero_weighted_mode="subset",
+            extra_horizon_lookahead_frames=0,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -1695,6 +1801,47 @@ _CONFIGS = [
             base_config=DataConfig(
                 prompt_from_task=True,
             ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    # SCIZOR sidecar gating — paper-faithful (anchor-frame, ε_s=0.58, binary
+    # weights). Reads scores from a separate parquet (no LeRobot mutation).
+    # See docs/scizor_sidecar_rabc.md for methodology.
+    TrainConfig(
+        name="pi0_yam_tshirt_scizor_sidecar_110612",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotScizorSidecarDataConfig(
+            repo_id="tshirt_folding_d405_v010_20260420_singlefold_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            scizor_sidecar_path="/home/karimelrafi/SCIZOR_Baseline/scizor_outputs/tshirt_singlefold_110612/scizor_predictions.parquet",
+            scizor_eps_s=0.58,
+            scizor_weight_mode="binary",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_yam_tshirt_scizor_sidecar_122320",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotScizorSidecarDataConfig(
+            repo_id="tshirt_folding_d405_v010_20260420_singlefold_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            scizor_sidecar_path="/home/karimelrafi/SCIZOR_Baseline/scizor_outputs/tshirt_singlefold_122320/scizor_predictions.parquet",
+            scizor_eps_s=0.58,
+            scizor_weight_mode="binary",
+            base_config=DataConfig(prompt_from_task=True),
         ),
         batch_size=32,
         num_workers=8,
@@ -3005,6 +3152,38 @@ _CONFIGS = [
             rabc_enabled=True,
         )
         for tag in ("full", "under90s", "under60s")
+    ],
+    # Per-task pi0 finetunes on the 5 sim datasets with RABC final-action
+    # gating (keep iff repromo_velocity[-1] > threshold). repromo_velocity /
+    # repromo_quality columns must be written into each LeRobot dataset
+    # offline by the corresponding best_model_*_no_abs.pt repromo checkpoint
+    # before training. HF_LEROBOT_HOME must point at /home/karimelrafi/datasets.
+    *[
+        TrainConfig(
+            name=f"pi0_sim_{short}_rabc_finalaction_thr100",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=repo_id,
+                default_prompt=prompt,
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=True,
+                rabc_threshold=1.00,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            num_train_steps=30_000,
+            save_interval=10_000,
+            keep_period=10_000,
+            rabc_enabled=True,
+        )
+        for short, repo_id, prompt in (
+            ("hang_mug",       "sim_hang_the_mug_on_the_mug_rack_gop10",       "Hang the mug on the mug rack"),
+            ("load_plates",    "sim_load_the_plates_into_the_dish_rack_gop10", "Load the plates into the dish rack"),
+            ("put_bottles",    "sim_put_the_plastic_bottles_in_the_bin_gop10", "Put the plastic bottles in the bin"),
+            ("sweep_paper",    "sim_sweep_away_paper_scraps_from_the_table",   "Sweep away paper scraps from the table"),
+            ("throw_bottles",  "sim_throw_plastic_bottles_in_bin_gop10",       "Throw the plastic bottles in the bin"),
+        )
     ],
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

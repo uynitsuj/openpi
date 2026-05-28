@@ -1851,6 +1851,50 @@ _CONFIGS = [
         keep_period=30_000,
         rabc_enabled=True,
     ),
+    # Combined SCIZOR filter (suboptimal + semantic dedup) on the centered
+    # d405 sarm datasets. Sidecar parquets have already had duplicate frames
+    # (paper ε_d=0.99 in cos-sim, code-side eps=0.01) marked with
+    # scizor_score=+inf, so the standard ε_s=0.58 threshold drops both
+    # suboptimal and duplicates in one pass. Originals preserved at
+    # scizor_outputs/suboptimal_preds/<dataset>/scizor_predictions.parquet.
+    TrainConfig(
+        name="pi0_yam_sarm_under60s_scizor_sidecar_combined",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotScizorSidecarDataConfig(
+            repo_id="sarm_dense_and_sparse_centered_with_d405_under60s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            scizor_sidecar_path="/home/karimelrafi/SCIZOR_Baseline/scizor_outputs/sarm_dense_and_sparse_centered_with_d405_under60s_gop10/scizor_predictions.parquet",
+            scizor_eps_s=0.58,
+            scizor_weight_mode="binary",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_yam_sarm_under90s_scizor_sidecar_combined",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotScizorSidecarDataConfig(
+            repo_id="sarm_dense_and_sparse_centered_with_d405_under90s_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            scizor_sidecar_path="/home/karimelrafi/SCIZOR_Baseline/scizor_outputs/sarm_dense_and_sparse_centered_with_d405_under90s_gop10/scizor_predictions.parquet",
+            scizor_eps_s=0.58,
+            scizor_weight_mode="binary",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
     TrainConfig(
         name="pi0_yam_tshirt_no_rabc_d405",
         model=pi0_config.Pi0Config(action_horizon=30),
@@ -3176,6 +3220,32 @@ _CONFIGS = [
             save_interval=10_000,
             keep_period=10_000,
             rabc_enabled=True,
+        )
+        for short, repo_id, prompt in (
+            ("hang_mug",       "sim_hang_the_mug_on_the_mug_rack_gop10",       "Hang the mug on the mug rack"),
+            ("load_plates",    "sim_load_the_plates_into_the_dish_rack_gop10", "Load the plates into the dish rack"),
+            ("put_bottles",    "sim_put_the_plastic_bottles_in_the_bin_gop10", "Put the plastic bottles in the bin"),
+            ("sweep_paper",    "sim_sweep_away_paper_scraps_from_the_table",   "Sweep away paper scraps from the table"),
+            ("throw_bottles",  "sim_throw_plastic_bottles_in_bin_gop10",       "Throw the plastic bottles in the bin"),
+        )
+    ],
+    # Per-task pi0 vanilla BC finetunes (no RABC) on the 5 sim datasets.
+    # HF_LEROBOT_HOME must point at /home/karimelrafi/datasets.
+    *[
+        TrainConfig(
+            name=f"pi0_sim_{short}_vanilla_bc",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamDataConfig(
+                repo_id=repo_id,
+                default_prompt=prompt,
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            num_train_steps=60_000,
+            save_interval=10_000,
+            keep_period=10_000,
         )
         for short, repo_id, prompt in (
             ("hang_mug",       "sim_hang_the_mug_on_the_mug_rack_gop10",       "Hang the mug on the mug rack"),

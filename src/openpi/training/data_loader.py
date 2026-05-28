@@ -287,11 +287,18 @@ def _rabc_cache_key(
         "lookahead_frames": lookahead_frames,
     }
     if scizor_sidecar_path:
-        resolved = str(pathlib.Path(scizor_sidecar_path).resolve())
-        stat = pathlib.Path(resolved).stat()
-        payload["scizor_sidecar"] = {
-            "path": resolved, "mtime": stat.st_mtime, "size": stat.st_size,
-        }
+        if scizor_sidecar_path.startswith("s3://"):
+            # Remote sidecar: key on the URL alone. Distinct SCIZOR runs write
+            # to distinct S3 paths, so the URL uniquely identifies the score
+            # set; we avoid downloading 356MB just to stat it (which would
+            # defeat the point of the precompute cache).
+            payload["scizor_sidecar"] = {"path": scizor_sidecar_path}
+        else:
+            resolved = str(pathlib.Path(scizor_sidecar_path).resolve())
+            stat = pathlib.Path(resolved).stat()
+            payload["scizor_sidecar"] = {
+                "path": resolved, "mtime": stat.st_mtime, "size": stat.st_size,
+            }
     blob = json.dumps(payload, sort_keys=True, default=str).encode()
     return hashlib.sha1(blob).hexdigest()[:16]
 

@@ -1838,7 +1838,7 @@ _CONFIGS = [
         data=LeRobotScizorSidecarDataConfig(
             repo_id="tshirt_folding_d405_v010_20260420_singlefold_gop10",
             default_prompt="Folding tshirt pile and stacking",
-            scizor_sidecar_path="/home/karimelrafi/SCIZOR_Baseline/scizor_outputs/tshirt_singlefold_110612/scizor_predictions.parquet",
+            scizor_sidecar_path="s3://xdof-internal-research/repromo/baselines/scizor/tshirt_singlefold_110612/scizor_predictions.parquet",
             scizor_eps_s=0.58,
             scizor_weight_mode="binary",
             base_config=DataConfig(prompt_from_task=True),
@@ -1857,7 +1857,7 @@ _CONFIGS = [
         data=LeRobotScizorSidecarDataConfig(
             repo_id="tshirt_folding_d405_v010_20260420_singlefold_gop10",
             default_prompt="Folding tshirt pile and stacking",
-            scizor_sidecar_path="/home/karimelrafi/SCIZOR_Baseline/scizor_outputs/tshirt_singlefold_122320/scizor_predictions.parquet",
+            scizor_sidecar_path="s3://xdof-internal-research/repromo/baselines/scizor/tshirt_singlefold_122320/scizor_predictions.parquet",
             scizor_eps_s=0.58,
             scizor_weight_mode="binary",
             base_config=DataConfig(prompt_from_task=True),

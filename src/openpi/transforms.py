@@ -470,6 +470,40 @@ _SCIZOR_SIDECAR_CACHE: dict[
 _SCIZOR_SIDECAR_LOCK = threading.Lock()
 
 
+def _fetch_remote_sidecar_file(url: str) -> str:
+    """Download a single remote (``s3://``) sidecar parquet to a local cache
+    and return the local path.
+
+    Single-object ``aws s3 cp`` (not a prefix sync) — correct for a lone
+    ``scizor_predictions.parquet``. Cached by URL hash; skips re-download if a
+    non-empty local copy already exists (sidecars are immutable once scored).
+    Atomic via a ``.partial`` rename so an interrupted download can't leave a
+    truncated file in the cache.
+    """
+    import fcntl
+    import hashlib
+    import subprocess
+
+    cache_dir = pathlib.Path.home() / ".cache" / "openpi_scizor_sidecars"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tag = hashlib.md5(url.encode()).hexdigest()[:12]
+    local = cache_dir / f"{tag}_{pathlib.Path(url).name}"
+    if local.exists() and local.stat().st_size > 0:
+        return str(local)
+    # Serialize concurrent downloads: if the precompute .npy cache is warm but
+    # this .parquet cache is cold, all N DataLoader workers would otherwise
+    # race on the same file. flock + double-check makes exactly one fetch.
+    lock_path = cache_dir / f"{tag}.lock"
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        if local.exists() and local.stat().st_size > 0:
+            return str(local)
+        tmp = local.with_suffix(local.suffix + ".partial")
+        subprocess.run(["aws", "s3", "cp", url, str(tmp)], check=True)
+        tmp.replace(local)
+    return str(local)
+
+
 def _load_scizor_sidecar(
     sidecar_path: str, score_column: str = "scizor_score"
 ) -> dict[int, np.ndarray]:
@@ -486,14 +520,17 @@ def _load_scizor_sidecar(
     """
     import pyarrow.parquet as _pq  # local import: optional dep
 
-    # Remote sidecars (s3://, gs://) are fetched once to a local cache. The
-    # subset precompute in data_loader.precompute_valid_indices reads the
-    # sidecar in the main process before the torch DataLoader spawns workers,
-    # so this download happens exactly once per run; maybe_download is a
-    # passthrough (no-op) for already-local paths.
-    if "://" in sidecar_path:
-        from openpi.shared import download as _download
-        sidecar_path = str(_download.maybe_download(sidecar_path))
+    # Remote sidecars (s3://) are fetched once to a local cache via a
+    # single-object `aws s3 cp`. NOTE: we deliberately do NOT use
+    # openpi.shared.download.maybe_download here — that helper `aws s3 sync`s a
+    # *prefix* (it's built for sharded checkpoint directories) and, given a
+    # lone scizor_predictions.parquet key, materialises a bogus directory that
+    # pyarrow then misreads. The subset precompute in
+    # data_loader.precompute_valid_indices reads the sidecar in the main
+    # process before the torch DataLoader spawns workers, so this fetch happens
+    # exactly once per run.
+    if sidecar_path.startswith("s3://"):
+        sidecar_path = _fetch_remote_sidecar_file(sidecar_path)
 
     resolved = str(pathlib.Path(sidecar_path).resolve())
     stat = pathlib.Path(resolved).stat()

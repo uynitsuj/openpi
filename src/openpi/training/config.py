@@ -3280,6 +3280,36 @@ _CONFIGS = [
             ("throw_bottles",  "sim_throw_plastic_bottles_in_bin_gop10",       "Throw the plastic bottles in the bin"),
         )
     ],
+    # Vanilla-BC counterparts to the 5 sim rabc_finalaction_thr100 configs above.
+    # rabc_enabled=False bypasses both the loss reweighting and the subset filter
+    # (data_loader.py forces reject_zero_weighted_samples=False), so every sample
+    # trains at weight=1.0. Same dataset / init / step budget / save schedule as
+    # the rabc variants — only the gate is removed, for a clean ablation.
+    *[
+        TrainConfig(
+            name=f"pi0_sim_{short}_no_rabc",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=repo_id,
+                default_prompt=prompt,
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            num_train_steps=30_000,
+            save_interval=10_000,
+            keep_period=10_000,
+            rabc_enabled=False,
+        )
+        for short, repo_id, prompt in (
+            ("hang_mug",       "sim_hang_the_mug_on_the_mug_rack_gop10",       "Hang the mug on the mug rack"),
+            ("load_plates",    "sim_load_the_plates_into_the_dish_rack_gop10", "Load the plates into the dish rack"),
+            ("put_bottles",    "sim_put_the_plastic_bottles_in_the_bin_gop10", "Put the plastic bottles in the bin"),
+            ("sweep_paper",    "sim_sweep_away_paper_scraps_from_the_table",   "Sweep away paper scraps from the table"),
+            ("throw_bottles",  "sim_throw_plastic_bottles_in_bin_gop10",       "Throw the plastic bottles in the bin"),
+        )
+    ],
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

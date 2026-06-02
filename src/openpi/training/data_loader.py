@@ -13,6 +13,11 @@ from typing import List, Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
+# Side-effect: patch lerobot's load_nested_dataset to sort parquet files
+# numerically. Must be imported BEFORE lerobot.datasets.lerobot_dataset so the
+# patch is in place when any LeRobotDataset / LeRobotDatasetMetadata is built.
+# See openpi.utils.lerobot_patches for the rationale.
+import openpi.utils.lerobot_patches  # noqa: F401
 import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch

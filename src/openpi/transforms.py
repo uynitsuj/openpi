@@ -431,7 +431,7 @@ class ComputeRABCWeights(DataTransformFn):
         # Repromo rename) or fall back to rorm_velocity (legacy, pre-rename).
         # Same for repromo_quality vs rorm_q on the quality side.
         vel_key = next(
-            (k for k in ("repromo_signed_magnitude", "rorm_velocity", "sarm_dense_signed_magnitude") if k in data),
+            (k for k in ("warp_rm_signed_magnitude", "repromo_signed_magnitude", "rorm_velocity", "sarm_dense_signed_magnitude") if k in data),
             None,
         )
         if vel_key is None:

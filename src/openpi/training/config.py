@@ -1000,7 +1000,7 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
             # among them via the same precedence). Adding all that exist
             # forces lerobot to query every one per-frame, which crashes if
             # any legacy column (e.g. rorm_velocity) has null rows.
-            for col in ("repromo_signed_magnitude", "rorm_velocity", "sarm_dense_signed_magnitude"):
+            for col in ("warp_rm_signed_magnitude", "repromo_signed_magnitude", "rorm_velocity", "sarm_dense_signed_magnitude"):
                 if col in schema_cols:
                     repack_keys[col] = col
                     break
@@ -1069,7 +1069,7 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
             progress_key = _pick(self.sarm_progress_key)
             extra_horizon_keys = (progress_key,) if progress_key else ()
         else:
-            vel_key_for_horizon = _pick("repromo_signed_magnitude", "rorm_velocity", "sarm_dense_signed_magnitude")
+            vel_key_for_horizon = _pick("warp_rm_signed_magnitude", "repromo_signed_magnitude", "rorm_velocity", "sarm_dense_signed_magnitude")
             q_key_for_horizon = _pick("repromo_quality", "rorm_q", "sarm_dense_quality") if use_q else None
             extra_horizon_keys = tuple(k for k in (vel_key_for_horizon, q_key_for_horizon) if k is not None)
 
@@ -1351,6 +1351,15 @@ class TrainConfig:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
+
+# WARP-BC / vanilla-BC task table for the 06_10 d405 deliveries + tshirt folding.
+# short-name -> (base repo_id, default prompt, pi0 init checkpoint).
+# box/bottles init from base pi0 pretrained; tshirt from the tshirt-folding pi0 base.
+_WARPBC_TASKS = {
+    "box":     ("fold_the_paper_box_d405_v021",                 "Fold the paper box",                 "gs://openpi-assets/checkpoints/pi0_base/params"),
+    "bottles": ("put_the_plastic_bottles_in_the_bin_d405_v021", "Put the plastic bottles in the bin", "gs://openpi-assets/checkpoints/pi0_base/params"),
+    "tshirt":  ("tshirt_folding_d405_v010_20260420_gop10",      "Folding tshirt pile and stacking",   "s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+}
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
@@ -3309,6 +3318,63 @@ _CONFIGS = [
             ("sweep_paper",    "sim_sweep_away_paper_scraps_from_the_table",   "Sweep away paper scraps from the table"),
             ("throw_bottles",  "sim_throw_plastic_bottles_in_bin_gop10",       "Throw the plastic bottles in the bin"),
         )
+    ],
+    # ── WARP-BC (reward-aligned BC) + vanilla BC: 06_10 d405 deliveries
+    #    (box, bottles) + tshirt folding. 9 WARP-BC (3 tasks × {sss15,sss30,sss45}
+    #    RM strides) + 3 vanilla BC = 12 runs.
+    #    WARP-BC recipe (mirrors pi0_*_rabc_finalaction_thr100_nomax):
+    #      τ=1.0, clip_max=inf (continuous reweight everything above τ),
+    #      finalaction (terminal v_end), velocity_only, shortest 50% split.
+    #      Reads the per-stride scored copy's `warp_rm_signed_magnitude` column.
+    #    Vanilla BC: same shortest-50% split, rabc disabled (base dataset; no
+    #      velocity column needed — ComputeRABCWeights no-ops when absent).
+    #    PREREQUISITE: the per-stride scored copies <repo>_sss{15,30,45} are
+    #    created by warprm2/scripts/score_and_inject_warpbc.py (RM dense-inference
+    #    → inject velocity column into a videos-symlinked copy). Vanilla BC reads
+    #    the base <repo> directly.
+    *[
+        TrainConfig(
+            name=f"pi0_{short}_warpbc_sss{n}",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=f"{repo}_sss{n}",
+                default_prompt=prompt,
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=True,
+                rabc_threshold=1.00,
+                rabc_clip_max=float("inf"),
+                top_shortest_frac=0.5,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader(base_ckpt),
+            num_train_steps=60_000,
+            save_interval=30_000,
+            keep_period=30_000,
+            rabc_enabled=True,
+        )
+        for short, (repo, prompt, base_ckpt) in _WARPBC_TASKS.items()
+        for n in (15, 30, 45)
+    ],
+    *[
+        TrainConfig(
+            name=f"pi0_{short}_bc",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=repo,
+                default_prompt=prompt,
+                base_config=DataConfig(prompt_from_task=True),
+                top_shortest_frac=0.5,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader(base_ckpt),
+            num_train_steps=60_000,
+            save_interval=30_000,
+            keep_period=30_000,
+            rabc_enabled=False,
+        )
+        for short, (repo, prompt, base_ckpt) in _WARPBC_TASKS.items()
     ],
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

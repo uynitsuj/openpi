@@ -434,7 +434,7 @@ def precompute_valid_indices(
     # quality, and the parquet 'index' column to verify global flat ordering).
     needed_cols = ["index", "episode_index", "frame_index"]
     vel_col = None
-    for c in ("repromo_signed_magnitude", "rorm_velocity"):
+    for c in ("warp_rm_signed_magnitude", "repromo_signed_magnitude", "rorm_velocity"):
         if c in _pq.read_schema(sorted((root / "data").rglob("*.parquet"))[0]).names:
             vel_col = c
             break

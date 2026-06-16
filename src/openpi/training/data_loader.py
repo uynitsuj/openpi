@@ -586,10 +586,17 @@ def _spot_check_valid_indices(
     sampled k. Cost: ~n_checks video decodes; pays for itself by catching
     flat-index mismatches before they silently corrupt training."""
     meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    # Use whichever velocity column the dataset actually carries (warp_rm
+    # preferred — fresh WARP-RM scoring — then the legacy repromo/rorm names).
+    vel_col = next(
+        (c for c in ("warp_rm_signed_magnitude", "repromo_signed_magnitude", "rorm_velocity")
+         if c in meta.features),
+        "repromo_signed_magnitude",
+    )
     H_total = action_horizon + lookahead_frames
     delta_ts_extra = [t / meta.fps for t in range(H_total)]
     delta_ts_actions = [t / meta.fps for t in range(action_horizon)]
-    extra = ["repromo_signed_magnitude"]
+    extra = [vel_col]
     if rabc.mode != "velocity_only" and rabc.q_min is not None:
         extra.append("repromo_quality")
     delta_timestamps = {k: delta_ts_extra for k in extra}
@@ -604,9 +611,7 @@ def _spot_check_valid_indices(
     sampled = rng.choice(valid, size=min(n_checks, len(valid)), replace=False)
     for k in sampled:
         s = ds[int(k)]
-        vel_t = s.get("repromo_signed_magnitude")
-        if vel_t is None:
-            vel_t = s.get("rorm_velocity")
+        vel_t = s.get(vel_col)
         vel = np.asarray(vel_t)
         q = None
         if rabc.mode != "velocity_only" and rabc.q_min is not None:

@@ -3356,6 +3356,41 @@ _CONFIGS = [
         for short, (repo, prompt, base_ckpt) in _WARPBC_TASKS.items()
         for n in (15, 30, 45)
     ],
+    # ── Multi-cam (3-camera concat RM) WARP-BC: IDENTICAL recipe to
+    #    pi0_{short}_warpbc_sss{n} above, EXCEPT the velocity column is produced
+    #    by the 3-camera (top + left/right wrist) concat reward model and scored
+    #    into the copy <repo>_mc3_sss{n}. Only name + repo_id differ — same
+    #    τ=1.0, clip_max=inf, finalaction, top_shortest_frac=0.5, action_horizon,
+    #    base init (incl tshirt's special pi0_yam_tshirt ckpt), steps — so the
+    #    single-cam-vs-multi-cam comparison is clean and the downstream
+    #    real-robot eval is the only differing signal (RM val was ~tied).
+    #    PREREQUISITE: <repo>_mc3_sss{n} produced by
+    #    warprm2/scripts/launch_mc3_scoring_sky.sh (concat-RM dense inference,
+    #    cache-hit over shortest-60%, inject warp_rm_signed_magnitude).
+    *[
+        TrainConfig(
+            name=f"pi0_{short}_warpbc_mc3_sss{n}",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=f"{repo}_mc3_sss{n}",
+                default_prompt=prompt,
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=True,
+                rabc_threshold=1.00,
+                rabc_clip_max=float("inf"),
+                top_shortest_frac=0.5,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader(base_ckpt),
+            num_train_steps=60_000,
+            save_interval=30_000,
+            keep_period=30_000,
+            rabc_enabled=True,
+        )
+        for short, (repo, prompt, base_ckpt) in _WARPBC_TASKS.items()
+        for n in (15, 30, 45)
+    ],
     *[
         TrainConfig(
             name=f"pi0_{short}_bc",

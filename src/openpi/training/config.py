@@ -3248,43 +3248,53 @@ _CONFIGS = [
         )
         for tag in ("full", "under90s", "under60s")
     ],
-    # Per-task pi0 finetunes on the 5 sim datasets with RABC final-action
-    # gating (keep iff repromo_velocity[-1] > threshold). repromo_velocity /
-    # repromo_quality columns must be written into each LeRobot dataset
-    # offline by the corresponding best_model_*_no_abs.pt repromo checkpoint
-    # before training. HF_LEROBOT_HOME must point at /home/karimelrafi/datasets.
+    # Per-task pi0 finetunes on the 6 sim datasets (30fps MuJoCo-rendered) with
+    # RABC final-action gating (keep iff repromo_velocity[-1] > threshold) and
+    # NO upper cap on the retained weight (clip_max=inf → "thr100_nomax").
+    # repromo_signed_magnitude (velocity) must be injected into each LeRobot
+    # dataset offline by that task's best_model_*_no_abs.pt repromo checkpoint
+    # (write_repromo_annotations.py --mode inject/both) before training — RABC
+    # reads the velocity from dataset columns, not the sidecar. The datasets
+    # must be registered under HF_LEROBOT_HOME with the repo_ids below. All six
+    # finetune from pi0_base (neutral init for sim, not the tshirt real-robot
+    # ckpt the other YAM/HLM configs inherit). action_horizon=30 (=1.0s @30fps)
+    # doubles as the RABC velocity-aggregation window.
     *[
         TrainConfig(
-            name=f"pi0_sim_{short}_rabc_finalaction_thr100",
+            name=f"pi0_sim_{short}_rabc_finalaction_thr100_nomax",
             model=pi0_config.Pi0Config(action_horizon=30),
             data=LeRobotYamRormDataConfig(
                 repo_id=repo_id,
                 default_prompt=prompt,
                 base_config=DataConfig(prompt_from_task=True),
+                rabc_mode="velocity_only",
                 rabc_use_final_action_condition=True,
                 rabc_threshold=1.00,
+                rabc_clip_max=float("inf"),
             ),
             batch_size=32,
             num_workers=8,
             weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-            num_train_steps=30_000,
-            save_interval=10_000,
-            keep_period=10_000,
+            num_train_steps=60_000,
+            save_interval=30_000,
+            keep_period=30_000,
             rabc_enabled=True,
         )
         for short, repo_id, prompt in (
-            ("hang_mug",       "sim_hang_the_mug_on_the_mug_rack_gop10",       "Hang the mug on the mug rack"),
-            ("load_plates",    "sim_load_the_plates_into_the_dish_rack_gop10", "Load the plates into the dish rack"),
-            ("put_bottles",    "sim_put_the_plastic_bottles_in_the_bin_gop10", "Put the plastic bottles in the bin"),
-            ("sweep_paper",    "sim_sweep_away_paper_scraps_from_the_table",   "Sweep away paper scraps from the table"),
-            ("throw_bottles",  "sim_throw_plastic_bottles_in_bin_gop10",       "Throw the plastic bottles in the bin"),
+            ("hang_mug",       "sim_hang_the_mug_on_the_mug_rack_30hz_gop10",          "Hang the mug on the mug rack"),
+            ("load_plates",    "sim_load_the_plates_into_the_dish_rack_30hz_gop10",    "Load the plates into the dish rack"),
+            ("put_bottles",    "sim_put_the_plastic_bottles_in_the_bin_30hz_gop10",    "Put the plastic bottles in the bin"),
+            ("sweep_paper",    "sim_sweep_away_paper_scraps_from_the_table_30hz_gop10", "Sweep away paper scraps from the table"),
+            ("throw_bottles",  "sim_throw_plastic_bottles_in_bin_30hz_gop10",          "Throw the plastic bottles in the bin"),
+            ("turn_mug",       "sim_turn_the_mug_right_side_up_30hz_gop10",            "Turn the mug right side up"),
         )
     ],
-    # Vanilla-BC counterparts to the 5 sim rabc_finalaction_thr100 configs above.
-    # rabc_enabled=False bypasses both the loss reweighting and the subset filter
-    # (data_loader.py forces reject_zero_weighted_samples=False), so every sample
-    # trains at weight=1.0. Same dataset / init / step budget / save schedule as
-    # the rabc variants — only the gate is removed, for a clean ablation.
+    # Vanilla-BC counterparts to the 6 sim rabc_finalaction_thr100_nomax configs
+    # above. rabc_enabled=False bypasses both the loss reweighting and the subset
+    # filter (data_loader.py forces reject_zero_weighted_samples=False), so every
+    # sample trains at weight=1.0. Same dataset / init / step budget / save
+    # schedule as the rabc variants — only the gate is removed, for a clean
+    # ablation. (These need only the dataset registered, not the velocity column.)
     *[
         TrainConfig(
             name=f"pi0_sim_{short}_no_rabc",
@@ -3297,17 +3307,18 @@ _CONFIGS = [
             batch_size=32,
             num_workers=8,
             weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-            num_train_steps=30_000,
-            save_interval=10_000,
-            keep_period=10_000,
+            num_train_steps=60_000,
+            save_interval=30_000,
+            keep_period=30_000,
             rabc_enabled=False,
         )
         for short, repo_id, prompt in (
-            ("hang_mug",       "sim_hang_the_mug_on_the_mug_rack_gop10",       "Hang the mug on the mug rack"),
-            ("load_plates",    "sim_load_the_plates_into_the_dish_rack_gop10", "Load the plates into the dish rack"),
-            ("put_bottles",    "sim_put_the_plastic_bottles_in_the_bin_gop10", "Put the plastic bottles in the bin"),
-            ("sweep_paper",    "sim_sweep_away_paper_scraps_from_the_table",   "Sweep away paper scraps from the table"),
-            ("throw_bottles",  "sim_throw_plastic_bottles_in_bin_gop10",       "Throw the plastic bottles in the bin"),
+            ("hang_mug",       "sim_hang_the_mug_on_the_mug_rack_30hz_gop10",          "Hang the mug on the mug rack"),
+            ("load_plates",    "sim_load_the_plates_into_the_dish_rack_30hz_gop10",    "Load the plates into the dish rack"),
+            ("put_bottles",    "sim_put_the_plastic_bottles_in_the_bin_30hz_gop10",    "Put the plastic bottles in the bin"),
+            ("sweep_paper",    "sim_sweep_away_paper_scraps_from_the_table_30hz_gop10", "Sweep away paper scraps from the table"),
+            ("throw_bottles",  "sim_throw_plastic_bottles_in_bin_30hz_gop10",          "Throw the plastic bottles in the bin"),
+            ("turn_mug",       "sim_turn_the_mug_right_side_up_30hz_gop10",            "Turn the mug right side up"),
         )
     ],
     # RoboArena & PolaRiS configs.

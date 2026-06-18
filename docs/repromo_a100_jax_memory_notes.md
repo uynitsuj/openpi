@@ -114,9 +114,36 @@ GPU 5: 61437 MiB / 81920 MiB
 
 This is consistent with default JAX/XLA GPU memory preallocation. The batch-size-32 failure appears to happen because the train step needs an additional large temporary allocation inside/around this memory pool.
 
-## Current Workaround
+## Root Cause (Resolved)
 
-The batch-size-16 relaunch was started with:
+The `61437 MiB` reservation is not arbitrary: `0.75 * 81920 = 61440`, i.e. JAX's
+**default** `XLA_PYTHON_CLIENT_MEM_FRACTION = 0.75`. With preallocation on (also
+default), JAX carves out a ~61 GiB BFC pool and will not grow past it, leaving
+the remaining ~20 GiB of the 80 GB card unused. At batch size 32 the first train
+step needs another ~17.9 GiB on top of params + optimizer + activations, which
+the capped pool cannot satisfy -> `RESOURCE_EXHAUSTED`, even though `nvidia-smi`
+shows the card only ~75% full.
+
+This is **not** a hardware difference between the two A100-80GB clusters, and
+**not** an FSDP difference (configs default `fsdp_devices=1`, and the launcher
+pins one GPU per process, so nothing is sharded either way). It is purely the
+launch path:
+
+- The working cluster launches via SkyPilot. `sky_utils.generate_sky_config`
+  defaults `xla_mem_fraction=0.95` and exports it before `train.py`, giving a
+  ~78 GiB pool that fits batch size 32.
+- This machine launched via `scripts/launch_repromo_rabc_runs.sh`, which did not
+  set `XLA_PYTHON_CLIENT_MEM_FRACTION` at all, so JAX fell back to 0.75.
+
+**Fix applied:** `scripts/launch_repromo_rabc_runs.sh` now exports
+`XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.95}"`,
+matching the SkyPilot path. Batch size 32 no longer needs the manual env prefix.
+An explicit env override is still respected if you need to lower the fraction
+when co-scheduling other processes on a card.
+
+## Historical Workaround (superseded by the fix above)
+
+Before the root cause was understood, the relaunch dropped to batch size 16:
 
 ```bash
 CHECKPOINT_BASE_DIR=/mnt/data/openpi_checkpoints \
@@ -127,24 +154,16 @@ scripts/launch_repromo_rabc_runs.sh \
   --keep-period 60000
 ```
 
-At the time of these notes, those six batch-size-16 processes were alive and mapped across physical GPUs 0-5.
+Those six batch-size-16 processes were alive and mapped across physical GPUs
+0-5. Lowering the batch size is no longer necessary now that the launcher sets
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`.
 
-## Hypothesis For Difference From Other A100 Machine
+## Batch-Size-32 Launch
 
-If batch size 32 works on another A100-80GB machine, likely differences to compare:
-
-- `XLA_PYTHON_CLIENT_MEM_FRACTION`
-- `XLA_PYTHON_CLIENT_PREALLOCATE`
-- `XLA_PYTHON_CLIENT_ALLOCATOR`
-- `XLA_FLAGS`
-- `jax` / `jaxlib` versions
-- NVIDIA driver and CUDA runtime reported by `nvidia-smi`
-- Whether the other launch uses one process per GPU or one distributed run split across multiple GPUs
-
-A plausible batch-size-32 retry on this machine would be:
+With the fix in place, the default batch size 32 runs directly (no env prefix
+needed):
 
 ```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
 CHECKPOINT_BASE_DIR=/mnt/data/openpi_checkpoints \
 scripts/launch_repromo_rabc_runs.sh \
   --overwrite \
@@ -152,7 +171,8 @@ scripts/launch_repromo_rabc_runs.sh \
   --keep-period 60000
 ```
 
-This should be tested carefully because it leaves less unreserved memory for other GPU users/processes.
+The launcher uses `0.95` of each card. Lower it via an explicit env override if
+other processes share a GPU; here each run gets a dedicated GPU, so it is safe.
 
 ## Comparison Commands For Other Machine
 

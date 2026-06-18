@@ -15,6 +15,12 @@ TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs/repromo_rabc_${TIMESTAMP}}"
 DRY_RUN=0
 
+# Match the SkyPilot launch path (sky_utils.generate_sky_config defaults to 0.95).
+# JAX's default is 0.75, which caps the BFC pool at ~61 GiB on an 80 GB A100 and
+# OOMs batch_size=32 runs even though the card has spare memory. Each run gets a
+# dedicated GPU here, so a high fraction is safe.
+export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.95}"
+
 RUNS=(
   "hang_mug|pi0_sim_hang_mug_rabc_finalaction_thr100_nomax|sim_hang_the_mug_on_the_mug_rack_30hz_gop10"
   "load_plates|pi0_sim_load_plates_rabc_finalaction_thr100_nomax|sim_load_the_plates_into_the_dish_rack_30hz_gop10"

@@ -221,12 +221,12 @@ NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
     ),
     "pi0_merged_d405short25rm_bs1024_rabc_20260501": Checkpoint(
         config="pi0_merged_rabc",
-        dir="/home/hyrl/checkpoints/pi0_merged_rabc/pi0_merged_d405short25rm_bs1024_rabc_20260501/59999",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged_rabc/pi0_merged_d405short25rm_bs1024_rabc_20260501/59999",
         default_prompt="Folding tshirt pile and stacking",
     ),
     "pi0_merged90_d405short25rm_bs1024_rabc_20260505": Checkpoint(
         config="pi0_merged90_rabc",
-        dir="/home/hyrl/checkpoints/pi0_merged90_rabc/pi0_merged90_d405short25rm_bs1024_rabc_20260505/59999",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged90_rabc/pi0_merged90_d405short25rm_bs1024_rabc_20260505/59999",
         default_prompt="Folding tshirt pile and stacking",
     ),
     "pi0_merged90_d405short25rm_bs1024_rabcminwin_20260505": Checkpoint(
@@ -304,7 +304,7 @@ NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
         dir="s3://xdof-internal-research/model_ckpts/pi0_merged60_rabc_finalaction_thr100_nomax/pi0_merged60_rabc_finalaction_thr100_nomax_fs2sss45rm_strict_subset_20260510/59999",
         default_prompt="Folding tshirt pile and stacking",
     ),
-    "pi0_merged60_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511": Checkpoint(
+    "pi0_merged60_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511": Checkpoint( # Should be the goated one
         config="pi0_merged60_rabc_finalaction_thr100_nomax",
         dir="s3://xdof-internal-research/model_ckpts/pi0_merged60_rabc_finalaction_thr100_nomax/pi0_merged60_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511/59999",
         default_prompt="Folding tshirt pile and stacking",
@@ -382,57 +382,72 @@ def download_s3_checkpoint(s3_path: str) -> Checkpoint:
     return Checkpoint(config=config_name, dir=str(local_dir))
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
-    """Create a default policy for the given environment."""
-    if checkpoint := DEFAULT_CHECKPOINT.get(env):
-        return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
-        )
-    raise ValueError(f"Unsupported environment mode: {env}")
+def _resolve_checkpoint(args: Args) -> tuple[Checkpoint | None, str | None]:
+    """Resolve args to the (Checkpoint, short_name) actually being served.
 
-
-def create_policy(args: Args) -> _policy.Policy:
-    """Create a policy from the given arguments."""
+    ``short_name`` is the NAMED_CHECKPOINTS key when one was selected (the most
+    human-meaningful identifier), else None. Returns (None, None) only for an
+    unsupported Default env. Mirrors the load branching in ``create_policy`` so
+    the served policy and its reported name can never disagree.
+    """
     if args.s3 is not None:
-        ckpt = download_s3_checkpoint(args.s3)
-        return _policy_config.create_trained_policy(
-            _config.get_config(ckpt.config),
-            ckpt.dir,
-            default_prompt=args.default_prompt or ckpt.default_prompt,
-        )
+        return download_s3_checkpoint(args.s3), None
     if args.name is not None:
-        ckpt = NAMED_CHECKPOINTS[args.name]
-        return _policy_config.create_trained_policy(
-            _config.get_config(ckpt.config),
-            ckpt.dir,
-            default_prompt=args.default_prompt or ckpt.default_prompt,
-        )
+        return NAMED_CHECKPOINTS[args.name], args.name
     match args.policy:
         case Checkpoint():
-            return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config),
-                args.policy.dir,
-                default_prompt=args.default_prompt or args.policy.default_prompt,
-            )
+            return args.policy, None
         case NamedCheckpoint():
             if args.policy.name not in NAMED_CHECKPOINTS:
                 raise ValueError(
                     f"Unknown named checkpoint: {args.policy.name!r}. "
                     f"Available: {sorted(NAMED_CHECKPOINTS)}"
                 )
-            ckpt = NAMED_CHECKPOINTS[args.policy.name]
-            return _policy_config.create_trained_policy(
-                _config.get_config(ckpt.config),
-                ckpt.dir,
-                default_prompt=args.default_prompt or ckpt.default_prompt,
-            )
+            return NAMED_CHECKPOINTS[args.policy.name], args.policy.name
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return DEFAULT_CHECKPOINT.get(args.env), None
+    return None, None
+
+
+def _policy_name_from_checkpoint(ckpt: Checkpoint, short_name: str | None) -> str:
+    """A stable, filesystem-friendly identifier for the served checkpoint.
+
+    Named checkpoints report their short key (e.g. ``yam_rabc_30k``). Raw
+    checkpoints report ``<config>/<run_name>/<step>`` derived from the
+    checkpoint dir, which is unique per training run + step. Consumed by the
+    client to expand ``save_root: recordings/{policy_name}``.
+    """
+    if short_name:
+        return short_name
+    d = pathlib.Path(ckpt.dir)
+    step = d.name  # e.g. "30000"
+    run_name = d.parent.name  # e.g. "sky_pi0_yam_..._20260415_174132"
+    parts = [p for p in (ckpt.config, run_name, step) if p]
+    return "/".join(parts)
+
+
+def create_policy(args: Args) -> tuple[_policy.Policy, str | None]:
+    """Create a policy from the given arguments, plus a name identifying it."""
+    ckpt, short_name = _resolve_checkpoint(args)
+    if ckpt is None:
+        raise ValueError(f"Unsupported environment mode: {args.env}")
+    policy = _policy_config.create_trained_policy(
+        _config.get_config(ckpt.config),
+        ckpt.dir,
+        default_prompt=args.default_prompt or ckpt.default_prompt,
+    )
+    return policy, _policy_name_from_checkpoint(ckpt, short_name)
 
 
 def main(args: Args) -> None:
-    policy = create_policy(args)
-    policy_metadata = policy.metadata
+    policy, policy_name = create_policy(args)
+    # Ship the checkpoint identity to the client so it can expand
+    # save_root: recordings/{policy_name}. Copy so we don't mutate the policy's
+    # own metadata dict, and don't clobber a policy_name a config baked in.
+    policy_metadata = dict(policy.metadata)
+    if policy_name and not policy_metadata.get("policy_name"):
+        policy_metadata["policy_name"] = policy_name
+    logging.info("Serving policy_name=%r", policy_metadata.get("policy_name"))
 
     # Record the policy's behavior.
     if args.record:

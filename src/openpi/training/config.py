@@ -3319,6 +3319,84 @@ _CONFIGS = [
             ("throw_bottles",  "sim_throw_plastic_bottles_in_bin_gop10",       "Throw the plastic bottles in the bin"),
         )
     ],
+    # ── Vanilla BC (no_rabc) for the canonical 30hz sim datasets
+    #    (s3://xdof-internal-research/repromo/datasets/sim_<task>_30hz_gop10).
+    #    Counterparts to the sim RABC runs (same pi0_base init / 30k steps /
+    #    save schedule; only the reward gate removed). DISTINCT from the
+    #    pi0_sim_<task>_no_rabc configs above, which point at the STALE 15hz
+    #    `_gop10` datasets — these use the 30hz canonical data so they're a
+    #    clean ablation against the 30hz RABC runs.
+    *[
+        TrainConfig(
+            name=f"pi0_sim_{short}_no_rabc_30hz",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=repo_id,
+                default_prompt=prompt,
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            # Extended 30k -> 60k (resumed from the 29999 ckpts). decay_steps must
+            # match the 60k horizon (default CosineDecaySchedule decay_steps=30k is
+            # fixed, not tied to num_train_steps) so the cosine spans the full run
+            # rather than sitting at the 2.5e-6 floor for steps 30k-60k. Resuming the
+            # 30k-decayed ckpts gives a warm-restart LR bump at step 30k (intended).
+            lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
+            num_train_steps=60_000,
+            save_interval=10_000,
+            keep_period=10_000,
+            rabc_enabled=False,
+        )
+        for short, repo_id, prompt in (
+            ("load_plates",   "sim_load_the_plates_into_the_dish_rack_30hz_gop10",    "Load the plates into the dish rack"),
+            ("put_bottles",   "sim_put_the_plastic_bottles_in_the_bin_30hz_gop10",    "Put the plastic bottles in the bin"),
+            ("throw_bottles", "sim_throw_plastic_bottles_in_bin_30hz_gop10",          "Throw the plastic bottles in the bin"),
+            ("turn_mug",      "sim_turn_the_mug_right_side_up_30hz_gop10",            "Turn the mug right side up"),
+            ("sweep_paper",   "sim_sweep_away_paper_scraps_from_the_table_30hz_gop10","Sweep away paper scraps from the table"),
+        )
+    ],
+    # ── Per-task RABC trains on the canonical 30hz sim datasets, gating on the
+    #    inline `repromo_signed_magnitude` column injected by the new sss45
+    #    WARP-RM checkpoints (collaborator-uploaded 2026-06-25 to
+    #    s3://xdof-internal-research/repromo/datasets/mjgl_sim_30hz/<slug>/ and
+    #    promoted to s3://xdof-internal-research/lerobot/<slug>/).
+    #    Recipe: final-action gate at thr=1.0 (keep iff vel[-1] > 1.0), default
+    #    rabc_clip_max=1.0 → binary keep semantics (matches the original
+    #    pi0_sim_*_rabc_finalaction_thr100 runs, not the box/bottles/tshirt
+    #    `warpbc_sss{n}` continuous-reweight variant). top_shortest_frac unset.
+    #    Step budget 60k + cosine decay_steps=60k mirrors pi0_sim_*_no_rabc_30hz
+    #    so the RABC-vs-vanilla-BC comparison is apples-to-apples.
+    *[
+        TrainConfig(
+            name=f"pi0_sim_{short}_rabc_30hz",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=repo_id,
+                default_prompt=prompt,
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=True,
+                rabc_threshold=1.00,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
+            num_train_steps=60_000,
+            save_interval=10_000,
+            keep_period=10_000,
+            rabc_enabled=True,
+        )
+        for short, repo_id, prompt in (
+            ("hang_mug",      "sim_hang_the_mug_on_the_mug_rack_30hz_gop10",          "Hang the mug on the mug rack"),
+            ("load_plates",   "sim_load_the_plates_into_the_dish_rack_30hz_gop10",    "Load the plates into the dish rack"),
+            ("put_bottles",   "sim_put_the_plastic_bottles_in_the_bin_30hz_gop10",    "Put the plastic bottles in the bin"),
+            ("sweep_paper",   "sim_sweep_away_paper_scraps_from_the_table_30hz_gop10","Sweep away paper scraps from the table"),
+            ("throw_bottles", "sim_throw_plastic_bottles_in_bin_30hz_gop10",          "Throw the plastic bottles in the bin"),
+            ("turn_mug",      "sim_turn_the_mug_right_side_up_30hz_gop10",            "Turn the mug right side up"),
+        )
+    ],
     # ── WARP-BC (reward-aligned BC) + vanilla BC: 06_10 d405 deliveries
     #    (box, bottles) + tshirt folding. 9 WARP-BC (3 tasks × {sss15,sss30,sss45}
     #    RM strides) + 3 vanilla BC = 12 runs.

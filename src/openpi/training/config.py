@@ -3397,6 +3397,111 @@ _CONFIGS = [
             ("turn_mug",      "sim_turn_the_mug_right_side_up_30hz_gop10",            "Turn the mug right side up"),
         )
     ],
+    # ── put_bottles MJWARP RABC matrix (mirrors the DiT-XL mjwarp Table-A arms:
+    #    perobj RM, overall RM, + no_rabc baseline). Trains on the mjwarp
+    #    re-rendered 30hz dataset (2438 eps, 14-dim state/actions) with the
+    #    per-frame `warp_rm_signed_magnitude` column injected from the DiT
+    #    velocity_rm_{perobj,overall}.bin sidecars (an exact copy of the RM's
+    #    per-frame signal — verified bit-for-bit against abc/score_to_sidecar).
+    #    Two videos-on-S3 dataset copies:
+    #      sim_put_bottles_mjwarp_rmperobj  <- velocity_rm_perobj.bin
+    #      sim_put_bottles_mjwarp_rmoverall <- velocity_rm_overall.bin
+    #    Recipe = pi0_sim_put_bottles_rabc_30hz (final-action gate thr=1.0,
+    #    default clip_max=1.0 binary-keep, ah=30, pi0_base init, 60k cosine,
+    #    bs=32). Baseline reuses the perobj copy with rabc_enabled=False (the
+    #    reward column is ignored when RABC is off — RM-agnostic vanilla BC).
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_rabc_perobj",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
+        num_train_steps=60_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_rabc_overall",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmoverall",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
+        num_train_steps=60_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_no_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
+        num_train_steps=60_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=False,
+    ),
+    # ── NOMAX siblings of pi0_sim_<task>_rabc_30hz. Identical recipe except
+    #    rabc_clip_max=inf — chunks above thr=1.0 keep their raw vel[-1]
+    #    weight magnitude rather than saturating at 1.0. clip_min left at
+    #    default 0.0 (dead under threshold-gating; see transforms.py:332,
+    #    `np.clip(final_vel, None, self.clip_max)` ignores clip_min).
+    *[
+        TrainConfig(
+            name=f"pi0_sim_{short}_rabc_30hz_nomax",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=repo_id,
+                default_prompt=prompt,
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=True,
+                rabc_threshold=1.00,
+                rabc_clip_max=float("inf"),
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
+            num_train_steps=60_000,
+            save_interval=10_000,
+            keep_period=10_000,
+            rabc_enabled=True,
+        )
+        for short, repo_id, prompt in (
+            ("hang_mug",      "sim_hang_the_mug_on_the_mug_rack_30hz_gop10",          "Hang the mug on the mug rack"),
+            ("load_plates",   "sim_load_the_plates_into_the_dish_rack_30hz_gop10",    "Load the plates into the dish rack"),
+            ("put_bottles",   "sim_put_the_plastic_bottles_in_the_bin_30hz_gop10",    "Put the plastic bottles in the bin"),
+            ("sweep_paper",   "sim_sweep_away_paper_scraps_from_the_table_30hz_gop10","Sweep away paper scraps from the table"),
+            ("throw_bottles", "sim_throw_plastic_bottles_in_bin_30hz_gop10",          "Throw the plastic bottles in the bin"),
+            ("turn_mug",      "sim_turn_the_mug_right_side_up_30hz_gop10",            "Turn the mug right side up"),
+        )
+    ],
     # ── WARP-BC (reward-aligned BC) + vanilla BC: 06_10 d405 deliveries
     #    (box, bottles) + tshirt folding. 9 WARP-BC (3 tasks × {sss15,sss30,sss45}
     #    RM strides) + 3 vanilla BC = 12 runs.

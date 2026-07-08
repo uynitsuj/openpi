@@ -281,6 +281,7 @@ def generate_sky_config(
     s3_checkpoint_base: str,
     wandb_api_key: Optional[str] = None,
     provider_regions: Optional[dict[str, str]] = None,
+    aws_regions: Optional[List[str]] = None,
     aws_image_ids: Optional[dict[str, str]] = None,
     idle_minutes: int = 10,
     xla_mem_fraction: float = 0.95,
@@ -303,6 +304,11 @@ def generate_sky_config(
         provider_regions: Optional map pinning providers to a region,
             e.g. {"aws": "us-west-2"}. Unpinned providers let SkyPilot
             choose the cheapest available region.
+        aws_regions: Optional list of AWS regions to fail over across,
+            e.g. ["us-west-2", "us-east-1"]. When set, overrides the single
+            ``provider_regions["aws"]`` pin and emits one candidate per
+            (region, accelerator) using the region's AMI from aws_image_ids.
+            Regions without an AMI in aws_image_ids are skipped.
         aws_image_ids: Map of AWS region to AMI ID for the Deep Learning AMI.
         managed: If True, config is for ``sky jobs launch`` (auto-teardown).
     """
@@ -314,28 +320,41 @@ def generate_sky_config(
     if wandb_api_key:
         secrets['WANDB_API_KEY'] = wandb_api_key
 
-    # Build one resource candidate per (provider, accelerator) pair.
+    # Build one resource candidate per (provider, region, accelerator) tuple.
     # Within any_of entries, accelerators must be a single string.
     # SkyPilot picks the cheapest available and auto-fails-over.
     candidates = []
     for provider in providers:
-        region = provider_regions.get(provider)
-        infra = f"{provider}/{region}" if region else provider
+        # Determine the region(s) to try for this provider. aws_regions, when
+        # set, expands aws across multiple regions; otherwise fall back to the
+        # single provider_regions pin (which may be None = any region).
+        if provider == 'aws' and aws_regions:
+            regions = list(aws_regions)
+        else:
+            regions = [provider_regions.get(provider)]
 
-        for accel in accelerators:
-            entry = {
-                'infra': infra,
-                'accelerators': accel,
-                'disk_size': disk_size,
-            }
+        for region in regions:
+            infra = f"{provider}/{region}" if region else provider
 
-            if provider == 'aws' and aws_image_ids:
-                if region and region in aws_image_ids:
-                    entry['image_id'] = aws_image_ids[region]
-                elif not region:
-                    entry['image_id'] = aws_image_ids
+            for accel in accelerators:
+                entry = {
+                    'infra': infra,
+                    'accelerators': accel,
+                    'disk_size': disk_size,
+                }
 
-            candidates.append(entry)
+                if provider == 'aws' and aws_image_ids:
+                    if region and region in aws_image_ids:
+                        entry['image_id'] = aws_image_ids[region]
+                    elif region and region not in aws_image_ids:
+                        # No AMI for this region — skip it rather than launch
+                        # with an arbitrary default image.
+                        print(f"[WARN] No AMI in aws_image_ids for region {region}; skipping.")
+                        continue
+                    elif not region:
+                        entry['image_id'] = aws_image_ids
+
+                candidates.append(entry)
 
     if len(candidates) == 1:
         resources = candidates[0]

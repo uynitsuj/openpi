@@ -44,6 +44,7 @@ class SkyPilotTrainingConfig:
         "aws": "us-west-2",
         #"aws": "us-east-1"
     })  # Pin specific providers to a region; unpinned providers failover across all regions
+    aws_regions: Optional[List[str]] = None  # Fail over across these AWS regions (e.g. us-west-2 us-east-1); overrides the provider_regions['aws'] pin. Note: regions other than the dataset's S3 region incur cross-region transfer.
     aws_image_ids: dict[str, str] = field(default_factory=lambda: {
         "us-west-2": "ami-067cc81f948e50e06",
         "us-east-1": "ami-0365bff494b18bf93",
@@ -154,7 +155,10 @@ def main(cfg: SkyPilotTrainingConfig):
     # handles failover natively — no need for manual race logic.
     print(f"[INFO] Generating SkyPilot config with auto-failover...")
     for provider in cfg.service_provider:
-        region = cfg.provider_regions.get(provider, "any")
+        if provider == "aws" and cfg.aws_regions:
+            region = ",".join(cfg.aws_regions)
+        else:
+            region = cfg.provider_regions.get(provider, "any")
         print(f"  - {provider}/{region}: {cfg.accelerators}")
 
     sky_config = generate_sky_config(
@@ -167,6 +171,7 @@ def main(cfg: SkyPilotTrainingConfig):
         s3_checkpoint_base=cfg.s3_checkpoint_base,
         wandb_api_key=wandb_api_key,
         provider_regions=cfg.provider_regions,
+        aws_regions=cfg.aws_regions,
         aws_image_ids=cfg.aws_image_ids,
         idle_minutes=cfg.idle_minutes,
         xla_mem_fraction=cfg.xla_mem_fraction,

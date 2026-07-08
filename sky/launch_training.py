@@ -48,6 +48,7 @@ class SkyPilotTrainingConfig:
     aws_image_ids: dict[str, str] = field(default_factory=lambda: {
         "us-west-2": "ami-067cc81f948e50e06",
         "us-east-1": "ami-0365bff494b18bf93",
+        "us-east-2": "ami-032b37e4db407994d",  # Deep Learning OSS Nvidia Driver AMI GPU PyTorch 2.7 (Ubuntu 22.04)
     })
     cluster_name: Optional[str] = None
     disable_wandb: bool = False

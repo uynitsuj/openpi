@@ -220,26 +220,32 @@ def _build_run_script() -> str:
         'export WANDB_TAGS="skypilot,$SKYPILOT_CLUSTER_NAME"',
         'export WANDB_NOTES="task_id=$SKYPILOT_TASK_ID cluster=$SKYPILOT_CLUSTER_NAME"',
         '',
-        '# Resume mode: pull existing checkpoints from S3 into the local checkpoint dir',
-        '# BEFORE training so train.py can pick up from where it stopped.',
+        '# Auto-resume for preemption/spot safety. SkyPilot re-runs this script on',
+        '# a fresh instance after a spot preemption or machine failure. If this run',
+        '# already has step checkpoints in S3 (from a prior attempt), resume from',
+        '# the LATEST one instead of overwriting and restarting from scratch. Also',
+        '# honors an explicit RESUME=true (manual resume of a stopped run).',
         'LOCAL_CKPT_DIR="$CHECKPOINT_BASE_DIR/$CONFIG_NAME/$EXP_NAME"',
-        'if [ "$RESUME" = "true" ]; then',
-        '  echo "[INFO] Resume mode: syncing prior checkpoints from $S3_CHECKPOINT_PATH"',
-        '  mkdir -p "$LOCAL_CKPT_DIR"',
-        '  # Skip orbax tmp dirs from previous failed writes — they\'re partial/corrupt.',
-        '  aws s3 sync "$S3_CHECKPOINT_PATH" "$LOCAL_CKPT_DIR" \\',
+        '# Latest step already present in S3 (checkpoint step dirs are named by int step).',
+        'LATEST_S3_STEP=$(aws s3 ls "$S3_CHECKPOINT_PATH/" 2>/dev/null | grep -oE "PRE [0-9]+/" | grep -oE "[0-9]+" | sort -n | tail -1)',
+        'if [ -n "$LATEST_S3_STEP" ]; then',
+        '  echo "[INFO] Found S3 checkpoint at step $LATEST_S3_STEP; resuming from it"',
+        '  mkdir -p "$LOCAL_CKPT_DIR/$LATEST_S3_STEP"',
+        '  # Pull only the latest step (orbax reconstructs manager state from the',
+        '  # step dir; avoids re-downloading every accumulated checkpoint on each',
+        '  # recovery). Skip partial orbax tmp dirs from an interrupted write.',
+        '  aws s3 sync "$S3_CHECKPOINT_PATH/$LATEST_S3_STEP" "$LOCAL_CKPT_DIR/$LATEST_S3_STEP" \\',
         '    --exclude "*.orbax-checkpoint-tmp-*"',
-        '  # Free disk: keep only the latest checkpoint locally; older steps still in S3.',
-        '  # Also remove any orbax tmp dirs that slipped through (defensive).',
-        '  find "$LOCAL_CKPT_DIR" -maxdepth 1 -mindepth 1 -type d -name "*orbax-checkpoint-tmp*" -exec rm -rf {} + 2>/dev/null',
-        '  LATEST_STEP=$(find "$LOCAL_CKPT_DIR" -maxdepth 1 -mindepth 1 -type d -regextype posix-extended -regex ".*/[0-9]+" -printf "%f\\n" 2>/dev/null | sort -n | tail -1)',
-        '  if [ -n "$LATEST_STEP" ]; then',
-        '    echo "[INFO] Latest checkpoint: $LATEST_STEP. Removing older local checkpoints (still on S3)."',
-        '    find "$LOCAL_CKPT_DIR" -maxdepth 1 -mindepth 1 -type d -regextype posix-extended -regex ".*/[0-9]+" ! -name "$LATEST_STEP" -exec rm -rf {} +',
-        '    df -h "$LOCAL_CKPT_DIR" | tail -1',
-        '  fi',
+        '  df -h "$LOCAL_CKPT_DIR" | tail -1',
+        '  RESUME_ARG="--resume --no-overwrite"',
+        'elif [ "$RESUME" = "true" ]; then',
+        '  # Manual resume requested but nothing in S3 yet (e.g. preempted before the',
+        '  # first save). --resume is a no-op on an empty dir, so this starts fresh.',
+        '  echo "[INFO] RESUME set but no S3 checkpoint yet; starting fresh"',
+        '  mkdir -p "$LOCAL_CKPT_DIR"',
         '  RESUME_ARG="--resume --no-overwrite"',
         'else',
+        '  echo "[INFO] No prior checkpoint in S3; starting fresh"',
         '  RESUME_ARG="--overwrite"',
         'fi',
         '',
@@ -283,6 +289,7 @@ def generate_sky_config(
     provider_regions: Optional[dict[str, str]] = None,
     aws_regions: Optional[List[str]] = None,
     aws_image_ids: Optional[dict[str, str]] = None,
+    use_spot: bool = False,
     idle_minutes: int = 10,
     xla_mem_fraction: float = 0.95,
     managed: bool = True,
@@ -310,6 +317,11 @@ def generate_sky_config(
             (region, accelerator) using the region's AMI from aws_image_ids.
             Regions without an AMI in aws_image_ids are skipped.
         aws_image_ids: Map of AWS region to AMI ID for the Deep Learning AMI.
+        use_spot: If True, add a spot variant of every candidate (in addition
+            to the on-demand one). SkyPilot prefers the cheaper spot candidates
+            and falls back to on-demand when no spot capacity is available. On
+            preemption, managed-job recovery re-queues and the run script
+            auto-resumes from the latest S3 checkpoint.
         managed: If True, config is for ``sky jobs launch`` (auto-teardown).
     """
     provider_regions = provider_regions or {}
@@ -354,6 +366,11 @@ def generate_sky_config(
                     elif not region:
                         entry['image_id'] = aws_image_ids
 
+                # Prefer spot (cheaper) with on-demand as fallback. SkyPilot's
+                # optimizer orders any_of by price, so the spot variant is tried
+                # first and on-demand only when no spot capacity exists anywhere.
+                if use_spot:
+                    candidates.append({**entry, 'use_spot': True})
                 candidates.append(entry)
 
     if len(candidates) == 1:

@@ -54,6 +54,7 @@ class SkyPilotTrainingConfig:
     disable_wandb: bool = False
     dry_run: bool = False
     managed: bool = True  # Use sky jobs launch (auto-teardown) instead of sky launch
+    use_spot: bool = False  # Add spot candidates (preferred, on-demand fallback). Safe with auto-resume: preemption re-queues and resumes from the latest S3 checkpoint. Best paired with a smaller --save-interval.
     idle_minutes: int = 10  # Autostop idle timeout before teardown
     xla_mem_fraction: float = 0.95
     disk_size: int = 512  # Worker disk size in GiB. Sized for dataset + downloaded prior checkpoints + new checkpoint write + jax/orbax tmp.
@@ -174,6 +175,7 @@ def main(cfg: SkyPilotTrainingConfig):
         provider_regions=cfg.provider_regions,
         aws_regions=cfg.aws_regions,
         aws_image_ids=cfg.aws_image_ids,
+        use_spot=cfg.use_spot,
         idle_minutes=cfg.idle_minutes,
         xla_mem_fraction=cfg.xla_mem_fraction,
         managed=cfg.managed,

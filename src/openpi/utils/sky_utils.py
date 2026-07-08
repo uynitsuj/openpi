@@ -342,8 +342,13 @@ def generate_sky_config(
     else:
         resources = {'any_of': candidates}
 
+    # Repo root = parents[3] of src/openpi/utils/sky_utils.py. Derived at
+    # runtime so the launcher works regardless of which user/home checks out
+    # the repo (was previously hardcoded to a specific user's home dir).
+    repo_root = str(Path(__file__).resolve().parents[3])
+
     config = {
-        'workdir': '/home/justinyu/openpi',
+        'workdir': repo_root,
         'envs': {
             'DATASET_PATH': dataset_s3_path,
             'CONFIG_NAME': config_name,

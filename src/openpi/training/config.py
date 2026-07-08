@@ -2064,6 +2064,27 @@ _CONFIGS = [
         keep_period=30_000,
         rabc_enabled=False,
     ),
+    # Thomas t-shirt YAM dataset (thomas_tshirt_us05_gop10): 46 episodes / ~150k
+    # frames @ 30Hz, 14D state+actions, three camera views. Plain vanilla-BC YAM
+    # config (no reward columns in the dataset, so LeRobotYamDataConfig rather than
+    # the RORM variant). Primarily registered to compute norm stats for this dataset.
+    TrainConfig(
+        name="pi0_thomas_tshirt_us05",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamDataConfig(
+            repo_id="thomas_tshirt_us05_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+    ),
     # Wider merge — hlm + d405 episodes ≤ 90s (4124 episodes total) instead
     # of the under-60s 2427. More d405 demonstrations added to the training
     # mix; downstream RABC + no-RABC pair to sweep whether the wider data
@@ -2528,6 +2549,76 @@ _CONFIGS = [
         num_train_steps=60_000,
         save_interval=30_000,
         keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    # Task finetune: adapt the pi0_merged60_rabc_finalaction_thr100_nomax 60k
+    # checkpoint to the small thomas_tshirt_us05 subset (46 eps / 149,816 frames).
+    # Plain BC — this dataset has no repromo_*/rorm_* reward columns, so it uses
+    # LeRobotYamDataConfig (not the Rorm variant) with rabc_enabled=False.
+    #
+    # Weights load from the base checkpoint on S3 (the SkyPilot worker is a
+    # remote node with no access to the local /nfs_us_2 copy). Norm stats REUSE
+    # the base checkpoint's: instead of an asset override (which the launcher
+    # keys by asset_id but the worker run-script keys by repo_id — inconsistent),
+    # the base norm_stats.json is seeded into
+    # assets/pi0_thomas_tshirt_us05_ft/thomas_tshirt_us05_gop10/ so the launcher
+    # uploads it and the worker skips recompute. Same 14-D YAM space, so the base
+    # stats match the pretrained weights (thomas-vs-base: mean shift <0.2σ avg,
+    # 0.8σ worst on L_j5; std ratio 0.72–1.37).
+    #
+    # 10k steps ≈ 2.1 epochs at batch 32; save every 2k (5 kept) to pick the best
+    # checkpoint by eval before overfitting. AWS has no 2-GPU nodes and offers
+    # 80GB GPUs only in 8-packs, so this targets a 4× L40S node (g6e.12xlarge,
+    # 45GB × 4 = 180GB, far easier to schedule than 8× A100/H100). fsdp_devices=4
+    # shards the ~3.3B pi0 + AdamW/EMA state across all 4 GPUs; mesh = (dp=1,
+    # fsdp=4), batch 32 % 4 == 0.
+    TrainConfig(
+        name="pi0_thomas_tshirt_us05_ft",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamDataConfig(
+            repo_id="thomas_tshirt_us05_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        fsdp_devices=4,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "s3://xdof-internal-research/model_ckpts/pi0_merged60_rabc_finalaction_thr100_nomax/pi0_merged60_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511/59999/params"
+        ),
+        num_train_steps=10_000,
+        save_interval=2_000,
+        keep_period=2_000,
+        rabc_enabled=False,
+    ),
+    # RABC counterpart of pi0_thomas_tshirt_us05_ft, mirroring the abc30hz RABC
+    # recipe (final-action condition ON, thr=1.0, clip_max=inf, velocity_only).
+    # BLOCKED until rewards are injected: thomas_tshirt_us05_gop10 has NO reward
+    # columns yet, so a reward model must first inject repromo_signed_magnitude /
+    # repromo_quality into the dataset in place (as hlm_plus_d405_under60s_gop10
+    # has). Until then the RORM data loader has nothing to weight by and this
+    # config errors on load — it's registered so the pair is ready to launch once
+    # rewards exist. Same S3 base weights, fsdp_devices=2, and 10k/2k schedule.
+    TrainConfig(
+        name="pi0_thomas_tshirt_us05_ft_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="thomas_tshirt_us05_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.0,
+            rabc_clip_max=float("inf"),
+        ),
+        batch_size=32,
+        num_workers=8,
+        fsdp_devices=4,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "s3://xdof-internal-research/model_ckpts/pi0_merged60_rabc_finalaction_thr100_nomax/pi0_merged60_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511/59999/params"
+        ),
+        num_train_steps=10_000,
+        save_interval=2_000,
+        keep_period=2_000,
         rabc_enabled=True,
     ),
     # thr=1.0 strict variant — the most aggressive filter; long-episode frames

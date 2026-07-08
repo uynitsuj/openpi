@@ -2013,6 +2013,57 @@ _CONFIGS = [
         keep_period=30_000,
         rabc_enabled=False,
     ),
+    # Merged hlm-dedup + ABC-t-shirt-fold re-encoded at true 30Hz — 2903 episodes
+    # (1649 hlm-dedup + 1254 ABC). Successor to pi0_merged_{rabc,no_rabc}: swaps the
+    # d405-under60s half for the ABC fold_and_stack demos, with ABC re-sampled from its
+    # native ~60Hz mcaps onto a uniform 30Hz grid (fixes the fps-doubling that made ABC
+    # episodes appear ~2× long). Reward columns are warp_rm_progress /
+    # warp_rm_signed_magnitude, injected by RORM on both halves; the RABC velocity signal
+    # comes from warp_rm_signed_magnitude (velocity_only mode). repo_id mirrors the S3
+    # push at s3://xdof-internal-research/repromo/datasets/hlm_dedup_plus_abc30hz_gop10.
+    #
+    # RABC variant: final-action condition ON, keep only chunks whose final-action
+    # weight is above the threshold (thr=1.0), and no upper cap on the kept-chunk
+    # weight (clip_max=inf) so weight reflects raw RM magnitude instead of saturating.
+    TrainConfig(
+        name="pi0_merged_abc30hz_rabc_finalaction_thr100_nomax",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_dedup_plus_abc30hz_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.0,
+            rabc_clip_max=float("inf"),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_merged_abc30hz_no_rabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="hlm_dedup_plus_abc30hz_gop10",
+            default_prompt="Folding tshirt pile and stacking",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
+        num_train_steps=60_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=False,
+    ),
     # Wider merge — hlm + d405 episodes ≤ 90s (4124 episodes total) instead
     # of the under-60s 2427. More d405 demonstrations added to the training
     # mix; downstream RABC + no-RABC pair to sweep whether the wider data

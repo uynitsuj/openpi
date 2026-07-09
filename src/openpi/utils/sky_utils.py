@@ -254,6 +254,7 @@ def _build_run_script() -> str:
         'if [ -n "$NUM_TRAIN_STEPS_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --num-train-steps=$NUM_TRAIN_STEPS_OVERRIDE"; fi',
         'if [ -n "$SAVE_INTERVAL_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --save-interval=$SAVE_INTERVAL_OVERRIDE"; fi',
         'if [ -n "$KEEP_PERIOD_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --keep-period=$KEEP_PERIOD_OVERRIDE"; fi',
+        'if [ -n "$FSDP_DEVICES_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --fsdp-devices=$FSDP_DEVICES_OVERRIDE"; fi',
         '',
         '# Run training',
         'echo "[INFO] Running training: $CONFIG_NAME exp=$EXP_NAME (resume=$RESUME, extras=$EXTRA_ARGS)"',
@@ -298,6 +299,7 @@ def generate_sky_config(
     num_train_steps_override: Optional[int] = None,
     save_interval_override: Optional[int] = None,
     keep_period_override: Optional[int] = None,
+    fsdp_devices_override: Optional[int] = None,
 ) -> dict:
     """Generate a single SkyPilot YAML with multi-cloud auto-failover.
 
@@ -398,6 +400,7 @@ def generate_sky_config(
             'NUM_TRAIN_STEPS_OVERRIDE': str(num_train_steps_override) if num_train_steps_override is not None else '',
             'SAVE_INTERVAL_OVERRIDE': str(save_interval_override) if save_interval_override is not None else '',
             'KEEP_PERIOD_OVERRIDE': str(keep_period_override) if keep_period_override is not None else '',
+            'FSDP_DEVICES_OVERRIDE': str(fsdp_devices_override) if fsdp_devices_override is not None else '',
         },
         'resources': resources,
         'num_nodes': 1,

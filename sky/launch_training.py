@@ -62,6 +62,7 @@ class SkyPilotTrainingConfig:
     num_train_steps: Optional[int] = None  # Override TrainConfig.num_train_steps (e.g., extend a resumed run).
     save_interval: Optional[int] = None  # Override TrainConfig.save_interval to control checkpoint save frequency.
     keep_period: Optional[int] = None  # Override TrainConfig.keep_period (orbax keeps checkpoints at step%keep_period==0 forever).
+    fsdp_devices: Optional[int] = None  # Override TrainConfig.fsdp_devices. Must divide the GPU count (e.g. set 1 for a single-GPU node).
 
 
 def main(cfg: SkyPilotTrainingConfig):
@@ -184,6 +185,7 @@ def main(cfg: SkyPilotTrainingConfig):
         num_train_steps_override=cfg.num_train_steps,
         save_interval_override=cfg.save_interval,
         keep_period_override=cfg.keep_period,
+        fsdp_devices_override=cfg.fsdp_devices,
     )
 
     config_file = None

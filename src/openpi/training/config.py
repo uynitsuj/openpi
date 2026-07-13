@@ -1934,37 +1934,6 @@ _CONFIGS = [
         keep_period=30_000,
         rabc_enabled=False,
     ),
-    # mean2s / mean1s_offset gates on merged90/120: aggregate vel over the
-    # action chunk + 1s after it (60-frame window = 2s @ 30fps), or only the
-    # 1s lookahead portion. Tests whether the model wants to be told about
-    # what comes AFTER the action it's predicting, not just within it.
-    # Defaults: thr=0.75 NOMAX (kept-weight = raw mean; no upper cap).
-    *[
-        TrainConfig(
-            name=f"pi0_merged{cap}_rabc_{aggname}_thr{int(thr*100):03d}_nomax",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id=f"hlm_plus_d405_under{cap}s_gop10",
-                default_prompt="Folding tshirt pile and stacking",
-                base_config=DataConfig(prompt_from_task=True),
-                rabc_use_final_action_condition=False,
-                rabc_threshold=thr,
-                rabc_clip_max=float("inf"),
-                rabc_velocity_aggregator=agg,
-                rabc_lookahead_frames=30,  # 1s lookahead at fps=30
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-            num_train_steps=60_000,
-            save_interval=30_000,
-            keep_period=30_000,
-            rabc_enabled=True,
-        )
-        for cap in (90,)
-        for agg, aggname in (("mean_lookahead", "mean1s_offset"),)
-        for thr in (1.00,)
-    ],
     # No-max-cap variants of the 120s strict-gate trains. clip_max=inf lets
     # the kept-sample weight reflect raw RM magnitude (vel can be > 1.0)
     # rather than saturating at 1.0. Tests whether the cap was suppressing
@@ -2013,56 +1982,6 @@ _CONFIGS = [
         keep_period=30_000,
         rabc_enabled=True,
     ),
-    # IID-RM ablation twin: same recipe as pi0_merged90_rabc_finalaction_thr100_nomax,
-    # but repo_id points at the duplicated merged90 dataset whose
-    # `repromo_signed_magnitude` was injected with the IID-trained RM
-    # (repromo_full_tshirt_folding_d405_v010_20260420_shortest25_win32_iid_15k)
-    # rather than the canonical AR(1)-trained RM. Used to isolate the
-    # contribution of the AR(1) speed-process correlation in the RM training
-    # sampler on downstream policy quality.
-    TrainConfig(
-        name="pi0_merged90_rabc_finalaction_thr100_nomax_iidrm",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_under90s_iidrm_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=True,
-            rabc_threshold=1.00,
-            rabc_clip_max=float("inf"),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # Mean-over-chunk sibling of the above: same dataset and thr/nomax, but
-    # uses the default velocity_aggregator="mean" path instead of the final-
-    # action gate. Keep iff mean(vel[t:t+H]) > 1.0; kept weight = clip(mean,
-    # None, inf) = mean. clip_max=inf so high-velocity stretches retain their
-    # magnitude rather than saturating at 1.0.
-    TrainConfig(
-        name="pi0_merged90_rabc_mean_thr100_nomax",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_under90s_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=False,
-            rabc_threshold=1.00,
-            rabc_clip_max=float("inf"),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
     # WARP-BC on D1 (<=60s tier): final-action gate, thr=1.0, continuous
     # (clip_max=inf) reweighting of kept chunks.
     TrainConfig(
@@ -2075,26 +1994,6 @@ _CONFIGS = [
             rabc_use_final_action_condition=True,
             rabc_threshold=1.00,
             rabc_clip_max=float("inf"),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # thr=1.0 strict variant — the most aggressive filter; long-episode frames
-    # are nearly all dropped. Expected keep ~34% on under90s.
-    TrainConfig(
-        name="pi0_merged90_rabc_finalaction_thr100",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_under90s_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=True,
-            rabc_threshold=1.00,
         ),
         batch_size=32,
         num_workers=8,
@@ -2446,42 +2345,7 @@ _CONFIGS = [
             rabc_enabled=True,
         )
         for short, (repo, prompt, base_ckpt) in _WARPBC_TASKS.items()
-        for n in (15, 30, 45)
-    ],
-    # ── Multi-cam (3-camera concat RM) WARP-BC: IDENTICAL recipe to
-    #    pi0_{short}_warpbc_sss{n} above, EXCEPT the velocity column is produced
-    #    by the 3-camera (top + left/right wrist) concat reward model and scored
-    #    into the copy <repo>_mc3_sss{n}. Only name + repo_id differ — same
-    #    τ=1.0, clip_max=inf, finalaction, top_shortest_frac=0.5, action_horizon,
-    #    base init (incl tshirt's special pi0_yam_tshirt ckpt), steps — so the
-    #    single-cam-vs-multi-cam comparison is clean and the downstream
-    #    real-robot eval is the only differing signal (RM val was ~tied).
-    #    PREREQUISITE: <repo>_mc3_sss{n} produced by
-    #    warprm2/scripts/launch_mc3_scoring_sky.sh (concat-RM dense inference,
-    #    cache-hit over shortest-60%, inject warp_rm_signed_magnitude).
-    *[
-        TrainConfig(
-            name=f"pi0_{short}_warpbc_mc3_sss{n}",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id=f"{repo}_mc3_sss{n}",
-                default_prompt=prompt,
-                base_config=DataConfig(prompt_from_task=True),
-                rabc_use_final_action_condition=True,
-                rabc_threshold=1.00,
-                rabc_clip_max=float("inf"),
-                top_shortest_frac=0.5,
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader(base_ckpt),
-            num_train_steps=60_000,
-            save_interval=30_000,
-            keep_period=30_000,
-            rabc_enabled=True,
-        )
-        for short, (repo, prompt, base_ckpt) in _WARPBC_TASKS.items()
-        for n in (15, 30, 45)
+        for n in (45,)
     ],
     *[
         TrainConfig(

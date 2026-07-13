@@ -949,6 +949,31 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
     sarm_kappa: float = 0.01
     # Column name for absolute progress values.
     sarm_progress_key: str = "sarm_dense_progress"
+    # ── velocity-conditioned prompting (WARP-VC) ──
+    # When set to (lo, hi) velocity edges (raw RM units), inserts
+    # InjectSpeedBinPrompt BEFORE ComputeRABCWeights: each sample's prompt
+    # gets a ", speed: {slow|normal|fast}" suffix from the chunk's
+    # final-frame velocity (vel[-1] < lo -> slow, < hi -> normal, else fast).
+    # No samples are dropped or re-weighted by this transform. Default None
+    # = OFF (no behavior change for existing configs).
+    speed_bin_prompt_edges: tuple[float, float] | None = None
+    # ── ALIGN-style velocity conditioning via AdaRMS (WARP-VC-AdaRMS) ──
+    # When True, inserts InjectVelocityCondition BEFORE ComputeRABCWeights: each
+    # sample's chunk-final velocity (vel[-1]) is written to data["condition"]
+    # (raw RM units, NOT re-weighted or dropped). Pair with a
+    # Pi0Config(pi05=True, velocity_condition=True) model, which fuses it into
+    # the action expert's AdaRMS conditioning. Default False = OFF (no behavior
+    # change for existing configs). Independent of speed_bin_prompt_edges (the
+    # prompt-conditioning control), though both may be enabled together.
+    velocity_condition: bool = False
+    # Fixed condition value written at INFERENCE (velocity column absent). The
+    # "fast" analogue — a high value of the training vel[-1] distribution so the
+    # deployed policy is conditioned toward fast motion. For
+    # sim_put_bottles_mjwarp_rmsss15 warp_rm_signed_magnitude, p25/p75 of vel[-1]
+    # are 0.66/1.05; 1.5 sits clearly in the "fast" regime. The node operator
+    # can recompute p90 for a more principled value; only used when
+    # velocity_condition=True.
+    velocity_condition_inference_value: float = 1.5
     # Hard Q-filter: keep only the top fraction of episodes by mean rorm_q.
     top_q_frac: float | None = None
     # Length filter: keep only the shortest fraction of episodes by frame count.
@@ -1028,7 +1053,32 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
                     self.repo_id, model_config.action_horizon, self.sarm_progress_key,
                 )
 
-        rabc_inputs: list[_transforms.DataTransformFn] = [
+        rabc_inputs: list[_transforms.DataTransformFn] = []
+        if self.speed_bin_prompt_edges is not None:
+            # WARP-VC: must run before ComputeRABCWeights (which pops the
+            # velocity key) and before tokenization (model transforms).
+            # base_prompt=default_prompt makes the training prompt fully
+            # deterministic ("<default_prompt>, speed: <bin>") — the
+            # prompt_from_task path yields a garbage "0" prompt on lerobot-v3
+            # task tables (see InjectSpeedBinPrompt.base_prompt docstring),
+            # and the eval client must be able to reproduce the exact string.
+            rabc_inputs.append(
+                _transforms.InjectSpeedBinPrompt(
+                    edges=tuple(self.speed_bin_prompt_edges),
+                    base_prompt=self.default_prompt,
+                )
+            )
+        if self.velocity_condition:
+            # WARP-VC-AdaRMS: must run before ComputeRABCWeights (which pops the
+            # velocity key). Writes data["condition"] = vel[-1] at training; at
+            # inference (no velocity column) writes the fixed "fast" value.
+            rabc_inputs.append(
+                _transforms.InjectVelocityCondition(
+                    inference_fixed_condition=self.velocity_condition_inference_value,
+                    base_prompt=self.default_prompt,
+                )
+            )
+        rabc_inputs += [
             _transforms.ComputeRABCWeights(
                 clip_min=self.rabc_clip_min,
                 clip_max=self.rabc_clip_max,
@@ -3423,8 +3473,277 @@ _CONFIGS = [
         batch_size=32,
         num_workers=8,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
-        num_train_steps=60_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=True,
+    ),
+    # ── sss15-RM sibling of pi0_put_bottles_mjwarp_rabc_perobj. Identical
+    #    recipe; repo sim_put_bottles_mjwarp_rmsss15 is a hardlinked-videos copy
+    #    of rmperobj whose warp_rm_* columns were injected RAW (no rescale)
+    #    from the wr_A_rm_perobj_s25_mjwarp_sss15_20k dense sidecar
+    #    (/mnt/data/warp_rm/sidecars/rm_perobj_sss15, dense_predictions.parquet,
+    #    verified exact float32 2438/2438 eps). Raw thr=1.0 keeps ~31.5% of
+    #    chunks (32.55% of frames have vel > 1.0).
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_rabc_sss15",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmsss15",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_rabc_sss15_nomax",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmsss15",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_clip_max=float("inf"),
+            rabc_threshold=1.00,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=True,
+    ),
+    # ── 60Hz-RM sibling of pi0_put_bottles_mjwarp_rabc_sss15 (ladder winner:
+    #    sss15 trained on the 60Hz re-render). Identical recipe (BINARY gate,
+    #    default clip_max=1.0, thr=1.0, final-action, ah=30, bs=32, 30k);
+    #    repo sim_put_bottles_mjwarp_rmsss15_60 is a hardlinked-videos copy of
+    #    rmperobj whose warp_rm_* columns were injected RAW (no rescale) from
+    #    the wr_A_rm_perobj_s25_60hz_sss15_20k dense sidecar downsampled to
+    #    the 30Hz timeline (t30[i]=t60[2i]; /mnt/data/warp_rm/sidecars/
+    #    rm_perobj_sss15_60hz_ds30, verified exact float32 2438/2438 eps —
+    #    2436 scored + eps 2264/2344 zero-filled (absent from the 60Hz
+    #    re-render) -> gated out). Raw thr=1.0 keeps 35.75% of chunks
+    #    (34.85% of frames have vel > 1.0).
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_rabc_sss15_60hz",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmsss15_60",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=True,
+    ),
+    # ── WARP-VC: velocity-CONDITIONED sibling of ..._rabc_sss15. Uses the
+    #    PROVEN sss15@30Hz RM signal (sim_put_bottles_mjwarp_rmsss15, the
+    #    rabc_sss15 arm's dataset — arm eval 4.57); REDIRECTED 2026-07-07
+    #    off sim_put_bottles_mjwarp_rmsss15_60 after its rabc arm collapsed
+    #    to vanilla (4.03 vs no_rabc 4.07). Recipe (ah=30, pi0_base init,
+    #    30k cosine, bs=32), but NO rejection / weighting:
+    #    rabc_enabled=False skips the subset filter + loss weight,
+    #    so ALL chunks train. Instead each sample's prompt gets a per-sample
+    #    ", speed: {slow|normal|fast}" suffix from the chunk-final velocity
+    #    vel[-1] (the same statistic the RABC gate thresholds on). Edges
+    #    (0.66, 1.05) = empirical p25/p75 of vel[-1] over all 2,228,979
+    #    chunk starts (2438 eps) of THIS dataset's warp_rm_signed_magnitude
+    #    (raw p25/p75 = 0.6594/1.0508) -> slow/normal/fast = 25.1/49.8/25.1%.
+    #    The base prompt is overridden with default_prompt (deterministic
+    #    "Put the plastic bottles in the bin, speed: <bin>") because the
+    #    prompt_from_task path yields the garbage prompt "0" on this
+    #    dataset's lerobot-v3 task table (as it did for ALL sibling arms —
+    #    harmless there, fatal for prompt-borne conditioning).
+    #    At eval, send "Put the plastic bottles in the bin, speed: fast".
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_velcond",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmsss15",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            speed_bin_prompt_edges=(0.66, 1.05),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=False,
+    ),
+    # ── WARP-VC-AdaRMS: ALIGN-style velocity conditioning via the pi0.5 action
+    #    expert's AdaRMS, on the SAME dataset (sim_put_bottles_mjwarp_rmsss15)
+    #    and RM signal (warp_rm_signed_magnitude, chunk-final vel[-1]) as the
+    #    prompt-conditioning velcond arm — a clean INJECTION-METHOD ablation.
+    #    Motivation: the base-pi0 prompt velcond arm learned the correct
+    #    condition->speed direction but expressed it only WEAKLY (~0.55x the
+    #    diffusion-noise floor) because the language->action-expert pathway is
+    #    attenuated. Here the scalar velocity is injected DIRECTLY into every
+    #    action-expert layer's scale/shift/gate via AdaRMS (bypassing
+    #    SigLIP+Gemma): adarms_cond = time_emb + cond_mlp(condition), with
+    #    cond_mlp's final layer zero-init so it starts as an exact no-op
+    #    (identity w.r.t. pi05_base — a safe fine-tune start). Data routing:
+    #    InjectVelocityCondition writes data["condition"] = vel[-1] per chunk
+    #    (before ComputeRABCWeights pops the vel key), and (base_prompt) fixes
+    #    the training prompt to the deterministic base sentence. rabc_enabled
+    #    =False: ALL chunks train (no gate/reweight), each conditioned on its
+    #    OWN velocity. weight_loader = pi05_base; missing_regex widened so the
+    #    new cond_mlp is treated as fresh (kept, not dropped) at merge time.
+    #    Deploy: condition is fixed to velocity_condition_inference_value (1.5,
+    #    the "fast" analogue) at serve — see InjectVelocityCondition.
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_velcond_adarms",
+        model=pi0_config.Pi0Config(action_horizon=30, pi05=True, velocity_condition=True),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmsss15",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            velocity_condition=True,
+            velocity_condition_inference_value=1.5,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=".*(lora|cond_mlp).*",
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=False,
+    ),
+    # ── WARP-VC-prompt (pi0.5 control): the prompt-conditioning method (SAME
+    #    ", speed: {slow|normal|fast}" suffix / edges as pi0_put_bottles_mjwarp_
+    #    velcond) but on the pi0.5 backbone + pi05_base init — so it differs
+    #    from ..._velcond_adarms ONLY in injection method (prompt vs AdaRMS),
+    #    isolating the ALIGN hypothesis on a matched backbone. No cond_mlp / no
+    #    new params, so the default missing_regex (LoRA-only) is correct.
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_velcond_prompt_pi05",
+        model=pi0_config.Pi0Config(action_horizon=30, pi05=True),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmsss15",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            speed_bin_prompt_edges=(0.66, 1.05),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=False,
+    ),
+    # ── pi0.5-VANILLA control: plain pi0.5 BC on rmsss15, NO conditioning + NO
+    #    RABC (differs from velcond_prompt_pi05 by dropping the speed-bin prompt
+    #    conditioning + rabc fields). The fundamental control for the AdaRMS
+    #    study: isolates the pi0.5 BACKBONE from any conditioning method. Eval on
+    #    the shared base prompt "Put the plastic bottles in the bin".
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_velcond_vanilla_pi05",
+        model=pi0_config.Pi0Config(action_horizon=30, pi05=True),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmsss15",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=False,
+    ),
+    # ── ens_gate ENSEMBLE sibling of pi0_put_bottles_mjwarp_rabc_sss15_60hz.
+    #    Identical recipe (BINARY gate, default clip_max=1.0, thr=1.0,
+    #    final-action, ah=30, bs=32, 30k); repo sim_put_bottles_mjwarp_ensgate
+    #    is a hardlinked-videos copy of rmsss15_60 whose warp_rm_* columns
+    #    were injected RAW (no rescale) from the ens_gate ensemble sidecar
+    #    (/mnt/data/warp_rm/sidecars/ens_gate: sss15@60Hz raw velocity zeroed
+    #    where sss45@60Hz < g=0.6718, kept-frac@thr1.0=0.3200;
+    #    warp_rm_progress carried unchanged from sss15_60hz; verified exact
+    #    float32 2438/2438 eps — 2436 scored + eps 2264/2344 zero-filled
+    #    (absent from the 60Hz re-render) -> gated out). Raw thr=1.0 keeps
+    #    32.18% of chunks (31.98% of frames have vel > 1.0).
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_rabc_ensgate",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_ensgate",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=True,
+    ),
+    # ── sss45@60Hz RM sibling of pi0_put_bottles_mjwarp_rabc_sss15_60hz /
+    #    ..._rabc_ensgate. Identical recipe (BINARY gate, default
+    #    clip_max=1.0, thr=1.0, final-action, ah=30, bs=32, 30k); repo
+    #    sim_put_bottles_mjwarp_rmsss45_60 is a hardlinked-videos copy of
+    #    rmsss15_60 whose warp_rm_* columns were injected RAW (no rescale)
+    #    from the wr_A_rm_perobj_s25_60hz_sss45_20k dense sidecar downsampled
+    #    to the 30Hz timeline (t30[i]=t60[2i]; /mnt/data/warp_rm/sidecars/
+    #    rm_perobj_sss45_60hz_ds30, verified exact float32 2438/2438 eps —
+    #    2436 scored + eps 2264/2344 zero-filled (absent from the 60Hz
+    #    re-render) -> gated out). Raw thr=1.0 keeps 26.94% of chunks
+    #    (26.76% of frames have vel > 1.0) — BELOW the proven ~31-32%
+    #    operating point by design: raw-unit protocol, threshold NOT
+    #    recalibrated.
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_rabc_sss45_60hz",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmsss45_60",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
         save_interval=10_000,
         keep_period=10_000,
         rabc_enabled=True,
@@ -3442,8 +3761,8 @@ _CONFIGS = [
         batch_size=32,
         num_workers=8,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
-        num_train_steps=60_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
         save_interval=10_000,
         keep_period=10_000,
         rabc_enabled=True,
@@ -3461,12 +3780,144 @@ _CONFIGS = [
         batch_size=32,
         num_workers=8,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
-        num_train_steps=60_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
         save_interval=10_000,
         keep_period=10_000,
         rabc_enabled=False,
     ),
+    # ── AB-corpus arms (5,991 eps: A-half 0..2437 = original mjwarp corpus,
+    #    B-half 2438..5990 = the B expansion; merged on node2 2026-07-07,
+    #    pulled to node1 2026-07-08). BOTH arms train on
+    #    sim_put_bottles_mjwarp_AB_rmsss15 — a hardlinked-videos copy of
+    #    sim_put_bottles_mjwarp_AB whose all-zero warp_rm_* placeholder
+    #    columns were injected RAW (no rescale) from the rm_AB_perobj_sss15
+    #    dense sidecar (scored on the full AB index space by
+    #    wr_AB_rm_perobj_s25_mjwarp_sss15_20k, composite 0.9983; per-frame
+    #    raw thr=1.0 keeps ~33.4%). The norabc arm ignores the warp_rm
+    #    columns (rabc_enabled=False) — sharing ONE dataset keeps the A/B
+    #    comparison exact. norm_stats computed over the full 5,327,662-frame
+    #    AB corpus (node2 merge pipeline), NOT reused from A.
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_AB_norabc",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_AB_rmsss15",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=False,
+    ),
+    # ── RABC sibling: identical recipe, rabc_enabled=True (BINARY gate:
+    #    default clip_max=1.0, thr=1.00, final-action, ah=30, bs=32, 30k).
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_AB_rabc_sss15",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_AB_rmsss15",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=True,
+    ),
+    # ── Uncertainty-gated (ensvar) AB arms — SERVE/EVAL configs. The variance
+    #    gate (ensemble mean vel>1.0 AND ensemble var<=tau) is baked into the
+    #    training dataset's velocity column and is TRAINING-ONLY; at serve/eval
+    #    these are plain pi0 models (serve exactly like AB_rabc_sss15).
+    #    norm_stats byte-identical to the other AB arms (full-AB-corpus).
+    #    sfx: ""=k75 (main, keep 22.87%), _k50 (~15%), _k90 (~27%).
+    *[
+        TrainConfig(
+            name=f"pi0_put_bottles_mjwarp_AB_rabc_ensvar{sfx}",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=f"sim_put_bottles_mjwarp_AB_ensvar{sfx}",
+                default_prompt="Put the plastic bottles in the bin",
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=True,
+                rabc_threshold=1.00,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+            num_train_steps=30_000,
+            save_interval=10_000,
+            keep_period=10_000,
+            rabc_enabled=True,
+        )
+        for sfx in ("", "_k50", "_k90")
+    ],
+    # ── binmatch: keep-MATCHED binary control for ensvar. RAW ensemble-MEAN
+    #    velocity (NO variance gate); threshold tuned to ensvar's exact keep
+    #    (thr=1.049776 -> 22.87%, 1,218,263 chunks vs ensvar's 1,218,266).
+    #    ensvar vs binmatch = identical signal + identical keep-fraction,
+    #    differing only in WHICH chunks drop (high-variance vs low-velocity) ->
+    #    isolates the variance-gating criterion. SERVE/EVAL only.
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_AB_rabc_binmatch",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_AB_ensmean",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.049776,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=True,
+    ),
+    # ── smk single-model threshold sweep — binary-RABC on the SAME single-model
+    #    (AB_rmsss15) velocity as AB_rabc_sss15, but a raised threshold to keep
+    #    ~22.87% (k23, count-matched to binmatch/ensvar: thr=1.066287) and ~15%
+    #    (k15, matched to k50: thr=1.135547). Disentangles binmatch's win into
+    #    threshold (vs binary-31.5%) vs ensemble-mean signal (vs binmatch @ same keep).
+    *[
+        TrainConfig(
+            name=f"pi0_put_bottles_mjwarp_AB_rabc_sss15_{tag}",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id="sim_put_bottles_mjwarp_AB_rmsss15",
+                default_prompt="Put the plastic bottles in the bin",
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_use_final_action_condition=True,
+                rabc_threshold=thr,
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+            lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+            num_train_steps=30_000,
+            save_interval=10_000,
+            keep_period=10_000,
+            rabc_enabled=True,
+        )
+        for tag, thr in (("k23", 1.066287), ("k15", 1.135547))
+    ],
     # ── NOMAX siblings of pi0_sim_<task>_rabc_30hz. Identical recipe except
     #    rabc_clip_max=inf — chunks above thr=1.0 keep their raw vel[-1]
     #    weight magnitude rather than saturating at 1.0. clip_min left at

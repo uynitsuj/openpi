@@ -31,6 +31,13 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # ALIGN-style velocity conditioning (pi0.5 only). When True (and pi05=True),
+    # a small zero-init MLP maps the scalar `Observation.condition` into the
+    # action expert's AdaRMS conditioning vector: adarms_cond = time_emb +
+    # cond_mlp(condition). Zero-init on the final layer makes it a no-op at
+    # init (safe fine-tune from pi05_base). Default False = unchanged behavior;
+    # ignored entirely when pi05=False (no AdaRMS pathway exists).
+    velocity_condition: bool = False
 
     pytorch_compile_mode: str | None = "max-autotune"
 

@@ -78,6 +78,9 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        # ALIGN-style velocity conditioning is only meaningful on the pi0.5
+        # AdaRMS pathway; force off for plain pi0 (no adarms_cond exists).
+        self.velocity_condition = bool(config.pi05 and config.velocity_condition)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -104,6 +107,20 @@ class Pi0(_model.BaseModel):
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            if self.velocity_condition:
+                # Small MLP: scalar condition -> action-expert width, fused
+                # additively into adarms_cond. Final layer is zero-init so the
+                # whole term starts at exactly 0 (identity w.r.t. pi05_base):
+                # a safe fine-tune start where the condition has no effect until
+                # gradients push cond_mlp_out off zero.
+                self.cond_mlp_in = nnx.Linear(1, action_expert_config.width, rngs=rngs)
+                self.cond_mlp_out = nnx.Linear(
+                    action_expert_config.width,
+                    action_expert_config.width,
+                    kernel_init=nnx.initializers.zeros,
+                    bias_init=nnx.initializers.zeros,
+                    rngs=rngs,
+                )
         else:
             self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -178,6 +195,16 @@ class Pi0(_model.BaseModel):
             time_emb = nnx.swish(time_emb)
             action_expert_tokens = action_tokens
             adarms_cond = time_emb
+            # ALIGN-style velocity conditioning: fuse a scalar condition into
+            # the AdaRMS conditioning vector, bypassing the SigLIP+Gemma
+            # backbone. No-op when the flag is off or no condition is supplied
+            # (e.g. fake_obs / non-conditioning eval) — preserves pi05_base.
+            if self.velocity_condition and obs.condition is not None:
+                cond = obs.condition[:, None].astype(time_emb.dtype)  # (b, 1)
+                cond_emb = self.cond_mlp_in(cond)
+                cond_emb = nnx.swish(cond_emb)
+                cond_emb = self.cond_mlp_out(cond_emb)
+                adarms_cond = time_emb + cond_emb
         else:
             # mix timestep + action information using an MLP (no adaRMS)
             time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)

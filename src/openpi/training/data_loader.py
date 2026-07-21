@@ -7,7 +7,7 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
-import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+import lerobot.datasets.lerobot_dataset as lerobot_dataset  # lerobot moved common/ -> top-level
 import numpy as np
 import torch
 

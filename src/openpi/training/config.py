@@ -583,46 +583,80 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
     """
     YAM dataset with RORM reward weights for RABC / AWR training.
 
-    Same as LeRobotYamDataConfig but also loads `rorm_velocity` from the dataset
-    and computes per-sample RABC weights via the ComputeRABCWeights transform.
+    Same as LeRobotYamDataConfig but also derives per-sample RABC weights.
+    Two dataset layouts are supported:
+
+    - `rabc_velocity_key=None` (legacy): expects a pre-computed per-frame
+      scalar `rorm_weight` column that flows through as `sample_weights`.
+    - `rabc_velocity_key="<column>"`: fetches the per-frame RM velocity
+      column over the action-horizon window (via extra_horizon_keys) and
+      computes `sample_weights` with the ComputeRABCWeights transform
+      (integration or final-action gating, see rabc_* params).
     """
 
     default_prompt: str | None = None
     rabc_clip_min: float = 0.0
     rabc_clip_max: float = 1.0
+    # Zero out samples whose weight falls below this value. With
+    # rabc_use_final_action_condition, the gate is: keep iff vel[-1] > threshold.
+    rabc_threshold: float | None = None
+    # Gate on the final-frame velocity instead of integrating over the chunk.
+    rabc_use_final_action_condition: bool = False
+    # Per-frame RM velocity column to gate on (e.g. "warp_rm_signed_magnitude").
+    rabc_velocity_key: str | None = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "left_camera-images-rgb": "left_camera-images-rgb",
-                        "right_camera-images-rgb": "right_camera-images-rgb",
-                        "top_camera-images-rgb": "top_camera-images-rgb",
-                        "state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                        # rorm_weight is a pre-computed scalar per frame (clip(velocity, 0, inf))
-                        # It flows through as sample_weights for RABC loss weighting
-                        "sample_weights": "rorm_weight",
-                    }
-                )
-            ]
-        )
+        repack_keys = {
+            "left_camera-images-rgb": "left_camera-images-rgb",
+            "right_camera-images-rgb": "right_camera-images-rgb",
+            "top_camera-images-rgb": "top_camera-images-rgb",
+            "state": "state",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        if self.rabc_velocity_key is not None:
+            # Per-frame velocity flows through the repack; ComputeRABCWeights
+            # below collapses it into a scalar sample weight.
+            repack_keys[self.rabc_velocity_key] = self.rabc_velocity_key
+        else:
+            # rorm_weight is a pre-computed scalar per frame (clip(velocity, 0, inf))
+            # It flows through as sample_weights for RABC loss weighting
+            repack_keys["sample_weights"] = "rorm_weight"
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_keys)])
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
+        input_transforms = []
+        if self.rabc_velocity_key is not None:
+            input_transforms.append(
+                _transforms.ComputeRABCWeights(
+                    clip_min=self.rabc_clip_min,
+                    clip_max=self.rabc_clip_max,
+                    threshold=self.rabc_threshold,
+                    use_final_action_condition=self.rabc_use_final_action_condition,
+                    velocity_keys=(self.rabc_velocity_key,),
+                )
+            )
+        input_transforms.append(
+            yam_policy.YamInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)
+        )
         data_transforms = _transforms.Group(
-            inputs=[yam_policy.YamInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            inputs=input_transforms,
             outputs=[yam_policy.YamOutputs()],
         )
 
+        base_config = self.create_base_config(assets_dirs, model_config)
+        extra_horizon_keys = base_config.extra_horizon_keys
+        if self.rabc_velocity_key is not None:
+            extra_horizon_keys = (*extra_horizon_keys, self.rabc_velocity_key)
+
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_config,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            extra_horizon_keys=extra_horizon_keys,
         )
 
 
@@ -727,6 +761,17 @@ class TrainConfig:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
+
+# 30Hz MJWARP-310 sim task datasets, synced from
+# s3://xdof-internal-research/repromo/datasets/lerobot_30hz_mjwarp310/<repo_id>.
+# Each is a YAM-format LeRobot dataset (14-dim state/actions, 3 cameras) with
+# per-frame warp_rm_progress / warp_rm_signed_magnitude reward columns.
+_MJWARP310_SIM_TASKS = (
+    ("hang_mug", "sim_hang_the_mug_on_the_mug_rack", "Hang the mug on the mug rack"),
+    ("load_plates", "sim_load_the_plates_into_the_dish_rack", "Load the plates into the dish rack"),
+    ("sweep_paper", "sim_sweep_away_paper_scraps_from_the_table", "Sweep away paper scraps from the table"),
+    ("turn_mug", "sim_turn_the_mug_right_side_up", "Turn the mug right side up"),
+)
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
@@ -1353,6 +1398,54 @@ _CONFIGS = [
         ),
         wandb_enabled=False,
     ),
+    #
+    # Pi0 mjwarp310 sim training configs — per-task RABC vs vanilla BC pairs
+    # on the 30Hz sim datasets (see _MJWARP310_SIM_TASKS for the dataset list).
+    #
+    # RABC variant: final-action gate — keep a chunk iff the final-frame
+    # warp_rm_signed_magnitude > 1.0 — with no upper cap on the kept-chunk
+    # weight (clip_max=inf) so the weight reflects raw RM magnitude instead of
+    # saturating. The vanilla BC twin trains on the same data with the reward
+    # column ignored, at a matched 30k-step budget (default cosine decay_steps
+    # is 30k, so the schedule spans the full run for both).
+    *[
+        TrainConfig(
+            name=f"pi0_sim_{short}_rabc_finalaction_thr100_nomax",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamRormDataConfig(
+                repo_id=repo_id,
+                default_prompt=prompt,
+                base_config=DataConfig(prompt_from_task=True),
+                rabc_velocity_key="warp_rm_signed_magnitude",
+                rabc_use_final_action_condition=True,
+                rabc_threshold=1.0,
+                rabc_clip_max=float("inf"),
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+            num_train_steps=30_000,
+            rabc_enabled=True,
+        )
+        for short, repo_id, prompt in _MJWARP310_SIM_TASKS
+    ],
+    *[
+        TrainConfig(
+            name=f"pi0_sim_{short}_no_rabc",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotYamDataConfig(
+                repo_id=repo_id,
+                default_prompt=prompt,
+                base_config=DataConfig(prompt_from_task=True),
+            ),
+            batch_size=32,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+            num_train_steps=30_000,
+            rabc_enabled=False,
+        )
+        for short, repo_id, prompt in _MJWARP310_SIM_TASKS
+    ],
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

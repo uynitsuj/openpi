@@ -103,29 +103,51 @@ class RepackTransform(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class ComputeRABCWeights(DataTransformFn):
-    """Compute per-sample RABC weights from rorm_velocity.
+    """Compute per-sample RABC weights from a per-frame RM velocity signal.
 
-    Integrates velocity over the action horizon (area under curve),
-    normalizes by horizon length, and clips to [clip_min, clip_max].
+    Default mode integrates velocity over the action horizon (area under
+    curve), normalizes by horizon length, and clips to [clip_min, clip_max].
 
-    Expects `rorm_velocity` in the data dict as shape (action_horizon,).
-    Produces `sample_weights` as a scalar float.
+    When `use_final_action_condition` is True, skips integration and gates
+    purely on the final-frame velocity: keep iff vel[-1] > `threshold`.
+    Kept samples get weight = min(vel[-1], clip_max) — use clip_max=inf for
+    raw RM magnitude — and rejected samples get weight 0. `threshold` must
+    be set in this mode.
+
+    When `threshold` is set without the final-action condition, integrated
+    weights below the threshold are zeroed out instead of clipped to clip_min.
+
+    Reads the first key present among `velocity_keys` (shape
+    (action_horizon,)). Produces `sample_weights` as a scalar float.
     """
 
     clip_min: float = 0.0
     clip_max: float = 1.0
+    threshold: float | None = None
+    use_final_action_condition: bool = False
+    velocity_keys: tuple[str, ...] = ("warp_rm_signed_magnitude", "rorm_velocity")
 
     def __call__(self, data: DataDict) -> DataDict:
-        if "rorm_velocity" not in data:
+        key = next((k for k in self.velocity_keys if k in data), None)
+        if key is None:
             return data
-        vel = np.asarray(data["rorm_velocity"], dtype=np.float32)
-        # Integrate velocity over the action horizon and normalize
-        weight = float(np.sum(vel) / max(len(vel), 1))
-        # Clip to range
-        weight = float(np.clip(weight, self.clip_min, self.clip_max))
+        vel = np.asarray(data[key], dtype=np.float32)
+        if self.use_final_action_condition:
+            if self.threshold is None:
+                raise ValueError("use_final_action_condition requires threshold to be set.")
+            final_vel = float(vel[-1])
+            weight = min(final_vel, self.clip_max) if final_vel > self.threshold else 0.0
+        else:
+            # Integrate velocity over the action horizon and normalize
+            weight = float(np.sum(vel) / max(len(vel), 1))
+            if self.threshold is not None and weight < self.threshold:
+                weight = 0.0
+            else:
+                weight = float(np.clip(weight, self.clip_min, self.clip_max))
         data = {**data, "sample_weights": np.float32(weight)}
         # Remove raw velocity from dict (not needed downstream)
-        data.pop("rorm_velocity", None)
+        for k in self.velocity_keys:
+            data.pop(k, None)
         return data
 
 

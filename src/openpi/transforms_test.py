@@ -119,3 +119,42 @@ def test_extract_prompt_from_task():
 
     with pytest.raises(ValueError, match="task_index=2 not found in task mapping"):
         transform({"task_index": 2})
+
+
+def test_compute_rabc_weights_integration_mode():
+    transform = _transforms.ComputeRABCWeights(clip_min=0.0, clip_max=1.0)
+
+    data = transform({"rorm_velocity": np.array([0.5, 1.0, 1.5]), "state": np.zeros(3)})
+    assert data["sample_weights"] == np.float32(1.0)  # mean=1.0, clipped to 1.0
+    assert "rorm_velocity" not in data
+
+    # No velocity key (e.g. at inference): passthrough.
+    data = {"state": np.zeros(3)}
+    assert transform(data) is data
+
+
+def test_compute_rabc_weights_final_action_gate():
+    transform = _transforms.ComputeRABCWeights(
+        threshold=1.0,
+        use_final_action_condition=True,
+        clip_max=float("inf"),
+        velocity_keys=("warp_rm_signed_magnitude",),
+    )
+
+    # Final-frame velocity above the threshold: kept, weight is the raw
+    # magnitude since there is no upper cap.
+    kept = transform({"warp_rm_signed_magnitude": np.array([0.0, 0.5, 3.5]), "state": np.zeros(3)})
+    assert kept["sample_weights"] == np.float32(3.5)
+    assert "warp_rm_signed_magnitude" not in kept
+
+    # Final-frame velocity at/below the threshold: rejected, weight 0 even if
+    # earlier frames in the chunk had high velocity.
+    rejected = transform({"warp_rm_signed_magnitude": np.array([5.0, 5.0, 1.0])})
+    assert rejected["sample_weights"] == np.float32(0.0)
+
+
+def test_compute_rabc_weights_final_action_requires_threshold():
+    transform = _transforms.ComputeRABCWeights(use_final_action_condition=True)
+
+    with pytest.raises(ValueError, match="requires threshold"):
+        transform({"rorm_velocity": np.array([1.0, 2.0])})

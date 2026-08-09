@@ -25,7 +25,7 @@ class YamInputs(transforms.DataTransformFn):
 
     Expected inputs:
     - left_camera-images-rgb: [channel, height, width] - Left camera
-    - right_camera-images-rgb: [channel, height, width] - Right camera  
+    - right_camera-images-rgb: [channel, height, width] - Right camera
     - top_camera-images-rgb: [channel, height, width] - Top camera
     - state: [14] - Joint positions for both arms (6 joints + 1 gripper per arm)
     - actions: [action_horizon, 14] - Joint actions for both arms (absolute joint space)
@@ -39,7 +39,11 @@ class YamInputs(transforms.DataTransformFn):
 
     # The expected camera names. All input cameras must be in this set. Missing cameras will be
     # replaced with black images and the corresponding `image_mask` will be set to False.
-    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("left_camera-images-rgb", "right_camera-images-rgb", "top_camera-images-rgb")
+    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = (
+        "left_camera-images-rgb",
+        "right_camera-images-rgb",
+        "top_camera-images-rgb",
+    )
 
     def __call__(self, data: dict) -> dict:
         # Get the state. We are padding from 14 to the model action dim.
@@ -66,9 +70,7 @@ class YamInputs(transforms.DataTransformFn):
             return img
 
         # Process available images
-        processed_images = {}
-        for camera_key in in_images:
-            processed_images[camera_key] = convert_image(in_images[camera_key])
+        processed_images = {camera_key: convert_image(image) for camera_key, image in in_images.items()}
 
         # Use the first available image as base image, or create a default
         if processed_images:
@@ -77,12 +79,20 @@ class YamInputs(transforms.DataTransformFn):
             base_image = np.zeros((224, 224, 3), dtype=np.uint8)
 
         match self.model_type:
-            case _model.ModelType.PI0:
-                # Map YAM cameras to standard PI0 camera names
+            case _model.ModelType.PI0 | _model.ModelType.PI05:
+                # Pi0 and Pi0.5 use the same camera slots. Pi0.5 tokenizes
+                # the state differently downstream, but its observation
+                # layout remains identical here.
                 images = {
-                    "base_0_rgb": processed_images.get("top_camera-images-rgb", np.zeros_like(base_image)),  # Top camera as base
-                    "left_wrist_0_rgb": processed_images.get("left_camera-images-rgb", np.zeros_like(base_image)),  # Left camera
-                    "right_wrist_0_rgb": processed_images.get("right_camera-images-rgb", np.zeros_like(base_image)),  # Right camera
+                    "base_0_rgb": processed_images.get(
+                        "top_camera-images-rgb", np.zeros_like(base_image)
+                    ),  # Top camera as base
+                    "left_wrist_0_rgb": processed_images.get(
+                        "left_camera-images-rgb", np.zeros_like(base_image)
+                    ),  # Left camera
+                    "right_wrist_0_rgb": processed_images.get(
+                        "right_camera-images-rgb", np.zeros_like(base_image)
+                    ),  # Right camera
                 }
                 image_masks = {
                     "base_0_rgb": "top_camera-images-rgb" in processed_images,
@@ -118,6 +128,12 @@ class YamInputs(transforms.DataTransformFn):
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+
+        # RABC weights are scalar per-example values. Preserve them through
+        # the policy adapter so the training loop can apply the per-sample
+        # reweighting after the model returns its action-chunk losses.
+        if "sample_weights" in data:
+            inputs["sample_weights"] = np.asarray(data["sample_weights"], dtype=np.float32)
 
         return inputs
 

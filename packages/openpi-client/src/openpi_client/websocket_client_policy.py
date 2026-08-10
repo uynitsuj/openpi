@@ -53,6 +53,15 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             raise RuntimeError(f"Error in inference server:\n{response}")
         return msgpack_numpy.unpackb(response)
 
+    def infer_batch(self, obs_list) -> list:  # noqa: UP006
+        """One batched model forward for a list of observations (batch-aware servers)."""
+        data = self._packer.pack({"__batch__": list(obs_list)})
+        self._ws.send(data)
+        response = self._ws.recv()
+        if isinstance(response, str):
+            raise RuntimeError(f"Error in inference server:\n{response}")
+        return msgpack_numpy.unpackb(response)["__batch__"]
+
     @override
     def reset(self) -> None:
         pass

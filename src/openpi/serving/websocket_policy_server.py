@@ -58,7 +58,12 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                if isinstance(obs, dict) and "__batch__" in obs:
+                    # Batched request: a list of observations under "__batch__"
+                    # -> one batched model forward, list reply under the same key.
+                    action = {"__batch__": self._policy.infer_batch(obs["__batch__"])}
+                else:
+                    action = self._policy.infer(obs)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

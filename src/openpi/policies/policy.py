@@ -105,6 +105,53 @@ class Policy(BasePolicy):
         }
         return outputs
 
+    def infer_batch(self, obs_list: list[dict], *, noise: np.ndarray | None = None) -> list[dict]:
+        """Run ONE batched model forward over multiple observations.
+
+        The input/output transform chains assume single examples (several
+        transforms silently mis-handle a leading batch dim, e.g. the CHW->HWC
+        rearrange and output action slicing), so they run per example on CPU;
+        only the expensive model call is batched. JAX path only.
+        """
+        if self._is_pytorch_model:
+            raise NotImplementedError("infer_batch is only implemented for the JAX model path")
+        if not obs_list:
+            return []
+
+        transformed = []
+        for obs in obs_list:
+            inputs = jax.tree.map(lambda x: x, obs)
+            transformed.append(self._input_transform(inputs))
+        inputs = jax.tree.map(
+            lambda *leaves: jnp.stack([jnp.asarray(leaf) for leaf in leaves], axis=0),
+            *transformed,
+        )
+        self._rng, sample_rng = jax.random.split(self._rng)
+
+        sample_kwargs = dict(self._sample_kwargs)
+        if noise is not None:
+            noise = jnp.asarray(noise)
+            if noise.ndim == 2:  # shared (action_horizon, action_dim) -> per-example
+                noise = jnp.broadcast_to(noise, (len(obs_list), *noise.shape))
+            sample_kwargs["noise"] = noise
+
+        observation = _model.Observation.from_dict(inputs)
+        start_time = time.monotonic()
+        batched_actions = np.asarray(self._sample_actions(sample_rng, observation, **sample_kwargs))
+        model_time = time.monotonic() - start_time
+
+        states = np.asarray(inputs["state"])
+        results = []
+        for i in range(len(obs_list)):
+            outputs = {"state": states[i], "actions": batched_actions[i]}
+            outputs = self._output_transform(outputs)
+            outputs["policy_timing"] = {
+                "infer_ms": model_time * 1000,
+                "batch_size": len(obs_list),
+            }
+            results.append(outputs)
+        return results
+
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata

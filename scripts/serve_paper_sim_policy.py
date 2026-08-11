@@ -19,6 +19,7 @@ from openpi.training import config
 POLICY_CONFIGS = {
     "vanilla": "pi0_warp_rm_sim_bottles_vanilla",
     "warp_rabc_sss15": "pi0_warp_rm_sim_bottles_rabc_sss15",
+    "hang_mug": "pi0_sim_hang_mug",
 }
 DEFAULT_PROMPT = "Put the plastic bottles in the bin"
 
@@ -28,7 +29,7 @@ class Args:
     """Public-only local serving arguments."""
 
     checkpoint_dir: Path
-    policy: Literal["vanilla", "warp_rabc_sss15"] = "vanilla"
+    policy: Literal["vanilla", "warp_rabc_sss15", "hang_mug"] = "vanilla"
     port: int = 8000
     default_prompt: str = DEFAULT_PROMPT
     record: bool = False

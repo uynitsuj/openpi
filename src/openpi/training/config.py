@@ -1353,6 +1353,19 @@ _CONFIGS = [
         ),
         wandb_enabled=False,
     ),
+    # hang_mug sim serving config (repromo checkpoints). Both the rabc and the
+    # vanilla-BC checkpoints share the sim_hang_the_mug_on_the_mug_rack asset id,
+    # so one config serves either parameter tree.
+    TrainConfig(
+        name="pi0_sim_hang_mug",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamDataConfig(
+            repo_id="sim_hang_the_mug_on_the_mug_rack",
+            default_prompt="0",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        wandb_enabled=False,
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

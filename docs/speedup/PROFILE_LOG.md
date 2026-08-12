@@ -61,3 +61,38 @@ profiler trace (sweep 3, running).
   _SYNTHETIC / _LOADER / _TRACE, OPENPI_REMAT_POLICY (gemma.py + siglip.py).
   Originals saved as *.orig. All default-off; the recipe path is byte-identical
   when env vars are unset.
+
+## CONVERGENCE VERDICT — bs128 recipe vs vanilla, same host (cow), n=128 (08-12 15:40 PDT)
+
+speed_bs128_v1: bs128/dots/0.93, 7500 steps = 960k samples (recipe-equal), decay
+rescaled, peak lr unchanged. Baseline: released vanilla ckpt evaluated on the SAME
+host and seeds. Both arms fresh rollouts.
+```
+
+===== tight-anypart  n=128  [PAPER] =====
+  bottles placed:  514/768 -> 509/768
+  bottles/scene:   4.016 -> 3.977   diff -0.039  t(127)=-0.25  p=8.0e-01
+  time/bottle:     10.6 -> 11.0 s   per-scene paired t=1.46 p=1.4e-01
+  throughput:      245 -> 243 /hr   per-scene paired t=-0.27 p=7.9e-01
+  >= 4 placed:     66.4% -> 68.0%
+  >= 5 placed:     42.2% -> 36.7%
+  >= 6 placed:     10.2% -> 11.7%
+```
+
+## CONVERGENCE VERDICT — 2026-08-12 15:40 PDT: NULL, the claim SHIPS
+
+vancow (released vanilla ckpt, fresh rollouts) vs bs128conv (fast-recipe ckpt),
+same host (cow), same 128 canonical seeds, paired, paper rule:
+
+    vancow 4.016 -> bs128conv 3.977   diff -0.039  t(127)=-0.25  p=0.80
+    throughput 245 -> 243/hr (p=0.79)   >=6: 10.2% vs 11.7%
+
+Pre-registered rule: |diff| <= 0.2 and n.s. -> ship with a +/-0.3 bound (n=128
+paired SE ~0.15). Outcome is dead-center null; secondaries agree; vancow
+absolute matches campaign draws (3.885-3.977).
+
+SHIPPED CLAIM: pi0 fine-tune 5h12m -> 3h10m (1.66x) at equal policy quality
+(bounded +/-0.3 bottles/scene), via bs 32->128 + dots remat + 0.93 pool +
+decay rescaled to 7500 + peak lr unchanged. Seed caveat: one recipe draw vs one
+released draw; the lr2x/seed-1 arm (training) adds a second recipe draw, and the
+batched runner makes tighter n cheap.

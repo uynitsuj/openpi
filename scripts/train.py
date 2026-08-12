@@ -1,3 +1,5 @@
+import os
+import time
 import dataclasses
 import functools
 import logging
@@ -367,10 +369,37 @@ def main(config: _config.TrainConfig):
     bc_weight = np.array([0.0])
     mean_weight = 0.0
     rms_mean = 0.0
+    _prof_n = int(os.environ.get('OPENPI_PROFILE_STEPS', '0'))
+    _prof_warmup = int(os.environ.get('OPENPI_PROFILE_WARMUP', '20'))
+    _prof_t0 = None
+    _prof_i = 0
     for step in pbar:
-        with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
+        if os.environ.get('OPENPI_PROFILE_LOADER'):
+            info = {}  # loader-only: no compute, measures max pull rate
+        else:
+            with sharding.set_mesh(mesh):
+                train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
+        if _prof_n:
+            _prof_i += 1
+            if _prof_i == _prof_warmup:
+                jax.block_until_ready(train_state)
+                _prof_t0 = time.time()
+                _tdir = os.environ.get('OPENPI_PROFILE_TRACE')
+                if _tdir:
+                    jax.profiler.start_trace(_tdir)
+            elif os.environ.get('OPENPI_PROFILE_TRACE') and _prof_i == _prof_warmup + 8:
+                jax.block_until_ready(train_state)
+                jax.profiler.stop_trace()
+                print('[PROFILE] trace written', flush=True)
+            elif _prof_t0 is not None and _prof_i >= _prof_warmup + _prof_n:
+                jax.block_until_ready(train_state)
+                _dt = time.time() - _prof_t0
+                _bs = int(config.batch_size)
+                print(f'[PROFILE] steps={_prof_n} wall={_dt:.2f}s '
+                      f'it/s={_prof_n/_dt:.4f} samples/s={_prof_n*_bs/_dt:.2f} '
+                      f'synthetic={bool(os.environ.get("OPENPI_PROFILE_SYNTHETIC"))}', flush=True)
+                break
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
@@ -430,7 +459,10 @@ def main(config: _config.TrainConfig):
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
-        batch = next(data_iter)
+        if os.environ.get('OPENPI_PROFILE_SYNTHETIC'):
+            pass  # reuse the cached batch: measures the pure-compute ceiling
+        else:
+            batch = next(data_iter)
 
         # Online RM: compute per-sample weights and inject into observation
         if config.online_rm_enabled and rm is not None:

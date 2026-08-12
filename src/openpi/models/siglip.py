@@ -16,6 +16,8 @@
 
 from collections.abc import Sequence
 
+import os
+
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
@@ -116,7 +118,7 @@ class Encoder(nn.Module):
     num_heads: int = 12
     dropout: float = 0.0
     scan: bool = False
-    remat_policy: str = "nothing_saveable"
+    remat_policy: str = os.environ.get("OPENPI_REMAT_POLICY", "nothing_saveable")
     dtype_mm: str = "float32"
 
     @nn.compact
@@ -201,7 +203,7 @@ class _Module(nn.Module):
     head_zeroinit: bool = True
     scan: bool = False
     # or "dots_with_no_batch_dims_saveable" for more speed (memory costly)
-    remat_policy: str = "nothing_saveable"
+    remat_policy: str = os.environ.get("OPENPI_REMAT_POLICY", "nothing_saveable")
     dtype_mm: str = "float32"
 
     @nn.compact

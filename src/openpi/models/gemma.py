@@ -31,6 +31,8 @@ from typing import Literal, TypeAlias
 
 import einops
 import flax.linen as nn
+import os
+
 import jax
 import jax.numpy as jnp
 
@@ -360,7 +362,8 @@ class Module(nn.Module):
             Block,
             prevent_cse=False,
             static_argnums=(5,),  # 0=self, 6=deterministic
-            policy=jax.checkpoint_policies.nothing_saveable,
+            policy=getattr(jax.checkpoint_policies,
+                           os.environ.get("OPENPI_REMAT_POLICY", "nothing_saveable")),
         )
         self.layers = nn.scan(
             block_cls,

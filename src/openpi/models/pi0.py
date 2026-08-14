@@ -209,9 +209,15 @@ class Pi0(_model.BaseModel):
             # (e.g. fake_obs / non-conditioning eval) — preserves pi05_base.
             if self.velocity_condition and obs.condition is not None:
                 cond = obs.condition[:, None].astype(time_emb.dtype)  # (b, 1)
-                cond_emb = self.cond_mlp_in(cond)
+                # WARP-CFG: NaN = per-sample classifier-free null. cond_emb is
+                # zeroed for those samples -> exact unconditional branch
+                # (adarms_cond = time_emb), which is pi05_base behavior.
+                keep = ~jnp.isnan(cond)
+                cond_in = jnp.nan_to_num(cond)
+                cond_emb = self.cond_mlp_in(cond_in)
                 cond_emb = nnx.swish(cond_emb)
                 cond_emb = self.cond_mlp_out(cond_emb)
+                cond_emb = jnp.where(keep, cond_emb, jnp.zeros_like(cond_emb))
                 adarms_cond = time_emb + cond_emb
         else:
             # mix timestep + action information using an MLP (no adaRMS)

@@ -583,6 +583,14 @@ class InjectVelocityCondition(DataTransformFn):
     # Fixed condition value written at inference (velocity column absent).
     # None -> no-op at inference (leave condition unset).
     inference_fixed_condition: float | None = None
+    # WARP-CFG: binarize the condition to the o-bit [vel > thr] before writing.
+    # None -> raw velocity (the original velcond arm).
+    binarize_threshold: float | None = None
+    # WARP-CFG: classifier-free dropout — with this probability the training
+    # condition is replaced by NaN. The model zeroes cond_emb for NaN samples
+    # (per-sample unconditional branch == pi05_base behavior), which trains
+    # the marginal the guidance formula needs.
+    cfg_dropout_p: float = 0.0
     # When set, REPLACES the training prompt with this deterministic string
     # (same rationale as InjectSpeedBinPrompt.base_prompt: the prompt_from_task
     # path yields a garbage "0" prompt on lerobot-v3 task tables). Applied only
@@ -610,7 +618,12 @@ class InjectVelocityCondition(DataTransformFn):
             if len(vel) == 0:
                 return data
             # Do NOT pop the velocity key — ComputeRABCWeights runs next.
-            out = {**data, "condition": np.float32(vel[-1])}
+            cond = float(vel[-1])
+            if self.binarize_threshold is not None:
+                cond = 1.0 if cond > self.binarize_threshold else 0.0
+            if self.cfg_dropout_p > 0.0 and np.random.random() < self.cfg_dropout_p:
+                cond = float("nan")  # CFG null sentinel
+            out = {**data, "condition": np.float32(cond)}
             if self.base_prompt is not None:
                 out["prompt"] = self.base_prompt
             return out

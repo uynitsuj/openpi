@@ -974,6 +974,10 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
     # can recompute p90 for a more principled value; only used when
     # velocity_condition=True.
     velocity_condition_inference_value: float = 1.5
+    # WARP-CFG additions (see InjectVelocityCondition): o-bit binarization
+    # threshold and classifier-free condition dropout probability.
+    velocity_condition_binarize_thr: float | None = None
+    velocity_condition_cfg_dropout: float = 0.0
     # Hard Q-filter: keep only the top fraction of episodes by mean rorm_q.
     top_q_frac: float | None = None
     # Length filter: keep only the shortest fraction of episodes by frame count.
@@ -1076,6 +1080,8 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
                 _transforms.InjectVelocityCondition(
                     inference_fixed_condition=self.velocity_condition_inference_value,
                     base_prompt=self.default_prompt,
+                    binarize_threshold=self.velocity_condition_binarize_thr,
+                    cfg_dropout_p=self.velocity_condition_cfg_dropout,
                 )
             )
         rabc_inputs += [

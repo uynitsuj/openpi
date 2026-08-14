@@ -4048,25 +4048,6 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
-    TrainConfig(
-        name="pi0_put_bottles_mjwarp_rabc_sss15_pi05",
-        model=pi0_config.Pi0Config(action_horizon=30, pi05=True),
-        data=LeRobotYamRormDataConfig(
-            repo_id="sim_put_bottles_mjwarp_rmsss15",
-            default_prompt="Put the plastic bottles in the bin",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=True,
-            rabc_threshold=1.00,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
-        num_train_steps=30_000,
-        save_interval=10_000,
-        keep_period=10_000,
-        rabc_enabled=True,
-    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

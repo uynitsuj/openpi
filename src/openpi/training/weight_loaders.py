@@ -46,12 +46,21 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    # Regex matching reference-model param keys that are allowed to be ABSENT
+    # from the checkpoint (kept from the freshly-initialized model instead of
+    # erroring). Default matches LoRA adapters only — the historical behavior.
+    # Arms that add brand-new params on top of a released checkpoint (e.g. the
+    # velocity-conditioning cond_mlp, absent from pi05_base) must widen this so
+    # those params are treated as fresh/zero-init rather than dropped (a
+    # silently-dropped cond_mlp would make conditioning a dead no-op). Existing
+    # configs are unaffected (default unchanged).
+    missing_regex: str = ".*lora.*"
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        # Add all missing weights matched by missing_regex (LoRA by default).
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)

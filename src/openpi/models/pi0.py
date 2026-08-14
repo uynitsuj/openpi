@@ -78,6 +78,7 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.discrete_state_input = config.discrete_state_input
         # ALIGN-style velocity conditioning is only meaningful on the pi0.5
         # AdaRMS pathway; force off for plain pi0 (no adarms_cond exists).
         self.velocity_condition = bool(config.pi05 and config.velocity_condition)
@@ -107,6 +108,13 @@ class Pi0(_model.BaseModel):
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            if not config.discrete_state_input:
+                # Hybrid host: pi0.5 action expert (adaRMS time/cond injection)
+                # with the pi0-style CONTINUOUS state suffix token. Without
+                # this, pi05 + discrete_state_input=False is proprioception-
+                # blind: the model drops the state token AND the transforms
+                # never tokenize state into the prompt.
+                self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
             if self.velocity_condition:
                 # Small MLP: scalar condition -> action-expert width, fused
                 # additively into adarms_cond. Final layer is zero-init so the
@@ -176,7 +184,7 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
-        if not self.pi05:
+        if (not self.pi05) or (not self.discrete_state_input):
             # add a single state token
             state_token = self.state_proj(obs.state)[:, None, :]
             tokens.append(state_token)

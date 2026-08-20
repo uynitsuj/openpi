@@ -252,6 +252,7 @@ def _build_run_script() -> str:
         '# Run training',
         'echo "[INFO] Running training: $CONFIG_NAME exp=$EXP_NAME (resume=$RESUME, extras=$EXTRA_ARGS)"',
         'export XLA_PYTHON_CLIENT_MEM_FRACTION=$XLA_MEM_FRACTION',
+        'export OPENPI_REMAT_POLICY',
         '${WANDB_MODE_ARG}uv run scripts/train.py $CONFIG_NAME \\',
         '  --exp-name=$EXP_NAME \\',
         '  $RESUME_ARG \\',
@@ -343,8 +344,11 @@ def generate_sky_config(
         resources = {'any_of': candidates}
 
     config = {
-        'workdir': '/home/justinyu/openpi',
+        'workdir': '/home/karim/openpi-speedup',
         'envs': {
+            # measured 1.66x recipe (docs/speedup): must be in the env before
+            # python imports openpi.models.siglip (import-time default)
+            'OPENPI_REMAT_POLICY': 'dots_with_no_batch_dims_saveable',
             'DATASET_PATH': dataset_s3_path,
             'CONFIG_NAME': config_name,
             'REPO_ID': repo_id,

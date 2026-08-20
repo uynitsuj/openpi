@@ -3594,6 +3594,75 @@ _CONFIGS = [
         )
         for short, (repo, prompt, base_ckpt) in _WARPBC_TASKS.items()
     ],
+    # ── icrrt E12 curation 3-arm study (real bottles, bs128 speedup recipe) ──
+    # Same 2747-episode pool for all arms (no top_shortest filter), 60k steps
+    # at batch 128 (fsdp 2, per the docs/speedup recipe — OPENPI_REMAT_POLICY
+    # and the 0.93 XLA pool ride in via the sky launcher env). Arm (b) reads
+    # E12's velocity injected as warp_rm_signed_magnitude in <repo>_e12rabc
+    # (final-action gate reproduces the e12_zeroshot keeps exactly,
+    # keep_frac 0.28306); arm (c) reads a seeded random gate (2.0 at
+    # p=0.28306 = E12's keep rate) in <repo>_rndmatch with clip_max=1.0 so
+    # every kept chunk weighs exactly 1.
+    TrainConfig(
+        name="pi0_bottles_e12study_vanilla_bs128",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="put_the_plastic_bottles_in_the_bin_d405_v021_sss45",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
+        num_train_steps=60_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi0_bottles_e12study_e12rabc_thr100_nomax_bs128",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="put_the_plastic_bottles_in_the_bin_d405_v021_e12rabc",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            rabc_clip_max=float("inf"),
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
+        num_train_steps=60_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_bottles_e12study_rndmatch_bs128",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="put_the_plastic_bottles_in_the_bin_d405_v021_rndmatch",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            rabc_clip_max=1.0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
+        num_train_steps=60_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=True,
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

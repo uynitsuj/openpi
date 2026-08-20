@@ -633,6 +633,48 @@ class LoadScizorSidecar(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class LoadVelocitySidecar(DataTransformFn):
+    """Inject a reward-model velocity *window* from a sidecar parquet.
+
+    Lets any RM scoring drive the RABC gate without baking a column into a
+    dataset copy: the sidecar (e.g. icrrt's ``frame_signals.parquet``) has
+    per-frame columns ``episode_index, frame_index, <velocity_column>``, and
+    this transform writes ``data[velocity_key]`` as a
+    ``(action_horizon + lookahead_frames,)`` float32 window starting at the
+    sample's frame, tail-padded with the episode's last value — exactly
+    mirroring lerobot's ``delta_timestamps`` end-of-episode clamping — so
+    ``ComputeRABCWeights`` consumes it as if the column lived in the dataset.
+
+    Episodes absent from the sidecar yield an all-zero window (gated out
+    downstream). Reuses the scizor sidecar loader for the per-episode dense
+    arrays (same parquet shape, module-level cache, s3:// fetch support).
+    """
+
+    sidecar_path: str
+    action_horizon: int
+    lookahead_frames: int = 0
+    velocity_column: str = "velocity"
+    velocity_key: str = "warp_rm_signed_magnitude"
+
+    def __call__(self, data: DataDict) -> DataDict:
+        ep_idx = int(np.asarray(data["episode_index"]).reshape(-1)[0])
+        frame_idx = int(np.asarray(data["frame_index"]).reshape(-1)[0])
+        vel_by_ep = _load_scizor_sidecar(self.sidecar_path, self.velocity_column)
+        h = max(int(self.action_horizon) + int(self.lookahead_frames), 1)
+        ep_vel = vel_by_ep.get(ep_idx)
+        if ep_vel is None:
+            return {**data, self.velocity_key: np.zeros(h, dtype=np.float32)}
+        length = len(ep_vel)
+        t = min(frame_idx, length - 1)
+        end = t + h
+        if end <= length:
+            window = ep_vel[t:end]
+        else:
+            window = np.concatenate([ep_vel[t:length], np.full(end - length, ep_vel[-1], dtype=np.float32)])
+        return {**data, self.velocity_key: window.astype(np.float32)}
+
+
+@dataclasses.dataclass(frozen=True)
 class InjectEpisodeQNorm(DataTransformFn):
     """Deprecated. q_threshold mode now uses min-max normalization on the
     per-frame `repromo_quality` directly, the same as multiplicative/additive

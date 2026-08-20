@@ -1239,6 +1239,105 @@ class LeRobotScizorSidecarDataConfig(LeRobotYamRormDataConfig):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotVelocitySidecarDataConfig(LeRobotYamRormDataConfig):
+    """RABC velocity gating from a sidecar parquet instead of a dataset column.
+
+    Same gate math as the parent (final-action / aggregator modes via
+    ComputeRABCWeights), but the velocity comes from a standalone parquet with
+    per-frame ``episode_index, frame_index, <column>`` rows — e.g. the
+    ``frame_signals.parquet`` written by icrrt's RM scorers. The underlying
+    LeRobot dataset is NOT modified or copied; comparing two reward models is
+    a pure config swap. Local paths or s3:// URLs both work.
+
+    The parent's velocity-column autodetection and horizon fetch are skipped;
+    a LoadVelocitySidecar transform builds each sample's velocity window
+    (lerobot-identical tail clamping), and the subset precompute reads the
+    same sidecar (see data_loader.precompute_valid_indices).
+    """
+
+    velocity_sidecar_path: str = ""
+    velocity_sidecar_column: str = "velocity"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if not self.velocity_sidecar_path:
+            raise ValueError(
+                "LeRobotVelocitySidecarDataConfig requires velocity_sidecar_path "
+                "to point at a parquet with episode_index/frame_index/velocity columns."
+            )
+        if self.rabc_mode != "velocity_only":
+            raise ValueError("velocity sidecar supports rabc_mode='velocity_only' only")
+        # Minimal repack: carry episode_index/frame_index for the sidecar
+        # lookup; read no velocity/quality columns from the dataset parquets.
+        repack_keys = {
+            "left_camera-images-rgb": "left_camera-images-rgb",
+            "right_camera-images-rgb": "right_camera-images-rgb",
+            "top_camera-images-rgb": "top_camera-images-rgb",
+            "state": "state",
+            "actions": "actions",
+            "prompt": "prompt",
+            "episode_index": "episode_index",
+            "frame_index": "frame_index",
+        }
+        repack_transform = _transforms.Group(
+            inputs=[_transforms.RepackTransform(repack_keys)]
+        )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                _transforms.LoadVelocitySidecar(
+                    sidecar_path=self.velocity_sidecar_path,
+                    action_horizon=getattr(model_config, "action_horizon", 0),
+                    lookahead_frames=self.rabc_lookahead_frames,
+                    velocity_column=self.velocity_sidecar_column,
+                ),
+                _transforms.ComputeRABCWeights(
+                    clip_min=self.rabc_clip_min,
+                    clip_max=self.rabc_clip_max,
+                    threshold=self.rabc_threshold,
+                    use_final_action_condition=self.rabc_use_final_action_condition,
+                    mode="velocity_only",
+                    velocity_aggregator=self.rabc_velocity_aggregator,
+                    action_horizon=getattr(model_config, "action_horizon", 0),
+                    weight_power=self.rabc_weight_power,
+                    velocity_scale=self.rabc_velocity_scale,
+                ),
+                yam_policy.YamInputs(action_dim=model_config.action_dim, model_type=model_config.model_type),
+            ],
+            outputs=[yam_policy.YamOutputs()],
+        )
+
+        # Episode split — same semantics as the parent.
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+        episodes: tuple[int, ...] | None = None
+        val_episodes: tuple[int, ...] | None = None
+        info_path = HF_LEROBOT_HOME / self.repo_id / "meta" / "info.json" if self.repo_id is not None else None
+        if info_path is not None and info_path.exists():
+            val_eps, non_val_eps = _split_val_episodes(self.repo_id, self.val_frac, self.val_seed)
+            val_episodes = val_eps if val_eps else None
+            if self.top_q_frac is not None:
+                episodes = tuple(_top_q_episodes(self.repo_id, self.top_q_frac, exclude_eps=val_eps))
+            elif self.top_shortest_frac is not None:
+                episodes = tuple(_shortest_episodes(self.repo_id, self.top_shortest_frac, exclude_eps=val_eps))
+            elif non_val_eps:
+                episodes = non_val_eps
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            extra_horizon_keys=(),  # velocity window comes from the sidecar
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            episodes=episodes,
+            val_episodes=val_episodes,
+            reject_zero_weighted_samples=self.rabc_reject_zero_weighted,
+            reject_zero_weighted_mode=self.rabc_reject_zero_weighted_mode,
+            extra_horizon_lookahead_frames=0,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -3628,6 +3727,33 @@ _CONFIGS = [
             repo_id="put_the_plastic_bottles_in_the_bin_d405_v021_e12rabc",
             default_prompt="Put the plastic bottles in the bin",
             base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            rabc_clip_max=float("inf"),
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
+        num_train_steps=60_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=True,
+    ),
+    # Sidecar twin of the e12rabc arm: same gate (final-action thr 1.0 nomax)
+    # but the velocity comes from the e12 scorer's frame_signals.parquet at
+    # sample time — trains on the UNMODIFIED base sss45 dataset. Gate decisions
+    # are identical to pi0_bottles_e12study_e12rabc_thr100_nomax_bs128 (the
+    # baked column was generated from this exact parquet).
+    TrainConfig(
+        name="pi0_bottles_e12study_e12rabc_sidecar_bs128",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotVelocitySidecarDataConfig(
+            repo_id="put_the_plastic_bottles_in_the_bin_d405_v021_sss45",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            velocity_sidecar_path="s3://xdof-internal-research/icrrt/curation/bottles_d405_v021_full/e12_zeroshot/frame_signals.parquet",
             rabc_use_final_action_condition=True,
             rabc_threshold=1.00,
             rabc_clip_max=float("inf"),

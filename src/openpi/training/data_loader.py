@@ -271,6 +271,16 @@ def _find_scizor_sidecar_transform(
     return None
 
 
+def _find_velocity_sidecar_transform(
+    data_config: _config.DataConfig,
+) -> _transforms.LoadVelocitySidecar | None:
+    """Locate the LoadVelocitySidecar instance in data_config (if any)."""
+    for t in data_config.data_transforms.inputs:
+        if isinstance(t, _transforms.LoadVelocitySidecar):
+            return t
+    return None
+
+
 def _rabc_cache_key(
     repo_id: str,
     action_horizon: int,
@@ -278,6 +288,7 @@ def _rabc_cache_key(
     episodes: tuple[int, ...] | None,
     lookahead_frames: int = 0,
     scizor_sidecar_path: str | None = None,
+    velocity_sidecar_path: str | None = None,
 ) -> str:
     """Stable hash for the precomputed valid_indices file. Includes everything
     that changes which samples pass the gate: dataset, horizon, RABC params,
@@ -304,6 +315,15 @@ def _rabc_cache_key(
             payload["scizor_sidecar"] = {
                 "path": resolved, "mtime": stat.st_mtime, "size": stat.st_size,
             }
+    if velocity_sidecar_path:
+        if velocity_sidecar_path.startswith("s3://"):
+            payload["velocity_sidecar"] = {"path": velocity_sidecar_path}
+        else:
+            resolved = str(pathlib.Path(velocity_sidecar_path).resolve())
+            stat = pathlib.Path(resolved).stat()
+            payload["velocity_sidecar"] = {
+                "path": resolved, "mtime": stat.st_mtime, "size": stat.st_size,
+            }
     blob = json.dumps(payload, sort_keys=True, default=str).encode()
     return hashlib.sha1(blob).hexdigest()[:16]
 
@@ -319,6 +339,8 @@ def precompute_valid_indices(
     spot_check: bool = True,
     scizor_sidecar_path: str | None = None,
     scizor_score_column: str = "scizor_score",
+    velocity_sidecar_path: str | None = None,
+    velocity_sidecar_column: str = "velocity",
 ) -> np.ndarray:
     """Walk the lerobot v3 parquets, apply the RABC gate offline, and return
     the flat (post-episode-filter) indices of samples whose weight > 0.
@@ -347,7 +369,7 @@ def precompute_valid_indices(
         )
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / (
-        f"{_rabc_cache_key(repo_id, action_horizon, rabc, episodes, lookahead_frames, scizor_sidecar_path)}.npy"
+        f"{_rabc_cache_key(repo_id, action_horizon, rabc, episodes, lookahead_frames, scizor_sidecar_path, velocity_sidecar_path)}.npy"
     )
     logging.info(
         f"[rabc_precompute] {repo_id} H={action_horizon} mode={rabc.mode} "
@@ -430,19 +452,28 @@ def precompute_valid_indices(
         logging.info(f"[rabc_precompute] cached → {cache_path}")
         return valid
 
-    # 2) Read data parquets. Only pull the columns we need (velocity, optional
-    # quality, and the parquet 'index' column to verify global flat ordering).
+    # 2) Velocity source: either a sidecar parquet (episode_index/frame_index/
+    # velocity — no dataset columns touched) or the data parquets themselves.
+    sidecar_eps: dict[int, np.ndarray] | None = None
+    if velocity_sidecar_path:
+        sidecar_eps = _transforms._load_scizor_sidecar(  # noqa: SLF001 — shared per-episode loader
+            velocity_sidecar_path, velocity_sidecar_column
+        )
+    # Read data parquets. Only pull the columns we need (velocity when no
+    # sidecar, optional quality, and the parquet 'index' column to verify
+    # global flat ordering).
     needed_cols = ["index", "episode_index", "frame_index"]
     vel_col = None
-    for c in ("warp_rm_signed_magnitude", "repromo_signed_magnitude", "rorm_velocity"):
-        if c in _pq.read_schema(sorted((root / "data").rglob("*.parquet"))[0]).names:
-            vel_col = c
-            break
-    if vel_col is None:
-        raise KeyError(
-            f"No velocity column ('repromo_signed_magnitude' or 'rorm_velocity') in {root}"
-        )
-    needed_cols.append(vel_col)
+    if sidecar_eps is None:
+        for c in ("warp_rm_signed_magnitude", "repromo_signed_magnitude", "rorm_velocity"):
+            if c in _pq.read_schema(sorted((root / "data").rglob("*.parquet"))[0]).names:
+                vel_col = c
+                break
+        if vel_col is None:
+            raise KeyError(
+                f"No velocity column ('repromo_signed_magnitude' or 'rorm_velocity') in {root}"
+            )
+        needed_cols.append(vel_col)
 
     use_q = rabc.mode != "velocity_only" and rabc.q_min is not None and rabc.q_max is not None
     q_col = None
@@ -464,7 +495,7 @@ def precompute_valid_indices(
             f"parquet 'index' column is not a contiguous 0..N-1 range: "
             f"start={int(df['index'].iloc[0])}, end={int(df['index'].iloc[-1])}, n={n_global}"
         )
-    vel_global = df[vel_col].to_numpy(dtype=np.float32)
+    vel_global = df[vel_col].to_numpy(dtype=np.float32) if vel_col is not None else None
     q_global = df[q_col].to_numpy(dtype=np.float32) if q_col is not None else None
 
     # 3) Build the global→filtered index mapping. lerobot iterates episodes in
@@ -498,7 +529,18 @@ def precompute_valid_indices(
             raise ValueError(
                 f"ep {ep}: dataset_to-from={g_to-g_from} != length={L}"
             )
-        ep_vel = vel_global[g_from:g_to]
+        if sidecar_eps is not None:
+            ep_vel = sidecar_eps.get(int(ep))
+            if ep_vel is None:
+                ep_vel = np.zeros(L, dtype=np.float32)  # missing ep → gated out
+            elif len(ep_vel) < L:
+                ep_vel = np.concatenate(  # defensive tail pad, mirrors transform
+                    [ep_vel, np.full(L - len(ep_vel), ep_vel[-1], dtype=np.float32)]
+                )
+            else:
+                ep_vel = ep_vel[:L]
+        else:
+            ep_vel = vel_global[g_from:g_to]
         ep_q = q_global[g_from:g_to] if q_global is not None else None
         last_v = float(ep_vel[-1])
         for offset in range(L):
@@ -527,7 +569,14 @@ def precompute_valid_indices(
     )
 
     if spot_check and len(valid) > 0:
-        _spot_check_valid_indices(repo_id, action_horizon, rabc, episodes, valid, lookahead_frames=lookahead_frames)
+        if sidecar_eps is not None:
+            # The dataset carries no velocity column to re-derive from, so the
+            # getitem cross-check can't run; the transform and this precompute
+            # share the same sidecar loader + windowing, which is the invariant
+            # the spot check exists to protect.
+            logging.info("[rabc_precompute] sidecar mode: skipping getitem spot check")
+        else:
+            _spot_check_valid_indices(repo_id, action_horizon, rabc, episodes, valid, lookahead_frames=lookahead_frames)
 
     np.save(cache_path, valid)
     logging.info(f"[rabc_precompute] cached → {cache_path}")
@@ -789,14 +838,20 @@ def create_torch_data_loader(
         rabc = _find_rabc_transform(data_config)
         if rabc is not None and data_config.repo_id not in (None, "fake"):
             scizor_xf = _find_scizor_sidecar_transform(data_config)
+            vel_xf = _find_velocity_sidecar_transform(data_config)
             valid_indices = precompute_valid_indices(
                 data_config.repo_id,
                 action_horizon=action_horizon,
                 rabc=rabc,
                 episodes=data_config.episodes,
-                lookahead_frames=getattr(data_config, "extra_horizon_lookahead_frames", 0),
+                lookahead_frames=(
+                    vel_xf.lookahead_frames if vel_xf is not None
+                    else getattr(data_config, "extra_horizon_lookahead_frames", 0)
+                ),
                 scizor_sidecar_path=scizor_xf.sidecar_path if scizor_xf is not None else None,
                 scizor_score_column=scizor_xf.score_column if scizor_xf is not None else "scizor_score",
+                velocity_sidecar_path=vel_xf.sidecar_path if vel_xf is not None else None,
+                velocity_sidecar_column=vel_xf.velocity_column if vel_xf is not None else "velocity",
             )
             if len(valid_indices) == 0:
                 raise RuntimeError(

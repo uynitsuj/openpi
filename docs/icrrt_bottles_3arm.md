@@ -19,6 +19,23 @@ checkpoints every 10k. Note 60k steps @ bs128 is 4x the sample budget of the
 | `pi0_bottles_e12study_e12rabc_thr100_nomax_bs128` | `..._d405_v021_e12rabc` | final-action, thr 1.0 strict, clip_max=inf (kept chunks loss-weighted by raw velocity) |
 | `pi0_bottles_e12study_rndmatch_bs128` | `..._d405_v021_rndmatch` | final-action, thr 1.0, clip_max=1.0 (kept chunks weigh exactly 1) |
 
+## Sidecar alternative (no dataset copies)
+
+`LeRobotVelocitySidecarDataConfig` gates RABC from a standalone parquet
+(`episode_index, frame_index, velocity` — the shape of icrrt's
+`frame_signals.parquet`) instead of a dataset column, so a new RM scoring is a
+config swap rather than a 25 GB dataset copy. `LoadVelocitySidecar` builds
+each sample's velocity window at sample time (lerobot-identical tail
+clamping) and the subset precompute reads the same sidecar; local paths and
+s3:// both work. Verified equivalent to the baked-column arm: identical
+valid-index arrays (2,192,771 kept) and 800/800 sampled gate decisions/weights
+match `chunk_scores.parquet`.
+
+`pi0_bottles_e12study_e12rabc_sidecar_bs128` is the sidecar twin of the
+e12rabc arm — same gate, trains on the unmodified `_sss45` dataset with the
+sidecar at
+`s3://xdof-internal-research/icrrt/curation/bottles_d405_v021_full/e12_zeroshot/frame_signals.parquet`.
+
 ## Datasets
 
 openpi autodetects the velocity column from a fixed name list, so both injected

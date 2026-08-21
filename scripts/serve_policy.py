@@ -319,6 +319,73 @@ NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
         dir="s3://xdof-internal-research/model_ckpts/pi0_sarm_dense_sparse_rabc_finalaction_thr100_nomax/pi0_sarm_dense_sparse_rabc_finalaction_thr100_nomax_fs2sss45rm_strict_subset_20260510/59999",
         default_prompt="Folding tshirt pile and stacking",
     ),
+          # ── tshirt runs (this session): vanilla BC + single-cam WARP-BC sss sweep                                                                                   
+      #    + multi-cam (mc3, top+L+R concat) sss sweep. All final step 59999.                                                                                      
+      "tshirt_vanilla_bc_59k": Checkpoint(                                                                                                                         
+          config="pi0_tshirt_bc",                                                                                                                                  
+          dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_bc/sky_pi0_tshirt_bc_tshirt_folding_d405_v010_20260420_20260614_233412/59999",                   
+          default_prompt="Folding tshirt pile and stacking",                                                                                                       
+      ),                                                                                                                                                           
+      "tshirt_warpbc_sss15_59k": Checkpoint(                                                                                                                       
+          config="pi0_tshirt_warpbc_sss15",                                                                                                                        
+          dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_warpbc_sss15/sky_pi0_tshirt_warpbc_sss15_tshirt_folding_d405_v010_20260420_gop10_sss15_20260616_010556/59999",                                                                                                                                                    
+          default_prompt="Folding tshirt pile and stacking",                                                                                                       
+      ),                                                                                                                                                           
+      "tshirt_warpbc_sss30_59k": Checkpoint(                                                                                                                       
+          config="pi0_tshirt_warpbc_sss30",                                                                                                                        
+          dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_warpbc_sss30/sky_pi0_tshirt_warpbc_sss30_tshirt_folding_d405_v010_20260420_gop10_sss30_20260616_121554/59999",                                                                                                                                                    
+          default_prompt="Folding tshirt pile and stacking",                                                                                                       
+      ),
+      "tshirt_warpbc_sss45_59k": Checkpoint(
+          config="pi0_tshirt_warpbc_sss45",
+          dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_warpbc_sss45/sky_pi0_tshirt_warpbc_sss45_tshirt_folding_d405_v010_20260420_gop10_sss45_20260615_194413/59999",
+          default_prompt="Folding tshirt pile and stacking",
+      ),
+      "tshirt_warpbc_mc3_sss15_59k": Checkpoint(
+          config="pi0_tshirt_warpbc_mc3_sss15",
+          dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_warpbc_mc3_sss15/sky_pi0_tshirt_warpbc_mc3_sss15_tshirt_folding_d405_v010_20260420_gop10_mc3_sss15_20260616_172132/59999",
+          default_prompt="Folding tshirt pile and stacking",
+      ),
+      "tshirt_warpbc_mc3_sss30_59k": Checkpoint(
+          config="pi0_tshirt_warpbc_mc3_sss30",
+          dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_warpbc_mc3_sss30/sky_pi0_tshirt_warpbc_mc3_sss30_tshirt_folding_d405_v010_20260420_gop10_mc3_sss30_20260616_175522/59999",
+          default_prompt="Folding tshirt pile and stacking",
+      ),
+      "tshirt_warpbc_mc3_sss45_59k": Checkpoint(
+          config="pi0_tshirt_warpbc_mc3_sss45",
+          dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_warpbc_mc3_sss45/sky_pi0_tshirt_warpbc_mc3_sss45_tshirt_folding_d405_v010_20260420_gop10_mc3_sss45_20260616_180059/59999",
+          default_prompt="Folding tshirt pile and stacking",
+      ),
+    "sky_pi0_bottles_warpbc_sss45_put_the_plastic_bottles_in_the_bin_d405_v021_sss45_20260615_122115": Checkpoint(
+        config="pi0_bottles_warpbc_sss45",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_bottles_warpbc_sss45/sky_pi0_bottles_warpbc_sss45_put_the_plastic_bottles_in_the_bin_d405_v021_sss45_20260615_122115/59999",
+        default_prompt="Put the plastic bottles in the bin",
+    ),
+    "sky_pi0_bottles_warpbc_sss30_put_the_plastic_bottles_in_the_bin_d405_v021_sss30_20260615_122006": Checkpoint(
+        config="pi0_bottles_warpbc_sss30",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_bottles_warpbc_sss30/sky_pi0_bottles_warpbc_sss30_put_the_plastic_bottles_in_the_bin_d405_v021_sss30_20260615_122006/59999",
+        default_prompt="Put the plastic bottles in the bin",
+    ),
+    "sky_pi0_bottles_warpbc_sss15_put_the_plastic_bottles_in_the_bin_d405_v021_sss15_20260615_121905": Checkpoint(
+        config="pi0_bottles_warpbc_sss15",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_bottles_warpbc_sss15/sky_pi0_bottles_warpbc_sss15_put_the_plastic_bottles_in_the_bin_d405_v021_sss15_20260615_121905/59999",
+        default_prompt="Put the plastic bottles in the bin",
+    ),
+    "sky_pi0_bottles_bc_put_the_plastic_bottles_in_the_bin_d405_v021_20260614_233310": Checkpoint(
+        config="pi0_bottles_bc",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_bottles_bc/sky_pi0_bottles_bc_put_the_plastic_bottles_in_the_bin_d405_v021_20260614_233310/59999",
+        default_prompt="Put the plastic bottles in the bin",
+    ),
+    "sky_pi0_box_warpbc_sss45_fold_the_paper_box_d405_v021_sss45_20260615_121804": Checkpoint(
+        config="pi0_box_warpbc_sss45",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_box_warpbc_sss45/sky_pi0_box_warpbc_sss45_fold_the_paper_box_d405_v021_sss45_20260615_121804/59999",
+        default_prompt="Fold the paper box",
+    ),
+    "sky_pi0_tshirt_warpbc_sss45_tshirt_folding_d405_v010_20260420_gop10_sss45_20260615_194413": Checkpoint(
+        config="pi0_tshirt_warpbc_sss45",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_warpbc_sss45/sky_pi0_tshirt_warpbc_sss45_tshirt_folding_d405_v010_20260420_gop10_sss45_20260615_194413/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
 }
 
 NamedCheckpointKey = Literal[*NAMED_CHECKPOINTS]

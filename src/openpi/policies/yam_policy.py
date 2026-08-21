@@ -119,6 +119,9 @@ class YamInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        if "sample_weights" in data:
+            inputs["sample_weights"] = np.asarray(data["sample_weights"], dtype=np.float32)
+
         return inputs
 
 

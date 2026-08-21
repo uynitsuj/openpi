@@ -4,7 +4,6 @@ Utility functions for OpenPI SkyPilot training launcher.
 """
 
 import subprocess
-import pandas as pd
 from pathlib import Path
 from typing import Optional, List
 
@@ -47,126 +46,6 @@ def check_prerequisites():
     return True
 
 
-def parse_sky_gpu_output(output: str) -> pd.DataFrame:
-    """Parse tabular output from sky show-gpus into a pandas DataFrame."""
-    lines = output.strip().split('\n')
-
-    data_rows = []
-    current_headers = None
-    header_positions = None
-
-    for line in lines:
-        if not line.strip():
-            continue
-
-        if line.startswith('GPU'):
-            current_headers = []
-            header_positions = []
-
-            words = line.split()
-            search_pos = 0
-            for word in words:
-                pos = line.find(word, search_pos)
-                current_headers.append(word)
-                header_positions.append(pos)
-                search_pos = pos + len(word)
-
-        elif current_headers and header_positions and not line.startswith('-') and len(line.strip()) > 0:
-            row_data = {}
-
-            for i, header in enumerate(current_headers):
-                if i < len(header_positions):
-                    start_pos = header_positions[i]
-
-                    if i + 1 < len(header_positions):
-                        end_pos = header_positions[i + 1]
-                        value = line[start_pos:end_pos].strip()
-                    else:
-                        value = line[start_pos:].strip()
-
-                    if 'PRICE' in header and value.startswith('$'):
-                        value = value.replace('$', '').replace(',', '').strip()
-
-                    if value == '-':
-                        value = None
-
-                    row_data[header] = value
-
-            if row_data:
-                data_rows.append(row_data)
-
-    return pd.DataFrame(data_rows)
-
-
-def query_sky_accelerators(accelerators: str, region: str, service_providers: List[str]) -> dict:
-    """Query SkyPilot for the cheapest service provider for the requested accelerators."""
-    print(f"[INFO] Checking available providers: {service_providers}")
-
-    query_cmd = f"sky check {' '.join(service_providers)}"
-    result = run_command(query_cmd, capture_output=True)
-
-    available_providers = []
-    for provider in service_providers:
-        if f"{provider}: enabled" in result.stdout.lower():
-            available_providers.append(provider)
-
-    if not available_providers:
-        raise RuntimeError(f"No providers available from {service_providers}")
-
-    print(f"[OK] Available providers: {available_providers}")
-
-    all_dataframes = []
-    for provider in available_providers:
-        print(f"[INFO] Querying {provider} for {accelerators}...")
-        query_cmd = f"sky show-gpus {accelerators} --infra {provider}/{region}"
-        try:
-            result = run_command(query_cmd, capture_output=True)
-            if result.stdout.strip():
-                provider_df = parse_sky_gpu_output(result.stdout)
-                if not provider_df.empty:
-                    all_dataframes.append(provider_df)
-                    print(f"[OK] Found {len(provider_df)} options from {provider}/{region}")
-                else:
-                    print(f"[WARN] No options found from {provider}/{region}")
-            else:
-                print(f"[WARN] No output from {provider}/{region}")
-        except Exception as e:
-            print(f"[ERROR] Error querying {provider}/{region}: {e}")
-
-    if all_dataframes:
-        df = pd.concat(all_dataframes, ignore_index=True)
-    else:
-        df = pd.DataFrame()
-
-    if df.empty:
-        raise RuntimeError(f"No GPU options found for {accelerators}")
-
-    if region:
-        df_filtered = df[df['REGION'] == region]
-        if df_filtered.empty:
-            print(f"[WARN] No options found in region {region}, showing all regions")
-            df_filtered = df
-    else:
-        df_filtered = df
-
-    df_filtered = df_filtered.copy()
-    if 'HOURLY_SPOT_PRICE' in df_filtered.columns:
-        df_filtered['HOURLY_SPOT_PRICE'] = pd.to_numeric(df_filtered['HOURLY_SPOT_PRICE'], errors='coerce')
-        cheapest_idx = df_filtered['HOURLY_SPOT_PRICE'].idxmin()
-        cheapest_option = df_filtered.loc[cheapest_idx].to_dict()
-        print(f"[INFO] Cheapest (spot): {cheapest_option['CLOUD']} in {cheapest_option['REGION']} at ${cheapest_option['HOURLY_SPOT_PRICE']}/hour")
-    else:
-        df_filtered['HOURLY_PRICE'] = pd.to_numeric(df_filtered['HOURLY_PRICE'], errors='coerce')
-        cheapest_idx = df_filtered['HOURLY_PRICE'].idxmin()
-        cheapest_option = df_filtered.loc[cheapest_idx].to_dict()
-        print(f"[INFO] Cheapest (on-demand): {cheapest_option['CLOUD']} in {cheapest_option['REGION']} at ${cheapest_option['HOURLY_PRICE']}/hour")
-
-    return {
-        'cheapest_option': cheapest_option,
-        'all_options': list(df_filtered.to_dict('records')),
-        'dataframe': df_filtered,
-    }
-
 
 def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_stats_dir: str) -> str:
     """Upload dataset and norm stats to S3 and return the full S3 path.
@@ -184,7 +63,17 @@ def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_
 
     print(f"[INFO] Uploading dataset from {dataset_path} to {s3_path}")
 
-    upload_cmd = f"aws s3 sync {dataset_path} {s3_path} --exclude 'dp_dataset/*' --exclude 'jpg/*'"
+    # Dropped --delete + excluded videos/*: collaborator uploads canonical
+    # dataset (incl. videos) to S3 first; local copy may be partial
+    # (data+meta only, possibly with 0-byte placeholder mp4s). Without
+    # excluding videos/*, --size-only would overwrite S3's real videos with
+    # local 0-byte stubs. Letting local push data+meta is fine — they're
+    # small and idempotent — but videos must stay S3-canonical.
+    upload_cmd = (
+        f"aws s3 sync {dataset_path} {s3_path} "
+        f"--exclude 'dp_dataset/*' --exclude 'jpg/*' "
+        f"--exclude 'norm_stats/*' --exclude 'videos/*' --size-only"
+    )
     run_command(upload_cmd)
 
     print("[INFO] Verifying upload...")
@@ -197,8 +86,13 @@ def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_
     print(f"[OK] Dataset successfully uploaded to {s3_path}")
 
     norm_stats_dir = Path(norm_stats_dir)
-    if not norm_stats_dir.exists():
-        raise FileNotFoundError(f"Norm stats directory does not exist: {norm_stats_dir}")
+    norm_stats_file = norm_stats_dir / "norm_stats.json"
+    # If norm_stats is missing OR a tiny stub (<200B), skip the upload.
+    # The worker run-script will detect the missing/stub case after S3 sync
+    # and run compute_norm_stats locally, then upload back to S3.
+    if not norm_stats_file.exists() or norm_stats_file.stat().st_size < 200:
+        print(f"[INFO] Local norm_stats missing/stub at {norm_stats_file}; worker will compute.")
+        return s3_path
 
     upload_cmd = f"aws s3 sync '{norm_stats_dir}' '{s3_path}/norm_stats' --delete"
     run_command(upload_cmd)
@@ -216,17 +110,34 @@ def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_
 def _build_setup_script() -> str:
     """Build the cloud-agnostic setup script.
 
-    Installs system-level FFmpeg libraries required by torchcodec for fast
-    video decoding (see docs/dataloader-optimization.md).
+    Installs FFmpeg 7 dev libraries required by both av>=14 (PyAV, needs
+    FFmpeg 7 headers to compile from sdist) and torchcodec (runtime linking).
+    Also installs awscli system-wide so ``aws`` is available before the
+    venv is activated in the run script.
     """
     lines = [
         'echo "[SETUP] Setting up openpi"',
         'conda deactivate 2>/dev/null; conda deactivate 2>/dev/null; true',
-        'apt-get update && apt-get install -y git curl',
         '',
-        '# Install FFmpeg libraries for torchcodec video decoding',
-        'apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev',
+        '# Use sudo when available but still work on root-runner images.',
+        'if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi',
+        'export DEBIAN_FRONTEND=noninteractive',
         '',
+        '# System dependencies',
+        '$SUDO apt-get update && $SUDO apt-get install -y git curl pkg-config software-properties-common awscli',
+        '',
+        '# Install FFmpeg runtime/dev libs for torchcodec. Prefer FFmpeg 7, but',
+        '# fall back to the distro packages if the PPA is unavailable.',
+        'if $SUDO add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg7; then',
+        '  $SUDO apt-get update',
+        'else',
+        '  echo "[SETUP] FFmpeg 7 PPA unavailable; falling back to distro FFmpeg packages"',
+        'fi',
+        '$SUDO apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavdevice-dev libavutil-dev libavfilter-dev libswscale-dev libswresample-dev',
+        '$SUDO ldconfig || true',
+        'ffmpeg -version',
+        '',
+        '# Install uv and set up Python environment',
         'curl -LsSf https://astral.sh/uv/install.sh | sh',
         'source $HOME/.local/bin/env 2>/dev/null || true',
         'uv venv --python 3.11',
@@ -238,12 +149,11 @@ def _build_setup_script() -> str:
     return '\n'.join(lines)
 
 
-def _build_run_script(cloud: str) -> str:
+def _build_run_script() -> str:
     """Build the run script with SkyPilot metadata logging and wandb tagging.
 
-    The ``source /opt/pytorch/bin/activate`` line is only included for AWS,
-    where it is provided by the AWS Deep Learning AMI. Lambda and other
-    providers do not ship this path and the command would fail.
+    Cloud-agnostic: the AWS Deep Learning AMI activation line is always
+    included but uses ``|| true`` so it's a silent no-op on other providers.
     """
     lines = [
         'echo "############################"',
@@ -256,15 +166,12 @@ def _build_run_script(cloud: str) -> str:
         'echo "[INFO] Node rank: $SKYPILOT_NODE_RANK / $SKYPILOT_NUM_NODES"',
         'echo "[INFO] GPUs per node: $SKYPILOT_NUM_GPUS_PER_NODE"',
         '',
-        '# Activate environment',
+        '# Activate environment first so aws/uv are on PATH',
         'conda deactivate 2>/dev/null; conda deactivate 2>/dev/null; true',
         'source .venv/bin/activate',
+        '# AWS Deep Learning AMI PyTorch env (silent no-op on other clouds)',
+        'source /opt/pytorch/bin/activate 2>/dev/null || true',
     ]
-
-    # AWS Deep Learning AMI exposes a PyTorch env at /opt/pytorch/bin/activate.
-    # Lambda (and other providers) do not have this path, so we skip it.
-    if cloud == 'aws':
-        lines.append('source /opt/pytorch/bin/activate 2>/dev/null || true')
 
     lines += [
         '',
@@ -273,79 +180,213 @@ def _build_run_script(cloud: str) -> str:
         'mkdir -p ~/.cache/huggingface/lerobot/',
         'aws s3 sync "$DATASET_PATH" "$HOME/.cache/huggingface/lerobot/${REPO_ID}"',
         '',
-        '# Sync norm stats from S3',
+        '# Sync norm stats from S3 (may be empty if dataset is fresh).',
         'echo "[INFO] Syncing norm stats"',
-        'aws s3 sync "$DATASET_PATH/norm_stats" "$HOME/sky_workdir/assets/$CONFIG_NAME/${REPO_ID}"',
+        'NORM_STATS_DIR="$HOME/sky_workdir/assets/$CONFIG_NAME/${REPO_ID}"',
+        'mkdir -p "$NORM_STATS_DIR"',
+        'aws s3 sync "$DATASET_PATH/norm_stats" "$NORM_STATS_DIR"',
+        '',
+        '# If norm_stats absent on S3 (or stub), compute on this worker with',
+        '# bounded frames (--max-frames 50000 keeps wall time ~30min instead',
+        '# of full-dataset iteration ~3hr). Use .venv/bin/python directly to',
+        '# avoid `uv run` triggering a uv sync mid-train.',
+        'NORM_STATS_FILE="$NORM_STATS_DIR/norm_stats.json"',
+        'NORM_STATS_SIZE=$(stat -c%s "$NORM_STATS_FILE" 2>/dev/null || echo 0)',
+        'if [ "$NORM_STATS_SIZE" -lt 200 ]; then',
+        '  echo "[INFO] norm_stats missing/stub (size=$NORM_STATS_SIZE); computing on worker"',
+        '  .venv/bin/python scripts/compute_norm_stats.py --config-name=$CONFIG_NAME --max-frames=50000',
+        '  COMPUTE_EXIT=$?',
+        '  # Fail-fast: if compute_norm_stats crashed, do NOT upload the local',
+        '  # stub (would pollute S3 for parallel jobs) and do NOT proceed to',
+        '  # training with empty norm_stats (silently corrupts the run).',
+        '  if [ "$COMPUTE_EXIT" -ne 0 ]; then',
+        '    echo "[ERROR] compute_norm_stats.py exited $COMPUTE_EXIT — aborting before training to avoid silent corruption"',
+        '    exit $COMPUTE_EXIT',
+        '  fi',
+        '  # Verify the produced file is non-stub before uploading.',
+        '  NEW_SIZE=$(stat -c%s "$NORM_STATS_FILE" 2>/dev/null || echo 0)',
+        '  if [ "$NEW_SIZE" -lt 200 ]; then',
+        '    echo "[ERROR] compute_norm_stats.py exited 0 but produced a stub ($NEW_SIZE bytes); aborting"',
+        '    exit 1',
+        '  fi',
+        '  echo "[INFO] Uploading computed norm_stats ($NEW_SIZE bytes) to S3 for reuse by parallel jobs"',
+        '  aws s3 cp "$NORM_STATS_FILE" "$DATASET_PATH/norm_stats/norm_stats.json"',
+        'else',
+        '  echo "[INFO] Using existing norm_stats ($NORM_STATS_SIZE bytes)"',
+        'fi',
         '',
         '# Export SkyPilot metadata for wandb tagging',
         'export SKYPILOT_CLUSTER_NAME=$(echo $SKYPILOT_CLUSTER_INFO | python3 -c "import sys,json; print(json.load(sys.stdin)[\'cluster_name\'])" 2>/dev/null || echo "unknown")',
         'export WANDB_TAGS="skypilot,$SKYPILOT_CLUSTER_NAME"',
         'export WANDB_NOTES="task_id=$SKYPILOT_TASK_ID cluster=$SKYPILOT_CLUSTER_NAME"',
         '',
+        '# Auto-resume for preemption/spot safety. SkyPilot re-runs this script on',
+        '# a fresh instance after a spot preemption or machine failure. If this run',
+        '# already has step checkpoints in S3 (from a prior attempt), resume from',
+        '# the LATEST one instead of overwriting and restarting from scratch. Also',
+        '# honors an explicit RESUME=true (manual resume of a stopped run).',
+        'LOCAL_CKPT_DIR="$CHECKPOINT_BASE_DIR/$CONFIG_NAME/$EXP_NAME"',
+        '# Latest step already present in S3 (checkpoint step dirs are named by int step).',
+        'LATEST_S3_STEP=$(aws s3 ls "$S3_CHECKPOINT_PATH/" 2>/dev/null | grep -oE "PRE [0-9]+/" | grep -oE "[0-9]+" | sort -n | tail -1)',
+        'if [ -n "$LATEST_S3_STEP" ]; then',
+        '  echo "[INFO] Found S3 checkpoint at step $LATEST_S3_STEP; resuming from it"',
+        '  mkdir -p "$LOCAL_CKPT_DIR/$LATEST_S3_STEP"',
+        '  # Pull only the latest step (orbax reconstructs manager state from the',
+        '  # step dir; avoids re-downloading every accumulated checkpoint on each',
+        '  # recovery). Skip partial orbax tmp dirs from an interrupted write.',
+        '  aws s3 sync "$S3_CHECKPOINT_PATH/$LATEST_S3_STEP" "$LOCAL_CKPT_DIR/$LATEST_S3_STEP" \\',
+        '    --exclude "*.orbax-checkpoint-tmp-*"',
+        '  df -h "$LOCAL_CKPT_DIR" | tail -1',
+        '  RESUME_ARG="--resume --no-overwrite"',
+        'elif [ "$RESUME" = "true" ]; then',
+        '  # Manual resume requested but nothing in S3 yet (e.g. preempted before the',
+        '  # first save). --resume is a no-op on an empty dir, so this starts fresh.',
+        '  echo "[INFO] RESUME set but no S3 checkpoint yet; starting fresh"',
+        '  mkdir -p "$LOCAL_CKPT_DIR"',
+        '  RESUME_ARG="--resume --no-overwrite"',
+        'else',
+        '  echo "[INFO] No prior checkpoint in S3; starting fresh"',
+        '  RESUME_ARG="--overwrite"',
+        'fi',
+        '',
+        '# Optional CLI overrides forwarded to train.py only when set.',
+        'EXTRA_ARGS=""',
+        'if [ -n "$NUM_TRAIN_STEPS_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --num-train-steps=$NUM_TRAIN_STEPS_OVERRIDE"; fi',
+        'if [ -n "$SAVE_INTERVAL_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --save-interval=$SAVE_INTERVAL_OVERRIDE"; fi',
+        'if [ -n "$KEEP_PERIOD_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --keep-period=$KEEP_PERIOD_OVERRIDE"; fi',
+        'if [ -n "$FSDP_DEVICES_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --fsdp-devices=$FSDP_DEVICES_OVERRIDE"; fi',
+        '',
         '# Run training',
-        'echo "[INFO] Running training: $CONFIG_NAME exp=$EXP_NAME"',
+        'echo "[INFO] Running training: $CONFIG_NAME exp=$EXP_NAME (resume=$RESUME, extras=$EXTRA_ARGS)"',
         'export XLA_PYTHON_CLIENT_MEM_FRACTION=$XLA_MEM_FRACTION',
         '${WANDB_MODE_ARG}uv run scripts/train.py $CONFIG_NAME \\',
         '  --exp-name=$EXP_NAME \\',
-        '  --overwrite \\',
+        '  $RESUME_ARG \\',
+        '  $EXTRA_ARGS \\',
         '  --checkpoint_base_dir $CHECKPOINT_BASE_DIR \\',
         '  --s3_checkpoint_path $S3_CHECKPOINT_PATH',
+        'TRAIN_EXIT=$?',
         '',
-        '# Final sync after training completes',
-        'echo "[INFO] Final checkpoint sync to S3"',
-        'aws s3 sync ./tmp_checkpoints "$S3_CHECKPOINT_PATH"',
-        'echo "[OK] Training complete"',
+        '# Final sync after training (also runs on crash, since no set -e).',
+        '# IMPORTANT: source must be the per-experiment dir, NOT ./tmp_checkpoints,',
+        '# otherwise S3 ends up with a nested <exp>/<config>/<exp>/... duplicate.',
+        'echo "[INFO] Final checkpoint sync to S3 (train exit=$TRAIN_EXIT)"',
+        'aws s3 sync "$LOCAL_CKPT_DIR" "$S3_CHECKPOINT_PATH"',
+        'echo "[OK] Training complete (exit $TRAIN_EXIT)"',
+        'exit $TRAIN_EXIT',
     ]
     return '\n'.join(lines)
 
 
 def generate_sky_config(
-    cloud: str,
+    providers: List[str],
+    accelerators: List[str],
     dataset_s3_path: str,
     config_name: str,
     exp_name: str,
     repo_id: str,
     s3_checkpoint_base: str,
     wandb_api_key: Optional[str] = None,
-    accelerators: str = "A100:8",
-    region: str = "us-west-2",
-    image_id: Optional[str] = None,
+    provider_regions: Optional[dict[str, str]] = None,
+    aws_regions: Optional[List[str]] = None,
+    aws_image_ids: Optional[dict[str, str]] = None,
+    use_spot: bool = False,
     idle_minutes: int = 10,
     xla_mem_fraction: float = 0.95,
     managed: bool = True,
+    disk_size: int = 512,
+    resume: bool = False,
+    num_train_steps_override: Optional[int] = None,
+    save_interval_override: Optional[int] = None,
+    keep_period_override: Optional[int] = None,
+    fsdp_devices_override: Optional[int] = None,
 ) -> dict:
-    """Generate SkyPilot YAML configuration for any supported cloud provider.
+    """Generate a single SkyPilot YAML with multi-cloud auto-failover.
+
+    Instead of generating separate configs per provider and racing them,
+    this uses SkyPilot's native ``resources.any_of`` to let the scheduler
+    automatically fail over across clouds, regions, and GPU types.
 
     Args:
-        managed: If True (default), the config is intended for ``sky jobs launch``
-                 which auto-tears-down the cluster. Autostop is omitted since
-                 managed jobs handle cleanup. If False, autostop is configured
-                 as a safety net for ``sky launch``.
+        providers: Cloud providers to try, e.g. ["aws", "lambda"].
+        accelerators: GPU specs in preference order, e.g. ["H200:8", "H100:8", "A100-80GB:8"].
+        provider_regions: Optional map pinning providers to a region,
+            e.g. {"aws": "us-west-2"}. Unpinned providers let SkyPilot
+            choose the cheapest available region.
+        aws_regions: Optional list of AWS regions to fail over across,
+            e.g. ["us-west-2", "us-east-1"]. When set, overrides the single
+            ``provider_regions["aws"]`` pin and emits one candidate per
+            (region, accelerator) using the region's AMI from aws_image_ids.
+            Regions without an AMI in aws_image_ids are skipped.
+        aws_image_ids: Map of AWS region to AMI ID for the Deep Learning AMI.
+        use_spot: If True, add a spot variant of every candidate (in addition
+            to the on-demand one). SkyPilot prefers the cheaper spot candidates
+            and falls back to on-demand when no spot capacity is available. On
+            preemption, managed-job recovery re-queues and the run script
+            auto-resumes from the latest S3 checkpoint.
+        managed: If True, config is for ``sky jobs launch`` (auto-teardown).
     """
+    provider_regions = provider_regions or {}
     checkpoint_path = f"{s3_checkpoint_base}/{config_name}/{exp_name}"
     wandb_mode_arg = "" if wandb_api_key else "WANDB_MODE=disabled "
 
-    # Secrets block keeps sensitive values redacted in `sky status` / dashboard
     secrets = {}
     if wandb_api_key:
         secrets['WANDB_API_KEY'] = wandb_api_key
 
-    resources = {
-        'cloud': cloud,
-        'accelerators': accelerators,
-        'region': region,
-    }
+    # Build one resource candidate per (provider, region, accelerator) tuple.
+    # Within any_of entries, accelerators must be a single string.
+    # SkyPilot picks the cheapest available and auto-fails-over.
+    candidates = []
+    for provider in providers:
+        # Determine the region(s) to try for this provider. aws_regions, when
+        # set, expands aws across multiple regions; otherwise fall back to the
+        # single provider_regions pin (which may be None = any region).
+        if provider == 'aws' and aws_regions:
+            regions = list(aws_regions)
+        else:
+            regions = [provider_regions.get(provider)]
 
-    # Managed jobs (sky jobs launch) auto-teardown on completion and don't
-    # support the autostop field. Only add autostop for sky launch mode as
-    # a safety net against leaked instances.
-    if not managed:
-        resources['autostop'] = {
-            'down': True,
-        }
+        for region in regions:
+            infra = f"{provider}/{region}" if region else provider
+
+            for accel in accelerators:
+                entry = {
+                    'infra': infra,
+                    'accelerators': accel,
+                    'disk_size': disk_size,
+                }
+
+                if provider == 'aws' and aws_image_ids:
+                    if region and region in aws_image_ids:
+                        entry['image_id'] = aws_image_ids[region]
+                    elif region and region not in aws_image_ids:
+                        # No AMI for this region — skip it rather than launch
+                        # with an arbitrary default image.
+                        print(f"[WARN] No AMI in aws_image_ids for region {region}; skipping.")
+                        continue
+                    elif not region:
+                        entry['image_id'] = aws_image_ids
+
+                # Prefer spot (cheaper) with on-demand as fallback. SkyPilot's
+                # optimizer orders any_of by price, so the spot variant is tried
+                # first and on-demand only when no spot capacity exists anywhere.
+                if use_spot:
+                    candidates.append({**entry, 'use_spot': True})
+                candidates.append(entry)
+
+    if len(candidates) == 1:
+        resources = candidates[0]
+    else:
+        resources = {'any_of': candidates}
+
+    # Repo root = parents[3] of src/openpi/utils/sky_utils.py. Derived at
+    # runtime so the launcher works regardless of which user/home checks out
+    # the repo (was previously hardcoded to a specific user's home dir).
+    repo_root = str(Path(__file__).resolve().parents[3])
 
     config = {
-        'workdir': '.',
+        'workdir': repo_root,
         'envs': {
             'DATASET_PATH': dataset_s3_path,
             'CONFIG_NAME': config_name,
@@ -355,34 +396,55 @@ def generate_sky_config(
             'S3_CHECKPOINT_PATH': checkpoint_path,
             'WANDB_MODE_ARG': wandb_mode_arg,
             'XLA_MEM_FRACTION': str(xla_mem_fraction),
+            'RESUME': 'true' if resume else 'false',
+            'NUM_TRAIN_STEPS_OVERRIDE': str(num_train_steps_override) if num_train_steps_override is not None else '',
+            'SAVE_INTERVAL_OVERRIDE': str(save_interval_override) if save_interval_override is not None else '',
+            'KEEP_PERIOD_OVERRIDE': str(keep_period_override) if keep_period_override is not None else '',
+            'FSDP_DEVICES_OVERRIDE': str(fsdp_devices_override) if fsdp_devices_override is not None else '',
         },
         'resources': resources,
         'num_nodes': 1,
         'setup': _build_setup_script(),
-        'run': _build_run_script(cloud),
+        'run': _build_run_script(),
     }
 
     if secrets:
         config['secrets'] = secrets
 
-    if cloud == 'aws' and image_id:
-        config['resources']['image_id'] = image_id
-
     return config
+
+
+def _parse_job_id_from_output(output: str) -> Optional[str]:
+    """Extract the managed job ID from ``sky jobs launch`` output.
+
+    Looks for patterns like ``sky jobs logs 219`` or ``Job ID: 219`` in the
+    output to reliably capture the ID without a separate queue query.
+    """
+    import re
+    # sky jobs launch prints hints like: "sky jobs logs <id>"
+    match = re.search(r'sky jobs logs\s+(?:--controller\s+)?(\d+)', output)
+    if match:
+        return match.group(1)
+    # Fallback: "Job ID: <id>" or "Managed job ID: <id>"
+    match = re.search(r'[Jj]ob ID:\s*(\d+)', output)
+    if match:
+        return match.group(1)
+    return None
 
 
 def launch_training(config_file: Path, cluster_name: Optional[str] = None, managed: bool = False):
     """Launch the training job using SkyPilot.
 
-    Args:
-        config_file: Path to the SkyPilot YAML config.
-        cluster_name: Optional cluster name.
-        managed: If True, use ``sky jobs launch`` for guaranteed auto-teardown
-                 on completion. Recommended to prevent leaked GPU instances.
+    For managed jobs, streams the launch output (provisioning/setup) to the
+    terminal, parses the job ID, then tails the actual task logs so the user
+    sees training output without having to run ``sky jobs logs`` manually.
     """
     if managed:
         print(f"[INFO] Launching managed job with config: {config_file}")
-        launch_cmd = f"sky jobs launch '{config_file}' --yes"
+        # --detach-run: return as soon as the job is submitted to the controller
+        # instead of streaming worker logs. Lets batch launchers advance
+        # through multiple configs without blocking on the actual training run.
+        launch_cmd = f"sky jobs launch '{config_file}' --yes --detach-run"
         if cluster_name:
             launch_cmd += f" -n {cluster_name}"
     else:
@@ -391,5 +453,36 @@ def launch_training(config_file: Path, cluster_name: Optional[str] = None, manag
         if cluster_name:
             launch_cmd += f" --cluster-name {cluster_name}"
 
-    run_command(launch_cmd)
+    if not managed:
+        run_command(launch_cmd)
+        print("[OK] Training job launched successfully!")
+        return
+
+    # For managed jobs: tee the launch output to the terminal while
+    # capturing it so we can parse the job ID for log tailing.
+    print(f"[RUN] {launch_cmd}")
+    captured_lines = []
+    proc = subprocess.Popen(
+        launch_cmd, shell=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    for line in proc.stdout:
+        print(line, end='', flush=True)
+        captured_lines.append(line)
+    proc.wait()
+
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, launch_cmd)
+
     print("[OK] Training job launched successfully!")
+
+    # Parse job ID from the launch output. Skip log tailing so batch
+    # launches can advance through multiple configs without blocking.
+    output = ''.join(captured_lines)
+    job_id = _parse_job_id_from_output(output)
+    if job_id:
+        print(f"[INFO] Submitted job {job_id}. Tail with: sky jobs logs {job_id}")
+    else:
+        print("[WARN] Could not parse job ID from launch output. "
+              "Run 'sky jobs queue' to find it.")
+

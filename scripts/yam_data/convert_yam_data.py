@@ -118,8 +118,8 @@ def extract_task_name_from_episode(episode_data: dict, episode_path: Path) -> st
 
 # Import LeRobotDataset for hub operations
 try:
-    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-    from lerobot.common.datasets.utils import write_episode_stats
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.datasets.utils import write_episode_stats
     HAS_LEROBOT = True
 except ImportError:
     print("Warning: LeRobot not available. Hub push functionality disabled.")

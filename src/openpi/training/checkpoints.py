@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
+import subprocess
 from typing import Protocol
 
 from etils import epath
@@ -68,6 +69,7 @@ def save_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
+    s3_checkpoint_path: str | None = None,
 ):
     def save_assets(directory: epath.Path):
         # Save the normalization stats.
@@ -85,6 +87,22 @@ def save_state(
         "params": {"params": params},
     }
     checkpoint_manager.save(step, items)
+
+    if s3_checkpoint_path is not None:
+        _sync_to_s3(checkpoint_manager.directory, s3_checkpoint_path, step)
+
+
+def _sync_to_s3(local_checkpoint_dir: epath.Path, s3_checkpoint_path: str, step: int):
+    """Sync a checkpoint step to S3 via ``aws s3 sync``."""
+    s3_step_path = f"{s3_checkpoint_path.rstrip('/')}/{step}"
+    local_step_path = str(local_checkpoint_dir / str(step))
+    cmd = ["aws", "s3", "sync", local_step_path, s3_step_path, "--delete"]
+    logging.info(f"Syncing checkpoint step {step} to S3: {s3_step_path}")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        logging.info(f"S3 sync complete for step {step}")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"S3 sync failed for step {step}: {e.stderr}")
 
 
 def restore_state(

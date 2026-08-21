@@ -27,7 +27,7 @@ should look something like:
   Lambda [compute]
 ```
 
-To enable a cloud, follow the hints above and run: `uv sky check`
+To enable a cloud, follow the hints above and run: `uv run sky check`
 If any problems remain, refer to detailed docs at: https://docs.skypilot.co/en/latest/getting-started/installation.html
 
 To use SkyPilot API server: http://127.0.0.1:46580

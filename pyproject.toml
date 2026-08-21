@@ -55,7 +55,7 @@ dev = [
 ]
 sky = [
     "awscli",
-    "skypilot-nightly[aws,lambda]",
+    "skypilot[aws,lambda]==0.12.0",
 ]
 
 [tool.uv]

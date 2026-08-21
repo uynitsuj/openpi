@@ -1,4 +1,5 @@
 import logging
+import os
 
 import einops
 import flax.nnx as nnx
@@ -14,6 +15,16 @@ import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
+
+# ---- Debug toggles (read once at import time, no tracing cost in prod) -----
+# RTC_DEBUG=1 enables per-denoising-step jax.debug.print stats inside the RTC
+# loop. Each print is a host-device callback (forces a GPU→CPU sync) — cheap
+# in absolute terms but non-zero, so leave this off unless debugging.
+# JAX_LOG_COMPILES=1 (set via env) makes JAX log every JIT compile event —
+# useful to confirm the RTC denoiser is only compiled once, not per-call.
+RTC_DEBUG: bool = os.environ.get("RTC_DEBUG", "").lower() in ("1", "true", "yes")
+if RTC_DEBUG:
+    logger.warning("RTC_DEBUG=1 — per-denoising-step jax.debug.print is ENABLED (adds latency)")
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -221,7 +232,35 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        # --- Real-Time Chunking (RTC) --------------------------------------- #
+        # When ``action_prefix`` is supplied, dispatch to the RTC-guided
+        # denoiser (``sample_actions_rtc``). Otherwise this function is the
+        # byte-identical original pre-RTC implementation — no behavior change
+        # for existing callers.
+        action_prefix: at.Float[at.Array, "b tp ad"] | None = None,
+        inference_delay: int | at.Int[at.Array, ""] = 0,
+        execution_horizon: int | None = None,
+        # Max clamp on the RTC guidance weight. The raw schedule (c · inv_r2)
+        # diverges at t=0 and t=1, so we clamp here. Default 2.0 is a safe
+        # midpoint on π0-family policies assuming the action_prefix has been
+        # normalized into model-space (see Policy._rtc_action_normalizer).
+        # Symptoms of too-high: guided v_t sign-flips in the [rtc] trace and
+        # new chunks start far from obs. Too-low: RTC barely tracks the
+        # prefix and you'll see residual chunk-boundary jitter.
+        max_guidance_weight: float | at.Float[at.Array, ""] = 2.0,
     ) -> _model.Actions:
+        if action_prefix is not None:
+            return self.sample_actions_rtc(
+                rng,
+                observation,
+                num_steps=num_steps,
+                noise=noise,
+                action_prefix=action_prefix,
+                inference_delay=inference_delay,
+                execution_horizon=execution_horizon,
+                max_guidance_weight=max_guidance_weight,
+            )
+
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -273,6 +312,169 @@ class Pi0(_model.BaseModel):
         def cond(carry):
             x_t, time = carry
             # robust to floating-point error
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return x_0
+
+    def sample_actions_rtc(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        action_prefix: at.Float[at.Array, "b tp ad"],
+        inference_delay: int | at.Int[at.Array, ""] = 0,
+        execution_horizon: int | None = None,
+        # Max clamp on the RTC guidance weight. The raw schedule (c · inv_r2)
+        # diverges at t=0 and t=1, so we clamp here. Default 2.0 is a safe
+        # midpoint on π0-family policies assuming the action_prefix has been
+        # normalized into model-space (see Policy._rtc_action_normalizer).
+        # Symptoms of too-high: guided v_t sign-flips in the [rtc] trace and
+        # new chunks start far from obs. Too-low: RTC barely tracks the
+        # prefix and you'll see residual chunk-boundary jitter.
+        max_guidance_weight: float | at.Float[at.Array, ""] = 2.0,
+    ) -> _model.Actions:
+        """Real-Time-Chunking-guided variant of ``sample_actions``.
+
+        Identical to ``sample_actions`` except the inner denoising step adds a
+        correction term that keeps the first ``execution_horizon`` actions of
+        the generated chunk coherent with ``action_prefix`` (the unexecuted
+        tail of the previously-emitted chunk that the robot is still committed
+        to executing while this inference runs).
+
+        Implementation mirrors Physical Intelligence's Kinetix RTC and
+        LeRobot's ``RTCProcessor.denoise_step``, but uses ``jax.vjp`` in place
+        of ``torch.autograd.grad`` so it integrates cleanly with the existing
+        ``lax.while_loop``.
+
+        Reference: https://arxiv.org/abs/2506.07339
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        # Fill KV cache with the prefix forward pass (unchanged from sample_actions).
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        T = self.action_horizon
+        A = self.action_dim
+
+        # Resolve execution_horizon. If passed as a JAX array / int, keep it
+        # dynamic so value-only changes between inferences don't trigger a
+        # re-JIT (only shape/dtype changes do).
+        if execution_horizon is None:
+            execution_horizon_dyn = jnp.asarray(T, dtype=jnp.float32)
+        else:
+            execution_horizon_dyn = jnp.minimum(
+                jnp.asarray(execution_horizon, dtype=jnp.float32),
+                jnp.asarray(T, dtype=jnp.float32),
+            )
+
+        # Right-pad the prefix to the model's chunk shape (T, A) with zeros —
+        # handles both a shorter prefix near chunk drain (T_prev < T) AND a
+        # narrower action dim from a task-specific client (A_prev < A, e.g.
+        # YAM's bimanual 14-dim vs π0's shared 32-dim action head). Mirrors
+        # LeRobot's RTCProcessor.denoise_step padding step.
+        T_prev = action_prefix.shape[1]
+        A_prev = action_prefix.shape[2]
+        pad_width = (
+            (0, 0),                         # batch
+            (0, max(0, T - T_prev)),        # time / chunk index
+            (0, max(0, A - A_prev)),        # action dim
+        )
+        action_prefix_padded = jnp.pad(action_prefix, pad_width)
+        # And crop if the client sent more than we need along either axis.
+        action_prefix_padded = action_prefix_padded[:, :T, :A]
+
+        # LINEAR prefix-weight schedule:
+        #   idx <  inference_delay        -> 1.0  (robot committed, enforce prefix)
+        #   inference_delay <= idx < eh   -> linear ramp 1 -> 0
+        #   idx >= execution_horizon      -> 0.0  (model free-forms)
+        idx = jnp.arange(T, dtype=jnp.float32)
+        d = jnp.asarray(inference_delay, dtype=jnp.float32)
+        e = execution_horizon_dyn
+        ramp = 1.0 - (idx - d) / jnp.maximum(e - d, 1.0)
+        ramp = jnp.clip(ramp, 0.0, 1.0)
+        prefix_weights_1d = jnp.where(idx < d, jnp.float32(1.0), ramp)
+        prefix_weights_1d = prefix_weights_1d * (idx < e).astype(jnp.float32)
+        prefix_weights = prefix_weights_1d[None, :, None]   # (1, T, 1)
+        max_gw = jnp.asarray(max_guidance_weight, dtype=jnp.float32)
+
+        def denoise(x_t, time):
+            """Base velocity field (same forward pass used by the original step)."""
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask_rep = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask_rep, suffix_attn_mask], axis=-1)
+            assert full_attn_mask.shape == (
+                batch_size,
+                suffix_tokens.shape[1],
+                prefix_tokens.shape[1] + suffix_tokens.shape[1],
+            )
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            assert prefix_out is None
+            return self.action_out_proj(suffix_out[:, -self.action_horizon:])
+
+        def step(carry):
+            x_t, time = carry
+            # VJP gives us the Jacobian-vector product (d x1_t / d x_t)^T @ err
+            # in one backward pass — JAX equivalent of LeRobot's torch.autograd.
+            # With has_aux=True, jax.vjp returns (primals_out, vjp_fn, aux) —
+            # the "primal" is x1_t only, and v_t comes back via aux so we only
+            # pay for one denoise() call.
+            def x1_and_v(xt):
+                vt = denoise(xt, time)
+                x1 = xt - time * vt           # Euler projection to t=0
+                return x1, vt                  # primal=x1 (vjp target), aux=vt
+            x1_t, vjp_fn, v_t = jax.vjp(x1_and_v, x_t, has_aux=True)
+            err = (action_prefix_padded - x1_t) * prefix_weights
+            (correction,) = vjp_fn(err)
+
+            # Time-dependent guidance weight (matches Kinetix / LeRobot):
+            # small at start and end of denoising, peaks in the middle. The
+            # 1e-6 offsets guard the divisions without affecting the schedule
+            # in the interior of [0, 1].
+            tau = 1.0 - time
+            inv_r2 = ((1.0 - tau) ** 2 + tau ** 2) / ((1.0 - tau) ** 2 + 1e-6)
+            c = (1.0 - tau) / (tau + 1e-6)
+            guidance_weight = jnp.minimum(c * inv_r2, max_gw)
+
+            # Per-step stats, Python-level gated (RTC_DEBUG env var, read once
+            # at module import). jax.debug.print inside lax.while_loop is a
+            # host-device callback and costs real latency, so keep off in prod.
+            if RTC_DEBUG:
+                jax.debug.print(
+                    "[rtc] t={} gw={} |v_t|={} |corr|={} |err|={} |x1_t|={} |prefix|={}",
+                    time,
+                    guidance_weight,
+                    jnp.sqrt(jnp.mean(v_t * v_t)),
+                    jnp.sqrt(jnp.mean(correction * correction)),
+                    jnp.sqrt(jnp.mean(err * err)),
+                    jnp.sqrt(jnp.mean(x1_t * x1_t)),
+                    jnp.sqrt(jnp.mean(action_prefix_padded * action_prefix_padded)),
+                )
+
+            v_t = v_t - guidance_weight * correction
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            _, time = carry
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))

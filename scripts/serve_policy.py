@@ -1,7 +1,11 @@
 import dataclasses
 import enum
 import logging
+import pathlib
+import shutil
 import socket
+import subprocess
+from typing import Literal
 
 import tyro
 
@@ -18,6 +22,7 @@ class EnvMode(enum.Enum):
     ALOHA_SIM = "aloha_sim"
     DROID = "droid"
     LIBERO = "libero"
+    YAM = "yam"
 
 
 @dataclasses.dataclass
@@ -28,6 +33,15 @@ class Checkpoint:
     config: str
     # Checkpoint directory (e.g., "checkpoints/pi0_aloha_sim/exp/10000").
     dir: str
+    # Default prompt to use when the data does not carry one. Overridden by --default_prompt.
+    default_prompt: str | None = None
+
+
+@dataclasses.dataclass
+class NamedCheckpoint:
+    """Load a preset checkpoint by short name (see NAMED_CHECKPOINTS)."""
+
+    name: str
 
 
 @dataclasses.dataclass
@@ -47,12 +61,334 @@ class Args:
     default_prompt: str | None = None
 
     # Port to serve the policy on.
-    port: int = 8000
+    port: int = 8012
     # Record the policy's behavior for debugging.
     record: bool = False
 
+    # Shortcut for serving a named checkpoint (see NAMED_CHECKPOINTS). Takes precedence over --policy.
+    name: "NamedCheckpointKey | None" = None
+
+    # S3 path to a checkpoint directory (e.g., s3://bucket/model_ckpts/config_name/run_name/step/).
+    # Downloads assets, params, and metadata (excluding train_state) to ~/checkpoints/.
+    s3: str | None = None
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
-    policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
+    policy: Checkpoint | NamedCheckpoint | Default = dataclasses.field(default_factory=Default)
+
+
+# Named presets for frequently-served checkpoints. Select via `--policy named --policy.name <key>`.
+NAMED_CHECKPOINTS: dict[str, Checkpoint] = {
+    "yam_no_rabc_39k": Checkpoint(
+        config="pi0_yam_tshirt_no_rabc",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_1k": Checkpoint(
+        config="pi0_yam_tshirt_rabc",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc/sky_pi0_yam_tshirt_rabc_yam_tshirt_rorm_weighted_20260415_090157/1000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_11k_a": Checkpoint(
+        config="pi0_yam_tshirt_rabc",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc/sky_pi0_yam_tshirt_rabc_yam_tshirt_rorm_weighted_20260415_111935/11000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_11k_b": Checkpoint(
+        config="pi0_yam_tshirt_rabc",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc/sky_pi0_yam_tshirt_rabc_yam_tshirt_rorm_weighted_20260415_115838/11000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_30k": Checkpoint(
+        config="pi0_yam_tshirt_rabc",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc/sky_pi0_yam_tshirt_rabc_yam_tshirt_rorm_weighted_20260415_174132/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_thresh1_clip6_39k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_1_00_clip_max_6_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_1_00_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_1_00_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_183732/39999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_thresh0_25_clip6_39k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_0_25_clip_max_6_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_25_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_0_25_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_184347/39999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_thresh0_50_clip6_39k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_0_50_clip_max_6_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_50_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_0_50_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_184251/39999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_thresh0_75_clip6_30k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_0_75_clip_max_6_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_75_clip_max_6_0/sky_pi0_yam_tshirt_rabc_thresh_0_75_clip_max_6_0_yam_tshirt_rorm_weighted_20260415_184228/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_clipmin0_25_clip1_5_59k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_clip_min_0_25_clip_max_1_5",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_clip_min_0_25_clip_max_1_5/sky_pi0_yam_tshirt_rabc_clip_min_0_25_clip_max_1_5_yam_tshirt_rorm_weighted_20260416_193041/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_clipmin0_50_clip1_5_39k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_clip_min_0_50_clip_max_1_5",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_clip_min_0_50_clip_max_1_5/sky_pi0_yam_tshirt_rabc_clip_min_0_50_clip_max_1_5_yam_tshirt_rorm_weighted_20260416_193043/39999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_clipmin0_75_clip1_5_59k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_clip_min_0_75_clip_max_1_5",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_clip_min_0_75_clip_max_1_5/sky_pi0_yam_tshirt_rabc_clip_min_0_75_clip_max_1_5_yam_tshirt_rorm_weighted_20260416_235224/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_thresh0_50_clip1_0_30k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_0_50_clip_max_1_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_50_clip_max_1_0/sky_pi0_yam_tshirt_rabc_thresh_0_50_clip_max_1_0_yam_tshirt_rorm_weighted_20260417_015259/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_thresh0_80_clip1_0_30k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_thresh_0_80_clip_max_1_0",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_thresh_0_80_clip_max_1_0/sky_pi0_yam_tshirt_rabc_thresh_0_80_clip_max_1_0_yam_tshirt_rorm_weighted_20260417_090709/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_rabc_final_action_cond_20k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_use_final_action_cond",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_use_final_action_cond/sky_pi0_yam_tshirt_rabc_use_final_action_cond_tshirt_folding_d405_v010_20260420_gop10_20260425_032855/20000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_shortest_10_30k": Checkpoint(
+        config="pi0_yam_tshirt_shortest_10",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_shortest_10/sky_pi0_yam_tshirt_shortest_10_tshirt_folding_d405_v010_20260420_gop10_20260425_030032/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_shortest_50_30k": Checkpoint(
+        config="pi0_yam_tshirt_shortest_50",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_shortest_50/sky_pi0_yam_tshirt_shortest_50_tshirt_folding_d405_v010_20260420_gop10_20260425_030123/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_topq10_30k": Checkpoint(
+        config="pi0_yam_tshirt_topq10",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_topq10/sky_pi0_yam_tshirt_topq10_tshirt_folding_d405_v010_20260420_gop10_20260425_024926/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_topq10_rabc_q_mult_79k": Checkpoint(
+        config="pi0_yam_tshirt_topq10_rabc_q_mult",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_topq10_rabc_q_mult/sky_pi0_yam_tshirt_topq10_rabc_q_mult_tshirt_folding_d405_v010_20260420_gop10_20260425_031912/79999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_topq50_30k": Checkpoint(
+        config="pi0_yam_tshirt_topq50",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_topq50/sky_pi0_yam_tshirt_topq50_tshirt_folding_d405_v010_20260420_gop10_20260425_025936/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_no_rabc_d405_30k": Checkpoint(
+        config="pi0_yam_tshirt_no_rabc_d405",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_no_rabc_d405/sky_pi0_yam_tshirt_no_rabc_d405_tshirt_folding_d405_v010_20260420_gop10_20260428_200336/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_q_thresh_linear_30k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_q_thresh_linear",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_q_thresh_linear/sky_pi0_yam_tshirt_rabc_q_thresh_linear_tshirt_folding_d405_v010_20260420_gop10_20260429_030557/30000",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "yam_q_thresh_sig_top5_59k": Checkpoint(
+        config="pi0_yam_tshirt_rabc_q_thresh_sig_top5",
+        dir="/home/justinyu/checkpoints/pi0_yam_tshirt_rabc_q_thresh_sig_top5/sky_pi0_yam_tshirt_rabc_q_thresh_sig_top5_tshirt_folding_d405_v010_20260420_gop10_20260429_030558/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "hlm_piecewise_rabc_59k": Checkpoint(
+        config="pi0_hlm_rabc",
+        # dir="/home/justinyu/checkpoints/pi0_hlm_rabc/pi0_hlm_piecewise_bs1024_rabc_20260430_v2/59999",
+        dir="/home/hyrl/checkpoints/pi0_hlm_piecewise_bs1024_rabc_20260430_v2/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "hlm_uniform_rabc_59k": Checkpoint(
+        config="pi0_hlm_rabc",
+        dir="/home/justinyu/checkpoints/pi0_hlm_rabc/pi0_hlm_uniform_bs1024_rabc_20260430_v2/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "hlm_no_rabc_59k": Checkpoint(
+        config="pi0_hlm_no_rabc",
+        dir="/home/justinyu/checkpoints/pi0_hlm_no_rabc/pi0_hlm_baseline_bs1024_no_rabc_20260430_v2/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_hlm_d405short25rm_bs1024_rabc_20260501": Checkpoint(
+        config="pi0_hlm_rabc",
+        dir="/home/hyrl/checkpoints/pi0_hlm_rabc/pi0_hlm_d405short25rm_bs1024_rabc_20260501/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged_d405_no_rabc_20260501": Checkpoint(
+        config="pi0_merged_no_rabc",
+        dir="/home/hyrl/checkpoints/pi0_merged_no_rabc/pi0_merged_baseline_bs1024_no_rabc_20260501/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged_d405short25rm_bs1024_rabc_20260501": Checkpoint(
+        config="pi0_merged_rabc",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged_rabc/pi0_merged_d405short25rm_bs1024_rabc_20260501/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_d405short25rm_bs1024_rabc_20260505": Checkpoint(
+        config="pi0_merged90_rabc",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged90_rabc/pi0_merged90_d405short25rm_bs1024_rabc_20260505/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_d405short25rm_bs1024_rabcminwin_20260505": Checkpoint(
+        config="pi0_merged90_rabc_minwin",
+        dir="/home/hyrl/checkpoints/pi0_merged90_rabc_minwin/pi0_merged90_d405short25rm_bs1024_rabcminwin_20260505/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_d405short25rm_bs1024_rabc_thr050_nomax_20260506": Checkpoint(
+        config="pi0_merged90_rabc_thr050_nomax",
+        dir="/home/hyrl/checkpoints/pi0_merged90_rabc_thr050_nomax/pi0_merged90_d405short25rm_bs1024_rabc_thr050_nomax_20260506/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_d405short25rm_bs1024_rabc_thr075_nomax_20260506": Checkpoint(
+        config="pi0_merged90_rabc_thr075_nomax",
+        dir="/home/hyrl/checkpoints/pi0_merged90_rabc_thr075_nomax/pi0_merged90_d405short25rm_bs1024_rabc_thr075_nomax_20260506/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_d405short25rm_bs1024_rabc_finalaction_thr050_20260506": Checkpoint(
+        config="pi0_merged90_rabc_finalaction",
+        dir="/home/hyrl/checkpoints/pi0_merged90_rabc_finalaction/pi0_merged90_d405short25rm_bs1024_rabc_finalaction_thr050_20260506/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_d405short25rm_bs1024_rabc_thr075_nomax_20260506": Checkpoint(
+        config="pi0_merged90_rabc_thr075_nomax",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged90_rabc_thr075_nomax/pi0_merged90_d405short25rm_bs1024_rabc_thr075_nomax_20260506/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_d405short25rm_bs1024_rabc_finalaction_mult_thr050_20260507": Checkpoint(
+        config="pi0_merged90_rabc_finalaction_mult",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged90_rabc_finalaction_mult/pi0_merged90_d405short25rm_bs1024_rabc_finalaction_mult_thr050_20260507/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged_singlefold_d405short25rm_bs1024_rabc_finalaction_thr050_20260507": Checkpoint(
+        config="pi0_merged_singlefold_rabc_finalaction_thr050",
+        dir="/home/hyrl/checkpoints/pi0_merged_singlefold_rabc_finalaction_thr050/pi0_merged_singlefold_d405short25rm_bs1024_rabc_finalaction_thr050_20260507/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_no_rabc_20260504": Checkpoint(
+        config="pi0_merged90_no_rabc",
+        dir="/home/hyrl/checkpoints/pi0_merged90_no_rabc/pi0_merged90_fs2rm_bs1024_no_rabc_20260504/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_rabc_finalaction_thr050_strict_subset_20260508": Checkpoint(
+        config="pi0_merged90_rabc_finalaction",
+        dir="/home/hyrl/checkpoints/pi0_merged90_rabc_finalaction/pi0_merged90_rabc_finalaction_thr050_strict_subset_20260508/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_rabc_finalaction_thr075_strict_subset_20260508": Checkpoint(
+        config="pi0_merged90_rabc_finalaction_thr075",
+        dir="/home/hyrl/checkpoints/pi0_merged90_rabc_finalaction_thr075/pi0_merged90_rabc_finalaction_thr075_strict_subset_20260508/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_rabc_finalaction_thr100_strict_subset_20260509": Checkpoint(
+        config="pi0_merged90_rabc_finalaction_thr100",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged90_rabc_finalaction_thr100/pi0_merged90_rabc_finalaction_thr100_strict_subset_20260509/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged120_rabc_finalaction_thr100_nomax_strict_subset_20260510": Checkpoint(
+        config="pi0_merged120_rabc_finalaction_thr100_nomax",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged120_rabc_finalaction_thr100_nomax/pi0_merged120_rabc_finalaction_thr100_nomax_strict_subset_20260510/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_yam_tshirt_sarm_rabc_dense_progress_20260510": Checkpoint(
+        config="pi0_yam_tshirt_sarm_rabc_dense_progress_20260510",
+        dir="/home/hyrl/checkpoints/pi0_yam_tshirt_sarm_rabc_dense_progress_20260510/sarm_rabc_dense_progress_20260510/89999/",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged60_rabc_finalaction_thr100_fs2sss45rm_strict_subset_20260510": Checkpoint(
+        config="pi0_merged60_rabc_finalaction_thr100",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged60_rabc_finalaction_thr100/pi0_merged60_rabc_finalaction_thr100_fs2sss45rm_strict_subset_20260510/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged60_rabc_finalaction_thr100_nomax_fs2sss45rm_strict_subset_20260510": Checkpoint(
+        config="pi0_merged60_rabc_finalaction_thr100_nomax",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged60_rabc_finalaction_thr100_nomax/pi0_merged60_rabc_finalaction_thr100_nomax_fs2sss45rm_strict_subset_20260510/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged60_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511": Checkpoint( # Should be the goated one
+        config="pi0_merged60_rabc_finalaction_thr100_nomax",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged60_rabc_finalaction_thr100_nomax/pi0_merged60_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_merged90_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511": Checkpoint(
+        config="pi0_merged90_rabc_finalaction_thr100_nomax",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_merged90_rabc_finalaction_thr100_nomax/pi0_merged90_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+    "pi0_sarm_dense_sparse_rabc_finalaction_thr100_nomax_fs2sss45rm_strict_subset_20260510": Checkpoint(
+        config="pi0_sarm_dense_sparse_rabc_finalaction_thr100_nomax",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_sarm_dense_sparse_rabc_finalaction_thr100_nomax/pi0_sarm_dense_sparse_rabc_finalaction_thr100_nomax_fs2sss45rm_strict_subset_20260510/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+          # ── tshirt runs (this session): vanilla BC + single-cam WARP-BC sss sweep                                                                                   
+      #    + multi-cam (mc3, top+L+R concat) sss sweep. All final step 59999.                                                                                      
+      "tshirt_vanilla_bc_59k": Checkpoint(                                                                                                                         
+          config="pi0_tshirt_bc",                                                                                                                                  
+          dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_bc/sky_pi0_tshirt_bc_tshirt_folding_d405_v010_20260420_20260614_233412/59999",                   
+          default_prompt="Folding tshirt pile and stacking",                                                                                                       
+      ),                                                                                                                                                           
+      "tshirt_warpbc_sss15_59k": Checkpoint(                                                                                                                       
+          config="pi0_tshirt_warpbc_sss15",                                                                                                                        
+          dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_warpbc_sss15/sky_pi0_tshirt_warpbc_sss15_tshirt_folding_d405_v010_20260420_gop10_sss15_20260616_010556/59999",                                                                                                                                                    
+          default_prompt="Folding tshirt pile and stacking",                                                                                                       
+      ),                                                                                                                                                           
+      "tshirt_warpbc_sss30_59k": Checkpoint(                                                                                                                       
+          config="pi0_tshirt_warpbc_sss30",                                                                                                                        
+          dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_warpbc_sss30/sky_pi0_tshirt_warpbc_sss30_tshirt_folding_d405_v010_20260420_gop10_sss30_20260616_121554/59999",                                                                                                                                                    
+          default_prompt="Folding tshirt pile and stacking",                                                                                                       
+      ),
+      "tshirt_warpbc_sss45_59k": Checkpoint(
+          config="pi0_tshirt_warpbc_sss45",
+          dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_warpbc_sss45/sky_pi0_tshirt_warpbc_sss45_tshirt_folding_d405_v010_20260420_gop10_sss45_20260615_194413/59999",
+          default_prompt="Folding tshirt pile and stacking",
+      ),
+      "tshirt_warpbc_mc3_sss15_59k": Checkpoint(
+          config="pi0_tshirt_warpbc_mc3_sss15",
+          dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_warpbc_mc3_sss15/sky_pi0_tshirt_warpbc_mc3_sss15_tshirt_folding_d405_v010_20260420_gop10_mc3_sss15_20260616_172132/59999",
+          default_prompt="Folding tshirt pile and stacking",
+      ),
+      "tshirt_warpbc_mc3_sss30_59k": Checkpoint(
+          config="pi0_tshirt_warpbc_mc3_sss30",
+          dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_warpbc_mc3_sss30/sky_pi0_tshirt_warpbc_mc3_sss30_tshirt_folding_d405_v010_20260420_gop10_mc3_sss30_20260616_175522/59999",
+          default_prompt="Folding tshirt pile and stacking",
+      ),
+      "tshirt_warpbc_mc3_sss45_59k": Checkpoint(
+          config="pi0_tshirt_warpbc_mc3_sss45",
+          dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_warpbc_mc3_sss45/sky_pi0_tshirt_warpbc_mc3_sss45_tshirt_folding_d405_v010_20260420_gop10_mc3_sss45_20260616_180059/59999",
+          default_prompt="Folding tshirt pile and stacking",
+      ),
+    "sky_pi0_bottles_warpbc_sss45_put_the_plastic_bottles_in_the_bin_d405_v021_sss45_20260615_122115": Checkpoint(
+        config="pi0_bottles_warpbc_sss45",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_bottles_warpbc_sss45/sky_pi0_bottles_warpbc_sss45_put_the_plastic_bottles_in_the_bin_d405_v021_sss45_20260615_122115/59999",
+        default_prompt="Put the plastic bottles in the bin",
+    ),
+    "sky_pi0_bottles_warpbc_sss30_put_the_plastic_bottles_in_the_bin_d405_v021_sss30_20260615_122006": Checkpoint(
+        config="pi0_bottles_warpbc_sss30",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_bottles_warpbc_sss30/sky_pi0_bottles_warpbc_sss30_put_the_plastic_bottles_in_the_bin_d405_v021_sss30_20260615_122006/59999",
+        default_prompt="Put the plastic bottles in the bin",
+    ),
+    "sky_pi0_bottles_warpbc_sss15_put_the_plastic_bottles_in_the_bin_d405_v021_sss15_20260615_121905": Checkpoint(
+        config="pi0_bottles_warpbc_sss15",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_bottles_warpbc_sss15/sky_pi0_bottles_warpbc_sss15_put_the_plastic_bottles_in_the_bin_d405_v021_sss15_20260615_121905/59999",
+        default_prompt="Put the plastic bottles in the bin",
+    ),
+    "sky_pi0_bottles_bc_put_the_plastic_bottles_in_the_bin_d405_v021_20260614_233310": Checkpoint(
+        config="pi0_bottles_bc",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_bottles_bc/sky_pi0_bottles_bc_put_the_plastic_bottles_in_the_bin_d405_v021_20260614_233310/59999",
+        default_prompt="Put the plastic bottles in the bin",
+    ),
+    "sky_pi0_box_warpbc_sss45_fold_the_paper_box_d405_v021_sss45_20260615_121804": Checkpoint(
+        config="pi0_box_warpbc_sss45",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_box_warpbc_sss45/sky_pi0_box_warpbc_sss45_fold_the_paper_box_d405_v021_sss45_20260615_121804/59999",
+        default_prompt="Fold the paper box",
+    ),
+    "sky_pi0_tshirt_warpbc_sss45_tshirt_folding_d405_v010_20260420_gop10_sss45_20260615_194413": Checkpoint(
+        config="pi0_tshirt_warpbc_sss45",
+        dir="s3://xdof-internal-research/model_ckpts/pi0_tshirt_warpbc_sss45/sky_pi0_tshirt_warpbc_sss45_tshirt_folding_d405_v010_20260420_gop10_sss45_20260615_194413/59999",
+        default_prompt="Folding tshirt pile and stacking",
+    ),
+}
+
+NamedCheckpointKey = Literal[*NAMED_CHECKPOINTS]
 
 
 # Default checkpoints that should be used for each environment.
@@ -73,32 +409,112 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
         config="pi05_libero",
         dir="gs://openpi-assets/checkpoints/pi05_libero",
     ),
+    EnvMode.YAM: NAMED_CHECKPOINTS["yam_no_rabc_39k"],
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
-    """Create a default policy for the given environment."""
-    if checkpoint := DEFAULT_CHECKPOINT.get(env):
-        return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+def download_s3_checkpoint(s3_path: str) -> Checkpoint:
+    """Download a checkpoint from S3, excluding train_state, and return a Checkpoint."""
+    s3_path = s3_path.rstrip("/")
+    parts = s3_path.split("/")
+
+    try:
+        ckpts_idx = parts.index("model_ckpts")
+    except ValueError:
+        raise ValueError(f"S3 path must contain 'model_ckpts/' segment: {s3_path}")
+
+    remaining = parts[ckpts_idx + 1 :]
+    if len(remaining) < 3:
+        raise ValueError(
+            f"Expected s3://...model_ckpts/<config>/<run_name>/<step>/, got: {s3_path}"
         )
-    raise ValueError(f"Unsupported environment mode: {env}")
+
+    config_name = remaining[0]
+    run_name = remaining[1]
+    step = remaining[2]
+
+    local_dir = pathlib.Path.home() / "checkpoints" / run_name / step
+    if local_dir.exists() and (local_dir / "params").exists():
+        logging.info("Checkpoint already exists at %s, skipping download", local_dir)
+    else:
+        local_dir.mkdir(parents=True, exist_ok=True)
+        logging.info("Downloading checkpoint from %s to %s (excluding train_state)", s3_path, local_dir)
+        if shutil.which("aws") is None:
+            raise RuntimeError("aws CLI is required for S3 downloads but was not found")
+        subprocess.run(
+            ["aws", "s3", "sync", s3_path, str(local_dir), "--exclude", "train_state/*"],
+            check=True,
+        )
+
+    return Checkpoint(config=config_name, dir=str(local_dir))
 
 
-def create_policy(args: Args) -> _policy.Policy:
-    """Create a policy from the given arguments."""
+def _resolve_checkpoint(args: Args) -> tuple[Checkpoint | None, str | None]:
+    """Resolve args to the (Checkpoint, short_name) actually being served.
+
+    ``short_name`` is the NAMED_CHECKPOINTS key when one was selected (the most
+    human-meaningful identifier), else None. Returns (None, None) only for an
+    unsupported Default env. Mirrors the load branching in ``create_policy`` so
+    the served policy and its reported name can never disagree.
+    """
+    if args.s3 is not None:
+        return download_s3_checkpoint(args.s3), None
+    if args.name is not None:
+        return NAMED_CHECKPOINTS[args.name], args.name
     match args.policy:
         case Checkpoint():
-            return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
-            )
+            return args.policy, None
+        case NamedCheckpoint():
+            if args.policy.name not in NAMED_CHECKPOINTS:
+                raise ValueError(
+                    f"Unknown named checkpoint: {args.policy.name!r}. "
+                    f"Available: {sorted(NAMED_CHECKPOINTS)}"
+                )
+            return NAMED_CHECKPOINTS[args.policy.name], args.policy.name
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return DEFAULT_CHECKPOINT.get(args.env), None
+    return None, None
+
+
+def _policy_name_from_checkpoint(ckpt: Checkpoint, short_name: str | None) -> str:
+    """A stable, filesystem-friendly identifier for the served checkpoint.
+
+    Named checkpoints report their short key (e.g. ``yam_rabc_30k``). Raw
+    checkpoints report ``<config>/<run_name>/<step>`` derived from the
+    checkpoint dir, which is unique per training run + step. Consumed by the
+    client to expand ``save_root: recordings/{policy_name}``.
+    """
+    if short_name:
+        return short_name
+    d = pathlib.Path(ckpt.dir)
+    step = d.name  # e.g. "30000"
+    run_name = d.parent.name  # e.g. "sky_pi0_yam_..._20260415_174132"
+    parts = [p for p in (ckpt.config, run_name, step) if p]
+    return "/".join(parts)
+
+
+def create_policy(args: Args) -> tuple[_policy.Policy, str | None]:
+    """Create a policy from the given arguments, plus a name identifying it."""
+    ckpt, short_name = _resolve_checkpoint(args)
+    if ckpt is None:
+        raise ValueError(f"Unsupported environment mode: {args.env}")
+    policy = _policy_config.create_trained_policy(
+        _config.get_config(ckpt.config),
+        ckpt.dir,
+        default_prompt=args.default_prompt or ckpt.default_prompt,
+    )
+    return policy, _policy_name_from_checkpoint(ckpt, short_name)
 
 
 def main(args: Args) -> None:
-    policy = create_policy(args)
-    policy_metadata = policy.metadata
+    policy, policy_name = create_policy(args)
+    # Ship the checkpoint identity to the client so it can expand
+    # save_root: recordings/{policy_name}. Copy so we don't mutate the policy's
+    # own metadata dict, and don't clobber a policy_name a config baked in.
+    policy_metadata = dict(policy.metadata)
+    if policy_name and not policy_metadata.get("policy_name"):
+        policy_metadata["policy_name"] = policy_name
+    logging.info("Serving policy_name=%r", policy_metadata.get("policy_name"))
 
     # Record the policy's behavior.
     if args.record:

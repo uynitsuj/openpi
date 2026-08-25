@@ -39,6 +39,9 @@ class SkyPilotTrainingConfig:
     service_provider: Optional[List[str]] = field(default_factory=lambda: ["aws", "lambda"])
     s3_bucket: str = "s3://xdof-internal-research"
     s3_checkpoint_base: str = "s3://xdof-internal-research/model_ckpts"
+    # Full S3 URI for the dataset (overrides the {s3_bucket}/{parent}/{name} layout),
+    # e.g. s3://xdof-internal-research/siemens/datasets/industrial_packing_yam
+    s3_dataset_path: Optional[str] = None
     accelerators: List[str] = field(default_factory=lambda: ["A100-80GB:8", "A100-80GB:4", "H100:8", "H100:4", "H200:8", "H200:4", "B200:4"])
     provider_regions: dict[str, str] = field(default_factory=lambda: {
         "aws": "us-west-2",
@@ -147,6 +150,7 @@ def main(cfg: SkyPilotTrainingConfig):
         cfg.s3_bucket,
         s3_repo_id,
         norm_stats_dir,
+        s3_path_override=cfg.s3_dataset_path,
     )
 
     # Generate a single SkyPilot config with auto-failover across all

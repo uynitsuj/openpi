@@ -202,6 +202,16 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
+    if data_config.abc_layout:
+        # ABC training layout (MCAP export): abc's random-access loader instead of
+        # LeRobotDataset. The dataset emits "prompt" directly (episode task_name),
+        # so the prompt_from_task wrapper below is unnecessary.
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+
+        from openpi.training.abc_layout_dataset import AbcLayoutDataset
+
+        return AbcLayoutDataset(HF_LEROBOT_HOME / repo_id, action_horizon=action_horizon)
+
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     delta_ts = [t / dataset_meta.fps for t in range(action_horizon)]
     delta_timestamps = {key: delta_ts for key in data_config.action_sequence_keys}

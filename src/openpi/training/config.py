@@ -104,6 +104,11 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # If true, repo_id points at an ABC training layout (MCAP export: states_actions.bin +
+    # strict CFR combined video) under HF_LEROBOT_HOME, loaded with abc's random-access
+    # approach instead of LeRobotDataset. See openpi/training/abc_layout_dataset.py.
+    abc_layout: bool = False
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -863,6 +868,21 @@ class LeRobotYamDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+
+
+@dataclasses.dataclass(frozen=True)
+class AbcLayoutYamDataConfig(LeRobotYamDataConfig):
+    """YAM transforms over the ABC training layout (abc's mcap-export format).
+
+    Identical transform stack to LeRobotYamDataConfig; only the storage backend
+    differs (abc_layout_dataset.AbcLayoutDataset instead of LeRobotDataset).
+    NOTE the data conventions also follow abc: raw MCAP joint order (no flip) and
+    commanded actions — norm stats and serving must use this config's assets.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        return dataclasses.replace(super().create(assets_dirs, model_config), abc_layout=True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1915,6 +1935,52 @@ _CONFIGS = [
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
+    ),
+    #
+    # Siemens industrial packing: pi0.5 on the YAM dataset built from DataEngine job
+    # 01a01dc5-bef9-7233-b409-4db2d832ac91 (716 episodes after the >=10s duration filter)
+    # by scripts/yam_data/convert_xdof_mcap_job.py. Uses the validated bs128 speedup
+    # recipe (docs/speedup): bs128/fsdp2 + OPENPI_REMAT_POLICY, cosine decay over 15k.
+    #
+    TrainConfig(
+        name="pi05_siemens_industrial_packing_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamDataConfig(
+            repo_id="industrial_packing_yam",
+            default_prompt="industrial packing",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    #
+    # Same pi0.5 recipe but trained through abc's dataloader approach on the
+    # MCAP-exported ABC layout (industrial_packing_abc224): random access into the
+    # strict-CFR combined video + states_actions.bin, commanded actions, raw joint
+    # order. Comparison arm against pi05_siemens_industrial_packing_bs128.
+    #
+    TrainConfig(
+        name="pi05_siemens_packing_abcloader_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=AbcLayoutYamDataConfig(
+            repo_id="industrial_packing_abc224",
+            default_prompt="industrial packing",
+            base_config=DataConfig(),
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
     ),
     #
     # RABC / AWR weighted YAM tshirt folding configs.

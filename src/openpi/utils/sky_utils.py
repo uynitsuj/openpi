@@ -47,7 +47,10 @@ def check_prerequisites():
 
 
 
-def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_stats_dir: str) -> str:
+def upload_dataset_to_s3(
+    dataset_path: Path, s3_bucket: str, repo_id: str, norm_stats_dir: str,
+    s3_path_override: Optional[str] = None,
+) -> str:
     """Upload dataset and norm stats to S3 and return the full S3 path.
 
     Args:
@@ -55,11 +58,14 @@ def upload_dataset_to_s3(dataset_path: Path, s3_bucket: str, repo_id: str, norm_
         s3_bucket: S3 bucket URL (e.g. s3://bucket-name).
         repo_id: Dataset repo id used as the S3 key prefix (e.g. lerobot/dataset_name).
         norm_stats_dir: Local directory containing the norm_stats.json file.
+        s3_path_override: Full S3 URI for the dataset; bypasses the
+            {s3_bucket}/{repo_id} layout when the dataset must land at an exact
+            prefix (e.g. customer delivery buckets).
     """
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset path does not exist: {dataset_path}")
 
-    s3_path = f"{s3_bucket}/{repo_id}"
+    s3_path = s3_path_override.rstrip("/") if s3_path_override else f"{s3_bucket}/{repo_id}"
 
     print(f"[INFO] Uploading dataset from {dataset_path} to {s3_path}")
 
@@ -350,7 +356,8 @@ def generate_sky_config(
         resources = {'any_of': candidates}
 
     config = {
-        'workdir': '/home/karim/openpi-speedup',
+        # This repo's root: sky_utils.py lives at src/openpi/utils/, three levels down.
+        'workdir': str(Path(__file__).resolve().parents[3]),
         'envs': {
             # measured 1.66x recipe (docs/speedup): must be in the env before
             # python imports openpi.models.siglip (import-time default)

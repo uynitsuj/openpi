@@ -1295,6 +1295,32 @@ _CONFIGS = [
         ema_decay=None,
     ),
     #
+    # Siemens industrial packing (bimanual YAM, 3 cameras, absolute joint actions).
+    #
+    # Serving config for the checkpoints under
+    # /nfs_us_2/siemens/policy_ckpts/pi05_siemens_industrial_packing_bs128/ (asset id
+    # `industrial_packing_yam`, 32-dim padded norm stats, params carry pi05 markers
+    # time_mlp_in/out and no state_proj). The data was converted with lab42's LeRobot converter
+    # (resize_and_pad to 224x224, prompt = episode task_name), so inference uses the plain YAM
+    # transforms. action_horizon=30 mirrors the other pi05 YAM configs in this file; the training
+    # launcher's exact config was not recoverable from the checkpoint -- override with
+    # `serve_policy.py --action-horizon` if the run used a different value.
+    TrainConfig(
+        name="pi05_siemens_industrial_packing_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamDataConfig(
+            repo_id="industrial_packing_yam",
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=15_000,
+        save_interval=5000,
+    ),
+    #
     #
     # Debugging configs.
     #

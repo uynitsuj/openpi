@@ -77,8 +77,9 @@ class YamInputs(transforms.DataTransformFn):
             base_image = np.zeros((224, 224, 3), dtype=np.uint8)
 
         match self.model_type:
-            case _model.ModelType.PI0:
-                # Map YAM cameras to standard PI0 camera names
+            case _model.ModelType.PI0 | _model.ModelType.PI05:
+                # Map YAM cameras to standard PI0 camera names. pi0.5 shares the pi0 image slots
+                # and presence masks (same convention as droid_policy.py).
                 images = {
                     "base_0_rgb": processed_images.get("top_camera-images-rgb", np.zeros_like(base_image)),  # Top camera as base
                     "left_wrist_0_rgb": processed_images.get("left_camera-images-rgb", np.zeros_like(base_image)),  # Left camera

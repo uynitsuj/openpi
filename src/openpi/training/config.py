@@ -3789,6 +3789,57 @@ _CONFIGS = [
         keep_period=5_000,
         rabc_enabled=True,
     ),
+    # ── e12e_allwrist_ctx8 sidecar pair (new RM, same _sss45 base pool) ──
+    # Same final-action gate (thr 1.0) as the e12rabc sidecar arm but scored by
+    # the e12e_allwrist_ctx8 model. The two arms differ ONLY in kept-chunk
+    # weighting: nomax = weight is the raw velocity (magnitude-weighted);
+    # max1 = clip_max=1.0 so every kept chunk weighs exactly 1 (binary keep).
+    # velocity_sidecar_path is the LOCAL staged parquet — the s3:// read path
+    # does a single `aws s3 cp` that the box proxy keeps breaking.
+    TrainConfig(
+        name="pi0_bottles_e12e_allwrist_ctx8_sidecar_thr100_nomax_bs128",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotVelocitySidecarDataConfig(
+            repo_id="put_the_plastic_bottles_in_the_bin_d405_v021_sss45",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            velocity_sidecar_path="/mnt/data/karim/sidecars/bottles_d405_v021_full/e12e_allwrist_ctx8/frame_signals.parquet",
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            rabc_clip_max=float("inf"),
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_bottles_e12e_allwrist_ctx8_sidecar_thr100_max1_bs128",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotVelocitySidecarDataConfig(
+            repo_id="put_the_plastic_bottles_in_the_bin_d405_v021_sss45",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            velocity_sidecar_path="/mnt/data/karim/sidecars/bottles_d405_v021_full/e12e_allwrist_ctx8/frame_signals.parquet",
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            rabc_clip_max=1.0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        rabc_enabled=True,
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

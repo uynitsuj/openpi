@@ -108,6 +108,9 @@ class DataConfig:
     # strict CFR combined video) under HF_LEROBOT_HOME, loaded with abc's random-access
     # approach instead of LeRobotDataset. See openpi/training/abc_layout_dataset.py.
     abc_layout: bool = False
+    # ABC layout only: keep episodes from these station_types (episode_metadata.json).
+    # None trains on everything. E.g. ("yam_zed_0_61",) for a ZED-only policy.
+    abc_station_types: Sequence[str] | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -880,9 +883,16 @@ class AbcLayoutYamDataConfig(LeRobotYamDataConfig):
     commanded actions — norm stats and serving must use this config's assets.
     """
 
+    # Optional station_type filter (see DataConfig.abc_station_types).
+    station_types: tuple[str, ...] | None = None
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        return dataclasses.replace(super().create(assets_dirs, model_config), abc_layout=True)
+        return dataclasses.replace(
+            super().create(assets_dirs, model_config),
+            abc_layout=True,
+            abc_station_types=self.station_types,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1949,6 +1959,104 @@ _CONFIGS = [
             repo_id="industrial_packing_yam",
             default_prompt="industrial packing",
             base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    #
+    # v2: the full 1435-episode pool (1346 yam_zed_0_61 + 89 yam_0_61/D405 stations),
+    # ZED top cameras cropped to the D405 reference FOV (see docs/siemens_packing_runs.md).
+    # Same recipe; 15k x bs128 is ~1 epoch of the 1.85M-frame pool (matches the
+    # sample budget philosophy of the validated bottles recipe).
+    #
+    TrainConfig(
+        name="pi05_siemens_industrial_packing_v2_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamDataConfig(
+            repo_id="industrial_packing_yam_v2",
+            default_prompt="industrial packing",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_siemens_packing_abcloader_v2_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=AbcLayoutYamDataConfig(
+            repo_id="industrial_packing_abc224_v2",
+            default_prompt="industrial packing",
+            base_config=DataConfig(),
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    # v3 (2026-08-29): +33 episodes over v2 — 30 new D405 (sz_44/20260828) and 3 ZED
+    # on the new sz_04 station; 1468 episodes total after the >=10s filter.
+    TrainConfig(
+        name="pi05_siemens_packing_abcloader_v3_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=AbcLayoutYamDataConfig(
+            repo_id="industrial_packing_abc224_v3",
+            default_prompt="industrial packing",
+            base_config=DataConfig(),
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        name="pi05_siemens_packing_abcloader_v3_zedonly_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=AbcLayoutYamDataConfig(
+            repo_id="industrial_packing_abc224_v3",
+            default_prompt="industrial packing",
+            base_config=DataConfig(),
+            station_types=("yam_zed_0_61",),
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    # ZED-only ablation: same dataset, station filter keeps the 1346 yam_zed_0_61
+    # episodes (cropped ZED top) and drops the 89 D405 ones. Norm stats are computed
+    # per-config, so this arm normalizes over its own subset.
+    TrainConfig(
+        name="pi05_siemens_packing_abcloader_v2_zedonly_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=AbcLayoutYamDataConfig(
+            repo_id="industrial_packing_abc224_v2",
+            default_prompt="industrial packing",
+            base_config=DataConfig(),
+            station_types=("yam_zed_0_61",),
         ),
         batch_size=128,
         fsdp_devices=2,

@@ -151,6 +151,7 @@ def main(cfg: SkyPilotTrainingConfig):
         s3_repo_id,
         norm_stats_dir,
         s3_path_override=cfg.s3_dataset_path,
+        norm_stats_subdir=f"norm_stats/{cfg.config_name}",
     )
 
     # Generate a single SkyPilot config with auto-failover across all

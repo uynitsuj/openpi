@@ -210,7 +210,10 @@ def create_torch_dataset(
 
         from openpi.training.abc_layout_dataset import AbcLayoutDataset
 
-        return AbcLayoutDataset(HF_LEROBOT_HOME / repo_id, action_horizon=action_horizon)
+        station_types = tuple(data_config.abc_station_types) if data_config.abc_station_types else None
+        return AbcLayoutDataset(
+            HF_LEROBOT_HOME / repo_id, action_horizon=action_horizon, station_types=station_types
+        )
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     delta_ts = [t / dataset_meta.fps for t in range(action_horizon)]

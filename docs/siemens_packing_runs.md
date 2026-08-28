@@ -1,5 +1,60 @@
 # Siemens industrial packing — run ledger
 
+## v2 (2026-08-26): new data + FOV harmonization
+
+The job grew to 1,447 episodes: 1,358 on ZED stations (sz_43/48/50) + 89 on the D405 station
+sz_44 (`yam_0_61`). ≥10s filter keeps 1,435. Changes for the v2 datasets:
+
+- **ZED top crop → D405 reference FOV** (78.7°×63.2°, measured on sz_44): window size computed
+  per episode from its own intrinsics; placement chosen by Karim in the interactive viewer
+  (2026-08-26): **bottom-anchored (bottom margin 0), window center 86.7px right of the principal
+  point** — 1194×896 @ (435, 304) on sz_48; the horizontal shift generalizes as an angular offset
+  fx·(86.7/729). Side cams NOT cropped — a centered crop cuts off the partner arm / hand-off
+  region. Interactive viewer: https://claude.ai/code/artifact/8c694873-0876-4bcc-9d05-fff50c2f165d
+- Station-aware top source (`top_camera-images-left_rgb.mp4` on ZED, mono `top_camera-images-rgb.mp4`
+  on D405) in both converters.
+- Timestamp-unit normalization (`to_ns`): global clock is float seconds, ZED cam ts int64 ns,
+  **D405 cam ts float milliseconds** — the old `>1e12 → ns` heuristic would have silently
+  produced frozen-frame videos on D405 episodes.
+
+Datasets (built 2026-08-28 with the approved crop): `industrial_packing_yam_v2` (sky job 10,
+54m 15s) and `industrial_packing_abc224_v2` (sky job 11, 1h 25m 51s, 5.4GB / 4306 objects) under
+`s3://xdof-internal-research/siemens/datasets/`. Karim approved the per-station crops incl. the
+sz_43 bin-edge clipping (2026-08-28). The lerobot v2 dataset is an artifact only this round.
+
+**v2 training runs** (all pi0.5 bs128/15k via the abc loader, checkpoints under
+`s3://.../siemens/policy_ckpts/<config>/<exp>/`). Cloud jobs 13/14 (ZED-only) were cancelled in
+favor of the local box; cloud job 12 (combined) flapped STARTING→PENDING 4× over ~5h of scarce
+8-GPU capacity, so the combined run also fell back to the local box (job 12 left queued as a
+race — cancel whichever loses):
+
+| run | policy | config / exp | data | result |
+|---|---|---|---|---|
+| local 8×H100 | ZED-only | `pi05_siemens_packing_abcloader_v2_zedonly_bs128` / `siemens_packing_pi05_zedonly_v2_20260826` | station filter `yam_zed_0_61`, 1346 train eps / 1.62M frames | **SUCCEEDED 2026-08-28**, rc=0, **wall 288 min** (4h48m: 1.2 it/s steady, ckpt saves ~7.5 min each). **All ckpts on S3 & verified byte-exact** (5000/10000 streamed during training; 14999 pushed 00:15–00:19 after Karim's SSO refresh — 42GB in ~4 min: the SZ↔S3 link does ~175MB/s at night with the 100-way config vs ~4MB/s daytime). Local retention: only 14999 kept on NFS (`--keep-period 15000` GC'd 5k/10k). |
+| local 8×H100 | combined | `pi05_siemens_packing_abcloader_v2_bs128` / `siemens_packing_pi05_combined_v2_20260826_local` | all 1427 train eps | **SUCCEEDED 2026-08-29**, rc=0, **wall 313 min** (23:24→04:40 local). All 3 ckpts verified full-size on S3 (44.7GB each; 5000/10000 streamed during training, 14999 right after). Dataset-sync step skips S3 when the local copy is complete (expired-auth-proof). |
+| sky job 12 | combined | same config / `..._20260826` (no `_local`) | same | CANCELLED 2026-08-29 00:13 local after 6h40m of provisioning flaps (never reached RUNNING) — local run won the race. |
+
+**v3 (2026-08-29, in flight)**: +33 eps (30 D405 sz_44/20260828, 3 ZED on new station sz_04 —
+crop formula verified visually, 1224×918 @ (442,282)). Export sky job 15
+(`sky/convert_siemens_abc_layout_v3.yaml` → `industrial_packing_abc224_v3`); local pipeline
+`scripts/run_v3_local_pipeline.sh` then trains `pi05_siemens_packing_abcloader_v3_zedonly_bs128`
+/ `siemens_packing_pi05_zedonly_v3_20260829` and `..._v3_bs128` / `..._combined_v3_20260829`
+sequentially. Deployment: `robots_realtime` gained `publish_crop_rect` + `publish_image_key`
+(CameraNode) and `configs/yam/yam_bimanual_openpi_policy_sz_zed_siemens.yaml` pins the exact
+training crop (sz_48 rect active, sz_43/sz_50 + formula in header; `image_preprocess: pad`).
+
+2026-08-28 also evaluated the abc-rabc `karim/rerender-pipeline` LeRobot converter per Karim's
+suggestion: it targets *sim re-render* mcaps (`/left-arm-proprio`, in-mcap h264) — not usable on
+DataEngine episodes; its good ideas (direct LeRobot v3.0 write, commanded actions) noted for a
+future converter revision. Decision: keep the current pipeline for v2.
+
+Norm stats are per-config (namespaced at `<dataset>/norm_stats/<config>/` on S3) so the ZED-only
+arm normalizes over its own subset. Gotchas hit on the way: `sky jobs queue` hides finished jobs
+once the controller autostops (orchestrators must poll with that in mind), and the abc dataset
+first uploaded to `_v2_v2` (yaml sed double-replace) — server-side moved to the right key.
+
+## v1 (2026-08-25)
+
 **Bottom line (2026-08-25):** both pi0.5 arms trained to completion; final checkpoints at
 `s3://xdof-internal-research/siemens/policy_ckpts/<config>/<exp>/14999/params`.
 Dataloader verdict: abc's mcap-export loader matches LeRobot throughput exactly (1.7 s/it on

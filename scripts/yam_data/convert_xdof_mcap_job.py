@@ -48,15 +48,60 @@ from PIL import Image
 
 S3_RAW_BUCKET = "s3://xdof-de-prod"
 CAMERA_KEYS = ["left_camera-images-rgb", "right_camera-images-rgb", "top_camera-images-rgb"]
-# top view comes from the ZED-X stereo left eye
+# The top view differs per station type: ZED stations (yam_zed_0_61) store the stereo
+# left eye as top_camera-images-left_rgb.mp4; D405 stations (yam_0_61) store a mono
+# top_camera-images-rgb.mp4. Exactly one of the two exists per episode.
+TOP_VIDEO_CANDIDATES = ["top_camera-images-left_rgb.mp4", "top_camera-images-rgb.mp4"]
 RAW_VIDEO_FOR_KEY = {
     "left_camera-images-rgb": ("left_camera-images-rgb.mp4", "left_camera-timestamp.npy"),
     "right_camera-images-rgb": ("right_camera-images-rgb.mp4", "right_camera-timestamp.npy"),
-    "top_camera-images-rgb": ("top_camera-images-left_rgb.mp4", "top_camera-timestamp.npy"),
 }
-RAW_FILES = ["left.mcap", "right.mcap", "timestamp.npy", "metadata.json"] + [
+RAW_FILES = ["left.mcap", "right.mcap", "timestamp.npy", "metadata.json", "top_camera-timestamp.npy"] + [
     f for pair in RAW_VIDEO_FOR_KEY.values() for f in pair
 ]
+
+# FOV harmonization: the ZED-X top camera (HFOV 105.6 x VFOV 78.9) is far more zoomed-out
+# than the D405 top camera. Crop ZED top frames to the D405 reference FOV (measured on
+# station sz_44) before resizing, so both station types present the same top framing.
+# The crop window is derived per-episode from that episode's own top-camera intrinsics
+# and centered on the principal point. Side cameras are intentionally NOT cropped: the
+# partner arm / hand-off region routinely falls outside a centered crop (verified on
+# sz_48 frames 2026-08-26).
+D405_REF_HFOV_DEG = 78.7
+D405_REF_VFOV_DEG = 63.2
+
+
+def top_crop_from_metadata(meta: dict) -> tuple[int, int, int, int] | None:
+    """(x0, y0, w, h) crop matching the D405 reference FOV, or None when no crop applies."""
+    import math
+
+    cam = meta.get("camera_info", {}).get("top_camera", {})
+    if not str(cam.get("camera_type", "")).upper().startswith("ZED"):
+        return None
+    intr = cam.get("intrinsics", {})
+    stream = intr.get("left_rgb") or intr.get("rgb")
+    if not stream:
+        return None
+    K = stream["intrinsics_matrix"]
+    fx, fy, cx, cy = K[0][0], K[1][1], K[0][2], K[1][2]
+    width, height = cam["width"], cam["height"]
+    w = 2 * fx * math.tan(math.radians(D405_REF_HFOV_DEG / 2))
+    h = 2 * fy * math.tan(math.radians(D405_REF_VFOV_DEG / 2))
+    if w >= width or h >= height:
+        return None
+    # even sizes keep video encoders happy
+    # floor to even (matches the interactive viewer's window: 1194x896 on sz_48)
+    w, h = int(w / 2) * 2, int(h / 2) * 2
+    # Placement chosen by Karim 2026-08-26 in the interactive crop viewer (sz_48 frame:
+    # x0=435, y0=304 => window center 86.7px right of the principal point, bottom margin 0).
+    # The horizontal shift generalizes across stations as an angular offset:
+    # 86.7px at fx=729 => tan(theta) = 86.7/729.
+    x_center = cx + fx * (86.7 / 729.0)
+    x0 = min(max(int(round(x_center - w / 2)), 0), width - w)
+    # Bottom-anchored: never crop anything off the bottom of the frame (the robot
+    # bases/rails live there).
+    y0 = height - h
+    return (x0, y0, w, h)
 
 
 @dataclasses.dataclass
@@ -83,6 +128,26 @@ def resize_with_pad(img: np.ndarray, size: int) -> np.ndarray:
     out = Image.new("RGB", (size, size), 0)
     out.paste(im, ((size - rw) // 2, (size - rh) // 2))
     return np.asarray(out)
+
+
+def to_ns(ts: np.ndarray) -> np.ndarray:
+    """Normalize a unix-epoch timestamp array to int64 nanoseconds.
+
+    Station firmware is inconsistent: global timestamp.npy is float seconds (~1.7e9),
+    ZED camera timestamps are int64 ns (~1.7e18), D405 camera timestamps are float
+    MILLISECONDS (~1.7e12). Infer the unit from magnitude (valid for unix times
+    between 2001 and 2286).
+    """
+    m = float(np.nanmax(ts))
+    if m < 1e11:
+        scale = 1e9  # seconds
+    elif m < 1e14:
+        scale = 1e6  # milliseconds
+    elif m < 1e17:
+        scale = 1e3  # microseconds
+    else:
+        scale = 1.0  # nanoseconds
+    return (np.asarray(ts, dtype=np.float64) * scale).astype(np.int64)
 
 
 def nearest_indices(source_ts: np.ndarray, target_ts: np.ndarray) -> np.ndarray:
@@ -127,7 +192,7 @@ def read_side_mcap(path: Path, side: str) -> dict[str, np.ndarray]:
 
 def build_state(ep_dir: Path) -> np.ndarray:
     """(N,14) float32 state aligned to timestamp.npy, yam converter joint order (flipped)."""
-    ts_global_ns = (np.load(ep_dir / "timestamp.npy") * 1e9).astype(np.int64)
+    ts_global_ns = to_ns(np.load(ep_dir / "timestamp.npy"))
     n = len(ts_global_ns)
     state = np.empty((n, 14), dtype=np.float32)
     for side, joint_slice, grip_col in [("left", slice(0, 6), 6), ("right", slice(7, 13), 13)]:
@@ -140,10 +205,14 @@ def build_state(ep_dir: Path) -> np.ndarray:
 
 
 def transcode_camera(
-    raw_video: Path, raw_ts: Path, ts_global: np.ndarray, out_path: Path, size: int, fps: int
+    raw_video: Path, raw_ts: Path, ts_global: np.ndarray, out_path: Path, size: int, fps: int,
+    crop: tuple[int, int, int, int] | None = None,
 ) -> int:
-    """Decode raw video, pick nearest frame per global timestamp, resize-with-pad, encode h264."""
-    cam_ts = np.load(raw_ts)
+    """Decode raw video, pick nearest frame per global timestamp, resize-with-pad, encode h264.
+
+    crop: optional (x0, y0, w, h) applied before the resize (ZED top FOV harmonization).
+    """
+    cam_ts = to_ns(np.load(raw_ts))
     needed = nearest_indices(cam_ts, ts_global)  # non-decreasing frame indices, may repeat
     n_out = len(needed)
 
@@ -164,7 +233,11 @@ def transcode_camera(
                 break
             if needed[pos] > f_idx:
                 continue
-            small = resize_with_pad(frame.to_ndarray(format="rgb24"), size)
+            img = frame.to_ndarray(format="rgb24")
+            if crop is not None:
+                x0, y0, w, h = crop
+                img = img[y0 : y0 + h, x0 : x0 + w]
+            small = resize_with_pad(img, size)
             last_small = small
             while pos < n_out and needed[pos] == f_idx:
                 nf = av.VideoFrame.from_ndarray(small, format="rgb24")
@@ -192,13 +265,14 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
     try:
         # 1. download only the files we need
         s3_src = S3_RAW_BUCKET + nfs_path
-        cmd = ["aws", "s3", "cp", s3_src, str(raw_dir), "--recursive", "--only-show-errors", "--exclude", "*"]
-        for f in RAW_FILES:
+        cmd = ["aws", "s3", "sync", s3_src, str(raw_dir), "--size-only", "--only-show-errors", "--exclude", "*"]
+        for f in RAW_FILES + TOP_VIDEO_CANDIDATES:
             cmd += ["--include", f]
         subprocess.run(cmd, check=True, capture_output=True, timeout=600)
         missing = [f for f in RAW_FILES if not (raw_dir / f).exists()]
-        if missing:
-            print(f"  ep {ep_idx} ({ep_name}): missing raw files {missing}; skipping")
+        top_video = next((f for f in TOP_VIDEO_CANDIDATES if (raw_dir / f).exists()), None)
+        if missing or top_video is None:
+            print(f"  ep {ep_idx} ({ep_name}): missing raw files {missing or [TOP_VIDEO_CANDIDATES]}; skipping")
             return None
 
         # 2. state/actions aligned to the global clock; drop last frame (yam converter convention)
@@ -208,18 +282,23 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
             print(f"  ep {ep_idx} ({ep_name}): only {n_use} frames; skipping")
             return None
         state = state[:n_use]
-        ts_global_ns = (np.load(raw_dir / "timestamp.npy") * 1e9).astype(np.int64)[:n_use]
+        ts_global_ns = to_ns(np.load(raw_dir / "timestamp.npy"))[:n_use]
 
-        task_name = json.loads((raw_dir / "metadata.json").read_text()).get("task_name", "industrial packing")
+        meta = json.loads((raw_dir / "metadata.json").read_text())
+        task_name = meta.get("task_name", "industrial packing")
+        top_crop = top_crop_from_metadata(meta)
 
-        # 3. videos
+        # 3. videos (top source file + optional FOV crop are station-dependent)
+        cam_plan = dict(RAW_VIDEO_FOR_KEY)
+        cam_plan["top_camera-images-rgb"] = (top_video, "top_camera-timestamp.npy")
         chunk_id = ep_idx // cfg.chunk_size
-        for cam_key, (raw_video, raw_ts) in RAW_VIDEO_FOR_KEY.items():
+        for cam_key, (raw_video, raw_ts) in cam_plan.items():
             video_dir = base_dir / "videos" / f"chunk-{chunk_id:03d}" / cam_key
             video_dir.mkdir(parents=True, exist_ok=True)
             written = transcode_camera(
                 raw_dir / raw_video, raw_dir / raw_ts, ts_global_ns,
                 video_dir / f"episode_{ep_idx:06d}.mp4", cfg.resize_size, cfg.fps,
+                crop=top_crop if cam_key == "top_camera-images-rgb" else None,
             )
             if written != n_use:
                 raise ValueError(f"{cam_key}: wrote {written} frames, expected {n_use}")

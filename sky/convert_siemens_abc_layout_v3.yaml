@@ -2,9 +2,12 @@
 # (abc's export_mcap.py format: states_actions.bin + strict GOP-30 combined 224px video),
 # for training with abc_minimal's exact dataloader. Runs in us-west-2 next to the raw data.
 #
-# Launch:  uv run sky jobs launch sky/convert_siemens_abc_layout.yaml -n siemens-abc-export --yes
+# v3 (2026-08-29): +33 episodes over v2 — 30 new D405 eps (sz_44/20260828) and
+# 3 ZED eps on the new sz_04 station. 1480 total, >=10s filter keeps 1468.
+#
+# Launch:  uv run sky jobs launch sky/convert_siemens_abc_layout_v3.yaml -n siemens-abc-export-v3 --yes
 
-name: siemens-abc-export-v2
+name: siemens-abc-export-v3
 
 workdir: /home/karim/openpi
 
@@ -17,7 +20,7 @@ resources:
 num_nodes: 1
 
 envs:
-  S3_DATASET_PATH: s3://xdof-internal-research/siemens/datasets/industrial_packing_abc224_v2
+  S3_DATASET_PATH: s3://xdof-internal-research/siemens/datasets/industrial_packing_abc224_v3
 
 setup: |
   echo "[SETUP] deps for abc-layout export"
@@ -34,12 +37,12 @@ run: |
   set -eo pipefail
   echo "[1/2] Exporting raw MCAP episodes -> ABC training layout (>=10s filter, 8 val eps)"
   $HOME/abcenv/bin/python scripts/yam_data/export_abc_layout_job.py \
-    --episode-csv job_episodes_v2.csv \
-    --out-dir "$HOME/abc_dataset/industrial_packing_abc224_v2" \
+    --episode-csv job_episodes_v3.csv \
+    --out-dir "$HOME/abc_dataset/industrial_packing_abc224_v3" \
     --min-duration-s 10 \
     --val-episodes 8 \
     --workers 48
 
   echo "[2/2] Uploading to $S3_DATASET_PATH"
-  aws s3 sync "$HOME/abc_dataset/industrial_packing_abc224_v2" "$S3_DATASET_PATH" --only-show-errors
+  aws s3 sync "$HOME/abc_dataset/industrial_packing_abc224_v3" "$S3_DATASET_PATH" --only-show-errors
   echo "[OK] ABC-layout dataset: $S3_DATASET_PATH"

@@ -57,12 +57,57 @@ SCALAR_STREAMS = [
     ("action-right.mcap", "/action-right-gripper-state", 1),
 ]
 # (camera key, raw video, raw timestamp npy) in combined.mp4 stack order (abc: top first).
+# The top source differs per station: ZED stations (yam_zed_0_61) -> stereo left eye file,
+# D405 stations (yam_0_61) -> mono top_camera-images-rgb.mp4. Exactly one exists per episode.
+TOP_VIDEO_CANDIDATES = ["top_camera-images-left_rgb.mp4", "top_camera-images-rgb.mp4"]
 CAMERA_STREAMS = [
-    ("top", "top_camera-images-left_rgb.mp4", "top_camera-timestamp.npy"),
     ("left", "left_camera-images-rgb.mp4", "left_camera-timestamp.npy"),
     ("right", "right_camera-images-rgb.mp4", "right_camera-timestamp.npy"),
 ]
-RAW_FILES = sorted({f for f, _, _ in SCALAR_STREAMS} | {v for _, v, _ in CAMERA_STREAMS} | {t for _, _, t in CAMERA_STREAMS} | {"metadata.json"})
+STACK_ORDER = ["top", "left", "right"]
+RAW_FILES = sorted(
+    {f for f, _, _ in SCALAR_STREAMS}
+    | {v for _, v, _ in CAMERA_STREAMS}
+    | {t for _, _, t in CAMERA_STREAMS}
+    | {"metadata.json", "top_camera-timestamp.npy"}
+)
+
+# ZED top -> D405-reference FOV crop (see convert_xdof_mcap_job.py for the rationale;
+# derived per-episode from the episode's own intrinsics, centered on the principal point).
+# Side cameras are NOT cropped (centered crops cut off the partner arm / hand-off region).
+D405_REF_HFOV_DEG = 78.7
+D405_REF_VFOV_DEG = 63.2
+
+
+def top_crop_from_metadata(meta):
+    import math
+
+    cam = meta.get("camera_info", {}).get("top_camera", {})
+    if not str(cam.get("camera_type", "")).upper().startswith("ZED"):
+        return None
+    intr = cam.get("intrinsics", {})
+    stream = intr.get("left_rgb") or intr.get("rgb")
+    if not stream:
+        return None
+    K = stream["intrinsics_matrix"]
+    fx, fy, cx, cy = K[0][0], K[1][1], K[0][2], K[1][2]
+    width, height = cam["width"], cam["height"]
+    w = 2 * fx * math.tan(math.radians(D405_REF_HFOV_DEG / 2))
+    h = 2 * fy * math.tan(math.radians(D405_REF_VFOV_DEG / 2))
+    if w >= width or h >= height:
+        return None
+    # floor to even (matches the interactive viewer's window: 1194x896 on sz_48)
+    w, h = int(w / 2) * 2, int(h / 2) * 2
+    # Placement chosen by Karim 2026-08-26 in the interactive crop viewer (sz_48 frame:
+    # x0=435, y0=304 => window center 86.7px right of the principal point, bottom margin 0).
+    # The horizontal shift generalizes across stations as an angular offset:
+    # 86.7px at fx=729 => tan(theta) = 86.7/729.
+    x_center = cx + fx * (86.7 / 729.0)
+    x0 = min(max(int(round(x_center - w / 2)), 0), width - w)
+    # Bottom-anchored: never crop anything off the bottom of the frame (the robot
+    # bases/rails live there).
+    y0 = height - h
+    return (x0, y0, w, h)
 
 X264 = ["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-bf", "0", "-pix_fmt", "yuv420p"]
 X264_STRICT_PARAMS = (
@@ -87,6 +132,17 @@ def floor_indices(source_ts, target_ts):
     return np.clip(np.searchsorted(source_ts, target_ts, side="right") - 1, 0, len(source_ts) - 1)
 
 
+def to_ns(ts):
+    """Normalize a unix-epoch timestamp array to int64 ns.
+
+    Global timestamp.npy is float seconds, ZED camera ts are int64 ns, D405 camera
+    ts are float MILLISECONDS. Infer the unit from magnitude (valid 2001-2286).
+    """
+    m = float(np.nanmax(ts))
+    scale = 1e9 if m < 1e11 else 1e6 if m < 1e14 else 1e3 if m < 1e17 else 1.0
+    return (np.asarray(ts, dtype=np.float64) * scale).astype(np.int64)
+
+
 def probe(path, *entries):
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0", *entries, "-of", "csv=p=0", str(path)],
@@ -95,14 +151,16 @@ def probe(path, *entries):
     return [int(x) for x in out.split(",")]
 
 
-def encode_aligned(video_path, width, height, needed, out_path):
+def encode_aligned(video_path, width, height, needed, out_path, crop=None):
     """Decode raw video, emit frame needed[i] at tick i (duplicating as required), re-encode.
 
     Same as abc's encode_aligned but the input is an mp4 container rather than a raw
-    .h264 elementary stream (ffmpeg handles both identically).
+    .h264 elementary stream (ffmpeg handles both identically). crop: optional
+    (x0, y0, w, h) applied before the scale (ZED top FOV harmonization).
     """
     frame_bytes = width * height * 3
-    vf = (f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease:flags=bicubic,"
+    crop_vf = f"crop={crop[2]}:{crop[3]}:{crop[0]}:{crop[1]}," if crop else ""
+    vf = (f"{crop_vf}scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease:flags=bicubic,"
           f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2")
     dec = subprocess.Popen(
         ["ffmpeg", "-i", str(video_path), "-f", "rawvideo", "-pix_fmt", "rgb24", "-v", "error", "pipe:1"],
@@ -165,27 +223,30 @@ def export_episode(nfs_path: str, out_root: Path, split: str, raw_cache: Path, k
     try:
         cmd = ["aws", "s3", "sync", S3_RAW_BUCKET + nfs_path, str(raw_dir), "--size-only",
                "--only-show-errors", "--exclude", "*"]
-        for f in RAW_FILES:
+        for f in RAW_FILES + TOP_VIDEO_CANDIDATES:
             cmd += ["--include", f]
         subprocess.run(cmd, check=True, capture_output=True, timeout=900)
         missing = [f for f in RAW_FILES if not (raw_dir / f).exists()]
-        if missing:
-            print(f"[SKIP] {ep_id}: missing raw files {missing}")
+        top_video = next((f for f in TOP_VIDEO_CANDIDATES if (raw_dir / f).exists()), None)
+        if missing or top_video is None:
+            print(f"[SKIP] {ep_id}: missing raw files {missing or [TOP_VIDEO_CANDIDATES]}")
             return None
+
+        meta_raw = json.loads((raw_dir / "metadata.json").read_text())
+        top_crop = top_crop_from_metadata(meta_raw)
+        # (camera key, video file, ts file, crop) in STACK_ORDER: top first, like abc.
+        cam_streams = [("top", top_video, "top_camera-timestamp.npy", top_crop)] + [
+            (k, v, t, None) for k, v, t in CAMERA_STREAMS
+        ]
 
         scalars = read_scalar_streams(raw_dir)
         cam_ts = {}
-        for cam_key, _video, ts_npy in CAMERA_STREAMS:
+        for cam_key, _video, ts_npy, _crop in cam_streams:
             raw_ts = np.load(raw_dir / ts_npy)
             if len(raw_ts) == 0:
                 print(f"[SKIP] {ep_id}: empty {ts_npy}")
                 return None
-            # camera timestamps are int64 ns on modern stations, float seconds on older ones
-            if raw_ts.dtype.kind in "iu" or float(np.nanmax(raw_ts)) > 1e12:
-                ts = raw_ts.astype(np.int64)
-            else:
-                ts = (raw_ts * 1e9).astype(np.int64)
-            cam_ts[cam_key] = ts
+            cam_ts[cam_key] = to_ns(raw_ts)
 
         # 30Hz tick grid over the overlap window of ALL streams (abc semantics).
         starts = [ts[0] for ts, _ in scalars.values()] + [ts[0] for ts in cam_ts.values()]
@@ -209,7 +270,7 @@ def export_episode(nfs_path: str, out_root: Path, split: str, raw_cache: Path, k
 
         with tempfile.TemporaryDirectory(dir=raw_cache) as work:
             mp4s = []
-            for cam_key, video, _ts_npy in CAMERA_STREAMS:
+            for cam_key, video, _ts_npy, crop in cam_streams:
                 ts = cam_ts[cam_key]
                 video_path = raw_dir / video
                 width, height = probe(video_path, "-show_entries", "stream=width,height")
@@ -217,7 +278,7 @@ def export_episode(nfs_path: str, out_root: Path, split: str, raw_cache: Path, k
                 if n_frames > 0 and n_frames != len(ts):  # container frames != timestamps; respace
                     ts = np.linspace(ts[0], ts[-1], n_frames, dtype=np.int64)
                 mp4 = str(Path(work) / f"{cam_key}.mp4")
-                encode_aligned(video_path, width, height, floor_indices(ts, ticks), mp4)
+                encode_aligned(video_path, width, height, floor_indices(ts, ticks), mp4, crop=crop)
                 mp4s.append(mp4)
 
             combined = str(out_dir / "combined_camera-images-rgb.mp4")
@@ -237,11 +298,13 @@ def export_episode(nfs_path: str, out_root: Path, split: str, raw_cache: Path, k
                 if n != num_steps:
                     raise RuntimeError(f"{ep_id}: {Path(mp4).name} has {n} frames, expected {num_steps}")
 
-        task_name = json.loads((raw_dir / "metadata.json").read_text()).get("task_name", "industrial packing")
-        meta = {"task_name": task_name, "cameras": [k for k, _, _ in CAMERA_STREAMS],
-                "camera_resolutions": {k: [OUT_W, OUT_H] for k, _, _ in CAMERA_STREAMS},
+        task_name = meta_raw.get("task_name", "industrial packing")
+        meta = {"task_name": task_name, "cameras": [k for k, _, _, _ in cam_streams],
+                "camera_resolutions": {k: [OUT_W, OUT_H] for k, _, _, _ in cam_streams},
                 "alignment": "fixed_clock_30hz_causal", "t0_ns": int(t0), "tick_ns": TICK_NS,
-                "num_steps": num_steps}
+                "num_steps": num_steps,
+                "station_type": meta_raw.get("station_metadata", {}).get("station_type"),
+                "top_fov_crop": list(top_crop) if top_crop else None}
         (out_dir / "episode_metadata.json").write_text(json.dumps(meta, indent=2))
         print(f"[OK] {ep_id} ({split}): {num_steps} steps")
         return {"episode_id": ep_id, "split": split, "num_steps": num_steps}

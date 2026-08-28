@@ -52,11 +52,19 @@ class _Episode:
     usable: int  # frames k where a full action chunk [k, k+horizon) exists
     cameras: tuple[str, ...]  # vstack order in the combined video
     task_name: str
+    station_type: str | None
 
 
-def scan_episodes(data_dir: Path, action_horizon: int) -> list[_Episode]:
-    """abc's scan_episodes: any subdir with states_actions.bin is an episode."""
+def scan_episodes(
+    data_dir: Path, action_horizon: int, station_types: tuple[str, ...] | None = None
+) -> list[_Episode]:
+    """abc's scan_episodes: any subdir with states_actions.bin is an episode.
+
+    station_types: keep only episodes whose episode_metadata.json station_type is in
+    this set (v2 exports record it). None = keep everything.
+    """
     episodes = []
+    skipped_station = 0
     for ep_dir in sorted(Path(data_dir).iterdir()):
         bin_path = ep_dir / "states_actions.bin"
         if not bin_path.exists():
@@ -69,10 +77,16 @@ def scan_episodes(data_dir: Path, action_horizon: int) -> list[_Episode]:
         meta_path = ep_dir / "episode_metadata.json"
         if meta_path.exists():
             meta = json.loads(meta_path.read_text())
+        station = meta.get("station_type")
+        if station_types is not None and station not in station_types:
+            skipped_station += 1
+            continue
         cameras = tuple(meta.get("cameras") or ("top", "left", "right"))
         episodes.append(
-            _Episode(ep_dir, length, usable, cameras, meta.get("task_name") or "")
+            _Episode(ep_dir, length, usable, cameras, meta.get("task_name") or "", station)
         )
+    if skipped_station:
+        logger.info(f"scan_episodes: station filter {station_types} dropped {skipped_station} episodes")
     return episodes
 
 
@@ -108,14 +122,20 @@ class AbcLayoutDataset:
         prompt: str
     """
 
-    def __init__(self, root: Path | str, action_horizon: int, default_prompt: str | None = None):
+    def __init__(
+        self,
+        root: Path | str,
+        action_horizon: int,
+        default_prompt: str | None = None,
+        station_types: tuple[str, ...] | None = None,
+    ):
         root = Path(root)
         # dataset roots produced by export_abc_layout_job.py have train/ + val/ splits;
         # train on train/. A flat root (episodes directly inside) also works.
         data_dir = root / "train" if (root / "train").exists() else root
-        self._episodes = scan_episodes(data_dir, action_horizon)
+        self._episodes = scan_episodes(data_dir, action_horizon, station_types)
         if not self._episodes:
-            raise ValueError(f"no ABC-layout episodes found in {data_dir}")
+            raise ValueError(f"no ABC-layout episodes found in {data_dir} (station filter: {station_types})")
         self._action_horizon = action_horizon
         self._default_prompt = default_prompt or ""
         self._cum = np.cumsum([e.usable for e in self._episodes])

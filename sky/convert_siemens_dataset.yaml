@@ -5,7 +5,7 @@
 #
 # Launch:  uv run sky jobs launch sky/convert_siemens_dataset.yaml -n siemens-dataset-convert --yes
 
-name: siemens-dataset-convert
+name: siemens-dataset-convert-v2b
 
 workdir: /home/karim/openpi
 
@@ -18,9 +18,9 @@ resources:
 num_nodes: 1
 
 envs:
-  REPO_NAME: industrial_packing_yam
-  CONFIG_NAME: pi05_siemens_industrial_packing_bs128
-  S3_DATASET_PATH: s3://xdof-internal-research/siemens/datasets/industrial_packing_yam
+  REPO_NAME: industrial_packing_yam_v2
+  CONFIG_NAME: pi05_siemens_industrial_packing_v2_bs128
+  S3_DATASET_PATH: s3://xdof-internal-research/siemens/datasets/industrial_packing_yam_v2
 
 setup: |
   echo "[SETUP] Setting up openpi for dataset conversion"
@@ -51,7 +51,7 @@ run: |
 
   echo "[1/5] Converting raw MCAP episodes -> LeRobot v2.1 (duration filter >=10s)"
   python scripts/yam_data/convert_xdof_mcap_job.py \
-    --episode-csv job_episodes.csv \
+    --episode-csv job_episodes_v2.csv \
     --repo-name "$REPO_NAME" \
     --min-duration-s 10 \
     --max-workers 48
@@ -78,7 +78,7 @@ run: |
   sample = ds[0]
   for k, v in sample.items():
       print(" ", k, getattr(v, "shape", v) if not isinstance(v, str) else v)
-  assert ds.num_episodes > 700, "expected ~716 episodes"
+  assert ds.num_episodes > 1400, "expected ~716 episodes"
   # boundary consistency: the exact failure mode of the rollover bug
   to_idx = ds.meta.episodes["dataset_to_index"][-1]
   assert to_idx == ds.num_frames == len(ds.hf_dataset), (to_idx, ds.num_frames, len(ds.hf_dataset))

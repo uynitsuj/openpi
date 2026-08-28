@@ -50,6 +50,7 @@ def check_prerequisites():
 def upload_dataset_to_s3(
     dataset_path: Path, s3_bucket: str, repo_id: str, norm_stats_dir: str,
     s3_path_override: Optional[str] = None,
+    norm_stats_subdir: str = "norm_stats",
 ) -> str:
     """Upload dataset and norm stats to S3 and return the full S3 path.
 
@@ -100,15 +101,15 @@ def upload_dataset_to_s3(
         print(f"[INFO] Local norm_stats missing/stub at {norm_stats_file}; worker will compute.")
         return s3_path
 
-    upload_cmd = f"aws s3 sync '{norm_stats_dir}' '{s3_path}/norm_stats' --delete"
+    upload_cmd = f"aws s3 sync '{norm_stats_dir}' '{s3_path}/{norm_stats_subdir}' --delete"
     run_command(upload_cmd)
 
     print("[INFO] Verifying norm stats upload...")
-    verify_cmd = f"aws s3 ls '{s3_path}/norm_stats' --recursive | head -10"
+    verify_cmd = f"aws s3 ls '{s3_path}/{norm_stats_subdir}' --recursive | head -10"
     result = run_command(verify_cmd, capture_output=True)
 
     if not result.stdout.strip():
-        raise RuntimeError(f"Upload verification failed - no files found at {s3_path}/norm_stats")
+        raise RuntimeError(f"Upload verification failed - no files found at {s3_path}/{norm_stats_subdir}")
 
     return s3_path
 
@@ -187,10 +188,12 @@ def _build_run_script() -> str:
         'aws s3 sync "$DATASET_PATH" "$HOME/.cache/huggingface/lerobot/${REPO_ID}"',
         '',
         '# Sync norm stats from S3 (may be empty if dataset is fresh).',
+        '# Namespaced by config: multiple configs can train on the same dataset with',
+        '# different data subsets (e.g. station filters), so stats must not be shared.',
         'echo "[INFO] Syncing norm stats"',
         'NORM_STATS_DIR="$HOME/sky_workdir/assets/$CONFIG_NAME/${REPO_ID}"',
         'mkdir -p "$NORM_STATS_DIR"',
-        'aws s3 sync "$DATASET_PATH/norm_stats" "$NORM_STATS_DIR"',
+        'aws s3 sync "$DATASET_PATH/norm_stats/$CONFIG_NAME" "$NORM_STATS_DIR"',
         '',
         '# If norm_stats absent on S3 (or stub), compute on this worker with',
         '# bounded frames (--max-frames 50000 keeps wall time ~30min instead',
@@ -216,7 +219,7 @@ def _build_run_script() -> str:
         '    exit 1',
         '  fi',
         '  echo "[INFO] Uploading computed norm_stats ($NEW_SIZE bytes) to S3 for reuse by parallel jobs"',
-        '  aws s3 cp "$NORM_STATS_FILE" "$DATASET_PATH/norm_stats/norm_stats.json"',
+        '  aws s3 cp "$NORM_STATS_FILE" "$DATASET_PATH/norm_stats/$CONFIG_NAME/norm_stats.json"',
         'else',
         '  echo "[INFO] Using existing norm_stats ($NORM_STATS_SIZE bytes)"',
         'fi',

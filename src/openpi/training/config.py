@@ -1340,7 +1340,11 @@ class LeRobotVelocitySidecarDataConfig(LeRobotYamRormDataConfig):
                 episodes = tuple(_top_q_episodes(self.repo_id, self.top_q_frac, exclude_eps=val_eps))
             elif self.top_shortest_frac is not None:
                 episodes = tuple(_shortest_episodes(self.repo_id, self.top_shortest_frac, exclude_eps=val_eps))
-            elif non_val_eps:
+            # Leave ``episodes`` unset when there is no validation split or
+            # curation filter. Passing an explicit list containing every
+            # episode makes LeRobot build a multi-million-entry absolute to
+            # relative index map even though the identity mapping is enough.
+            elif val_eps:
                 episodes = non_val_eps
 
         return dataclasses.replace(
@@ -3904,6 +3908,118 @@ _CONFIGS = [
         num_train_steps=15_000,
         save_interval=5_000,
         keep_period=5_000,
+        rabc_enabled=True,
+    ),
+    # ── e12f_ctx24 RABC sidecars on the MJWarp310-reencoded 30 Hz sim sets ──
+    # Scoring writes one velocity per (episode_index, frame_index). These runs
+    # use strict final-action gating (vel[-1] > 1.0) and clip_max=1.0, so every
+    # accepted action chunk has binary sample weight 1. The 7.5k cosine and
+    # bs128/fsdp2 recipe use all eight H100s as four data-parallel FSDP pairs.
+    *[
+        TrainConfig(
+            name=f"pi0_sim_{short}_e12f_ctx24_sidecar_thr100_max1_bs128_7k5",
+            model=pi0_config.Pi0Config(action_horizon=30),
+            data=LeRobotVelocitySidecarDataConfig(
+                repo_id=repo_id,
+                default_prompt=prompt,
+                base_config=DataConfig(prompt_from_task=True),
+                assets=AssetsConfig(assets_dir=assets_dir, asset_id=asset_id),
+                velocity_sidecar_path=sidecar_path,
+                rabc_use_final_action_condition=True,
+                rabc_threshold=1.00,
+                rabc_clip_max=1.0,
+            ),
+            batch_size=128,
+            fsdp_devices=2,
+            num_workers=8,
+            weight_loader=weight_loaders.CheckpointWeightLoader(
+                "gs://openpi-assets/checkpoints/pi0_base/params"
+            ),
+            lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+            num_train_steps=7_500,
+            save_interval=2_500,
+            keep_period=2_500,
+            rabc_enabled=True,
+        )
+        for short, repo_id, prompt, sidecar_path, assets_dir, asset_id in (
+            (
+                "load_plates",
+                "sim_load_the_plates_into_the_dish_rack",
+                "Load the plates into the dish rack",
+                "s3://xdof-internal-research/icrrt/curation/"
+                "sim_load_the_plates_into_the_dish_rack/e12f_ctx24/frame_signals.parquet",
+                "assets/pi0_sim_load_plates_rabc_30hz",
+                "sim_load_the_plates_into_the_dish_rack_30hz_gop10",
+            ),
+            (
+                "throw_bottles",
+                "sim_throw_plastic_bottles_in_bin",
+                "Throw the plastic bottles in the bin",
+                "s3://xdof-internal-research/icrrt/curation/"
+                "sim_throw_plastic_bottles_in_bin/e12f_ctx24/frame_signals.parquet",
+                "assets/pi0_sim_throw_bottles_rabc_30hz",
+                "sim_throw_plastic_bottles_in_bin_30hz_gop10",
+            ),
+        )
+    ],
+    # ── Lego block sorting: matched 7.5k vanilla and e12f RABC policies ──
+    # The RABC arm matches the preceding sim recipe exactly: strict
+    # final-action velocity > 1.0, clip_max=1.0, bs128, and FSDP2 over 8 GPUs.
+    # The vanilla arm has no sidecar transforms or RABC loss weighting.
+    TrainConfig(
+        name="pi0_sim_lego_blocks_sorting_vanilla_bs128_7k5",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamDataConfig(
+            repo_id="lego_blocks_sorting_20260720_30hz_mjwarp310_lerobot_v3",
+            default_prompt="Sort the Lego blocks",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="assets/pi0_sim_lego_blocks_sorting_30hz",
+                asset_id="lego_blocks_sorting_20260720_30hz_mjwarp310_lerobot_v3",
+            ),
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi0_sim_lego_blocks_sorting_e12f_ctx24_sidecar_thr100_max1_bs128_7k5",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotVelocitySidecarDataConfig(
+            repo_id="lego_blocks_sorting_20260720_30hz_mjwarp310_lerobot_v3",
+            default_prompt="Sort the Lego blocks",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="assets/pi0_sim_lego_blocks_sorting_30hz",
+                asset_id="lego_blocks_sorting_20260720_30hz_mjwarp310_lerobot_v3",
+            ),
+            velocity_sidecar_path=(
+                "s3://xdof-internal-research/icrrt/curation/"
+                "lego_blocks_sorting_20260720_30hz_mjwarp310_lerobot_v3/"
+                "e12f_ctx24/frame_signals.parquet"
+            ),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            rabc_clip_max=1.0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
         rabc_enabled=True,
     ),
     # RoboArena & PolaRiS configs.

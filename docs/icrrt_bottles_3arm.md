@@ -9,9 +9,9 @@ real bottles task, using the bs128 speedup recipe (`docs/speedup/`).
 All arms: pi0 (action_horizon 30) from `pi0_base`, the same 2,747-episode
 LeRobot-v3 bottles pool (no `top_shortest_frac` filter — that differs from the
 production `pi0_bottles_warpbc_*` configs on purpose, so retention is the only
-variable), batch 128, `fsdp_devices=2`, cosine decay over the full 60k steps,
-checkpoints every 10k. Note 60k steps @ bs128 is 4x the sample budget of the
-60k @ bs32 production recipe.
+variable), batch 128, `fsdp_devices=2`, cosine decay over the full 15k steps,
+checkpoints at 5k, 10k, and the final step. The current configs use 15k steps;
+older 60k experiments predate this recipe.
 
 | config | repo_id (dataset) | gate |
 |---|---|---|
@@ -93,6 +93,33 @@ wandb key. The RABC subset precompute caches under
 Expected keep rates the loader should report (`sample_weight_zero_frac` ~0 in
 subset mode since zeros are pre-filtered): e12rabc keeps 28.31% of chunks,
 rndmatch 28.33%, vanilla 100%.
+
+## e12f_ctx24 simulation runs
+
+The current simulation recipe uses pi0 with action horizon 30, batch 128,
+`fsdp_devices=2`, eight 80 GB GPUs, a 7.5k-step cosine schedule, and checkpoints
+at steps 2500, 5000, and 7499. RABC uses the e12f_ctx24 checkpoint geometry
+`[400, 160, 60, 30, 15, 5, 0]`, all wrist cameras, strict final-action velocity
+`> 1.0`, and `clip_max=1.0` (binary accepted-sample weights).
+
+| config | dataset | arm |
+|---|---|---|
+| `pi0_sim_load_plates_e12f_ctx24_sidecar_thr100_max1_bs128_7k5` | `sim_load_the_plates_into_the_dish_rack` | RABC |
+| `pi0_sim_throw_bottles_e12f_ctx24_sidecar_thr100_max1_bs128_7k5` | `sim_throw_plastic_bottles_in_bin` | RABC |
+| `pi0_sim_lego_blocks_sorting_vanilla_bs128_7k5` | `lego_blocks_sorting_20260720_30hz_mjwarp310_lerobot_v3` | vanilla BC |
+| `pi0_sim_lego_blocks_sorting_e12f_ctx24_sidecar_thr100_max1_bs128_7k5` | `lego_blocks_sorting_20260720_30hz_mjwarp310_lerobot_v3` | RABC |
+
+The score outputs are archived at
+`s3://xdof-internal-research/icrrt/curation/<dataset>/e12f_ctx24/`; the RABC
+configs fetch `frame_signals.parquet` from those locations automatically.
+Observed keep rates were 36.65% for plates, 44.08% for bottles, and 31.75% for
+Lego. The reusable launcher requires `HF_LEROBOT_HOME` and accepts an optional
+checkpoint base directory:
+
+```bash
+export HF_LEROBOT_HOME=/path/to/lerobot
+scripts/launch_e12f_rabc_train.sh <config> <experiment> /path/to/checkpoints
+```
 
 ## SkyPilot notes (if relaunching from karim's box)
 

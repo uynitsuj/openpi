@@ -1417,6 +1417,12 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
+    # How often (in steps) to run a validation-loss pass. 0 disables it (default).
+    # Only abc-layout datasets carry a val/ split; other configs log a warning and skip.
+    val_interval: int = 0
+    # Number of full batches (of batch_size) evaluated per validation pass, drawn
+    # evenly-spaced across the val split with a fixed rng — deterministic curve.
+    num_val_batches: int = 8
     # How often (in steps) to save checkpoints.
     save_interval: int = 10000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -2046,6 +2052,28 @@ _CONFIGS = [
         save_interval=5_000,
         keep_period=5_000,
     ),
+    # v3cc ablation (2026-08-29): identical episodes to v3 but the dataset is baked with
+    # center-crop resize instead of letterbox padding (full pixel budget, narrower FOV).
+    # First run with the live val pass (val_interval) — same 8 val episodes as v3, so
+    # padded-vs-center-crop val curves compare directly.
+    TrainConfig(
+        name="pi05_siemens_packing_abcloader_v3cc_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=AbcLayoutYamDataConfig(
+            repo_id="industrial_packing_abc224_v3cc",
+            default_prompt="industrial packing",
+            base_config=DataConfig(),
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        val_interval=1_000,
+    ),
     # ZED-only ablation: same dataset, station filter keeps the 1346 yam_zed_0_61
     # episodes (cropped ZED top) and drops the 89 D405 ones. Norm stats are computed
     # per-config, so this arm normalizes over its own subset.
@@ -2089,6 +2117,89 @@ _CONFIGS = [
         num_train_steps=15_000,
         save_interval=5_000,
         keep_period=5_000,
+    ),
+    #
+    # Siemens "simple" D405-only job (DataEngine job 01a046a8-5ed0-7ea1-9064-f173a747688f,
+    # 2106 episodes on sz_44, all yam_0_61/D405 stations). Plain LeRobot yam pipeline —
+    # same conversion + transform stack as pi05_siemens_industrial_packing_bs128 (and the
+    # bottles/warp-rm lineage): convert_xdof_mcap_job.py, 224 resize-with-pad, absolute
+    # joint state=actions, flipped joint order. No ZED crop applies (no ZED stations).
+    #
+    TrainConfig(
+        name="pi05_siemens_simple_d405_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        # LeRobotYamRormDataConfig for the val_frac split machinery only: this
+        # dataset has no velocity column, so the repack stays vanilla and
+        # ComputeRABCWeights no-ops (same shape as the Table-I vanilla BC arms).
+        # val_frac = exactly 10 held-out episodes (k = round(frac * 2105)).
+        data=LeRobotYamRormDataConfig(
+            repo_id="siemens_simple_d405",
+            default_prompt="industrial packing",
+            base_config=DataConfig(prompt_from_task=True),
+            val_frac=10 / 2105,
+            val_seed=0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        val_interval=1_000,
+        project_name="siemens-industrial-packing",
+    ),
+    #
+    # Two-stage curriculum (2026-09-01): 5k on the mixed industrial-packing v3 pool
+    # (LeRobot rebuild of job_episodes_v3.csv, 1468 eps: ZED tops FOV-cropped to the
+    # D405 reference + D405 stations), then 15k fine-tune on the refreshed simple-D405
+    # job (siemens_simple_d405_v2, 2694 eps incl. the 590 new 20260901 episodes).
+    #
+    TrainConfig(
+        name="pi05_siemens_packing_yam_v3_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="industrial_packing_yam_v3",
+            default_prompt="industrial packing",
+            base_config=DataConfig(prompt_from_task=True),
+            val_frac=10 / 1468,  # exactly 10 held-out episodes
+            val_seed=0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=5_000),
+        num_train_steps=5_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        val_interval=1_000,
+        project_name="siemens-industrial-packing",
+    ),
+    TrainConfig(
+        name="pi05_siemens_simple_d405_v2_ft_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="siemens_simple_d405_v2",
+            default_prompt="industrial packing",
+            base_config=DataConfig(prompt_from_task=True),
+            val_frac=10 / 2694,  # exactly 10 held-out episodes
+            val_seed=0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        # Stage-1 output: the 5k industrial-packing-v3 checkpoint (final step 4999) on NFS.
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/nfs_old/karim/siemens_tmp_ckpts/pi05_siemens_packing_yam_v3_bs128/siemens_packing_yam_v3_5k_20260901/4999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        val_interval=1_000,
+        project_name="siemens-industrial-packing",
     ),
     #
     # RABC / AWR weighted YAM tshirt folding configs.

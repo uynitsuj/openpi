@@ -213,6 +213,86 @@ def train_step(
     return new_state, info
 
 
+@at.typecheck
+def val_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> dict[str, at.Array]:
+    """Validation loss on one batch — train_step's loss without gradients or updates."""
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+    observation, actions = batch
+    chunked_loss = model.compute_loss(rng, observation, actions, train=False)
+    return {"val_loss": jnp.mean(chunked_loss)}
+
+
+def build_val_batches(
+    config: _config.TrainConfig,
+) -> list[tuple[_model.Observation, _model.Actions]] | None:
+    """Pre-build a fixed, deterministic set of val batches (host memory).
+
+    Two val sources: abc-layout datasets have a val/ split on disk
+    (export_abc_layout_job.py reserves 8 episodes); LeRobot datasets get one via
+    the data config's val_episodes (val_frac/val_seed on LeRobotYamRormDataConfig).
+    Indices are evenly spaced over the split so the same frames are evaluated
+    every pass and every run. Returns None (with a warning) when no val data is
+    usable — training proceeds without validation.
+    """
+    from lerobot.utils.constants import HF_LEROBOT_HOME  # noqa: PLC0415
+
+    from openpi.training.abc_layout_dataset import AbcLayoutDataset  # noqa: PLC0415
+
+    data_config = config.data.create(config.assets_dirs, config.model)
+    if getattr(data_config, "abc_layout", False):
+        val_root = HF_LEROBOT_HOME / data_config.repo_id / "val"
+        if not val_root.exists():
+            logging.warning("val_interval is set but %s does not exist — skipping validation", val_root)
+            return None
+        station_types = getattr(data_config, "abc_station_types", None)
+        try:
+            dataset = AbcLayoutDataset(val_root, action_horizon=config.model.action_horizon, station_types=station_types)
+        except ValueError:
+            # e.g. the v2/v3 exports' val episodes are all D405 while this config trains
+            # ZED-only: fall back to the unfiltered val split and label the caveat loudly.
+            dataset = AbcLayoutDataset(val_root, action_horizon=config.model.action_horizon, station_types=None)
+            logging.warning(
+                "val split has no episodes matching station filter %s — using the full val split; "
+                "val_loss is out-of-distribution transfer for this config",
+                station_types,
+            )
+        dataset = _data_loader.transform_dataset(dataset, data_config)
+        val_src = str(val_root)
+    elif data_config.val_episodes:
+        # LeRobot-backed split: rebuild the torch dataset over only the held-out
+        # episodes, same transform stack. Zero-weight rejection is train-only
+        # sample selection — never filter the val set.
+        val_config = dataclasses.replace(
+            data_config,
+            episodes=tuple(data_config.val_episodes),
+            reject_zero_weighted_samples=False,
+        )
+        dataset = _data_loader.create_torch_dataset(val_config, config.model.action_horizon, config.model)
+        dataset = _data_loader.transform_dataset(dataset, val_config)
+        val_src = f"{data_config.repo_id} ({len(data_config.val_episodes)} val episodes)"
+    else:
+        logging.warning(
+            "val_interval is set but %s has neither an abc-layout val/ split nor val_episodes — skipping validation",
+            config.name,
+        )
+        return None
+    n_needed = config.num_val_batches * config.batch_size
+    indices = np.linspace(0, len(dataset) - 1, n_needed).astype(int)
+    batches = []
+    for b in range(config.num_val_batches):
+        items = [dataset[int(i)] for i in indices[b * config.batch_size : (b + 1) * config.batch_size]]
+        collated = jax.tree.map(lambda *xs: np.stack(xs), *items)
+        batches.append((_model.Observation.from_dict(collated), collated["actions"]))
+    logging.info("validation: %d batches of %d prepared from %s", len(batches), config.batch_size, val_src)
+    return batches
+
+
 def compute_weighted_fac_float(
     raw_reward: np.ndarray,
     reward: np.ndarray,
@@ -350,6 +430,16 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
+    val_batches = build_val_batches(config) if config.val_interval > 0 else None
+    pval_step = None
+    val_rng = jax.random.key(config.seed + 1)
+    if val_batches:
+        pval_step = jax.jit(
+            functools.partial(val_step, config),
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=replicated_sharding,
+        )
+
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
@@ -459,6 +549,16 @@ def main(config: _config.TrainConfig):
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
+        if pval_step is not None and step % config.val_interval == 0:
+            with sharding.set_mesh(mesh):
+                v_losses = []
+                for vb_i, vb in enumerate(val_batches):
+                    vb_dev = jax.device_put(vb, data_sharding)
+                    v_info = pval_step(jax.random.fold_in(val_rng, vb_i), train_state, vb_dev)
+                    v_losses.append(float(jax.device_get(v_info["val_loss"])))
+            val_loss = float(np.mean(v_losses))
+            pbar.write(f"Step {step}: val_loss={val_loss:.4f} ({len(val_batches)} batches)")
+            wandb.log({"val_loss": val_loss}, step=step)
         if os.environ.get('OPENPI_PROFILE_SYNTHETIC'):
             pass  # reuse the cached batch: measures the pure-compute ceiling
         else:

@@ -34,7 +34,58 @@ race — cancel whichever loses):
 | local 8×H100 | combined | `pi05_siemens_packing_abcloader_v2_bs128` / `siemens_packing_pi05_combined_v2_20260826_local` | all 1427 train eps | **SUCCEEDED 2026-08-29**, rc=0, **wall 313 min** (23:24→04:40 local). All 3 ckpts verified full-size on S3 (44.7GB each; 5000/10000 streamed during training, 14999 right after). Dataset-sync step skips S3 when the local copy is complete (expired-auth-proof). |
 | sky job 12 | combined | same config / `..._20260826` (no `_local`) | same | CANCELLED 2026-08-29 00:13 local after 6h40m of provisioning flaps (never reached RUNNING) — local run won the race. |
 
-**v3 (2026-08-29, in flight)**: +33 eps (30 D405 sz_44/20260828, 3 ZED on new station sz_04 —
+**Post-hoc val losses (2026-08-30)** — model.compute_loss(train=False) on each dataset's 8
+held-out val episodes (exporter holds out the *newest* 8 → all-D405 in v2/v3, all-ZED in v1;
+ZED-only rows are therefore D405 OOD transfer, not in-dist val). Full numbers in wandb
+(karim-el-refai-ucb/siemens-industrial-packing):
+
+| run | @5000 | @10000 | @14999 | read |
+|---|---|---|---|---|
+| v1 abcloader (in-dist) | 0.0066 | 0.0075 | 0.0090 | steady overfit; best ckpt = 5000 |
+| v2 combined (in-dist) | 0.0051 | 0.0050 | 0.0055 | flat — 2× data fixed the overfit |
+| v2 ZED-only (OOD) | 0.0120 | 0.0147 | 0.0178 | specializes away from D405 |
+| v3 combined (in-dist) | lost | lost | 0.0068 | 5k/10k ckpts lost (SSO expiry killed the S3 stream mid-upload + keep-period GC deleted local) |
+| v3 ZED-only (OOD) | 0.0150 | 0.0175 | 0.0203 | as v2; different val eps than v2 (newest-8 moved) |
+
+Lesson: local runs now keep 5k-interval checkpoints on NFS (`--keep-period 5000`) so
+intermediates never depend on the S3 stream surviving an auth window. train.py gained an
+opt-in live val pass (`val_interval`) — first used by the v3cc center-crop ablation.
+
+**Sampled-action recon MSE (2026-09-01)** — abc-style val metric (`scripts/eval_val_recon.py`):
+full `sample_actions` (the serving path, default denoising steps) over the same val-8 splits,
+MSE vs GT actions in normalized space, headline = first 14 (real) dims. All 14 surviving
+checkpoints; in wandb summaries as `recon_mse_{14,32,arm,gripper}[_d405_ood]_<step>`:
+
+| run | @5000 | @10000 | @14999 | arm / gripper @14999 |
+|---|---|---|---|---|
+| v1 abcloader (in-dist) | 0.0078 | 0.0067 | 0.0064 | 0.0045 / 0.0178 |
+| v2 combined (in-dist) | 0.0065 | 0.0052 | **0.0047** | 0.0041 / 0.0081 |
+| v2 ZED-only (OOD) | 0.0165 | 0.0180 | 0.0162 | 0.0126 / 0.0378 |
+| v3 combined (in-dist) | lost | lost | 0.0056 | 0.0049 / 0.0099 |
+| v3 ZED-only (OOD) | 0.0231 | 0.0216 | 0.0207 | 0.0175 / 0.0396 |
+| v3cc center-crop (in-dist) | lost | lost | 0.0055 | 0.0047 / 0.0102 |
+
+Reads: (1) **the metric disagrees with flow val loss on v1** — flow val said overfit after 5k
+(0.0066→0.0090) but sampled-action error improves monotonically through 15k, so the final
+checkpoint is the right serving choice by the metric that matches serving; (2) gripper error is
+2–4× arm error everywhere (worst in v1 and the OOD rows) — the gap the physical-units
+decomposition should watch; (3) v2 combined final is the best sampled-action model overall,
+with the caveat that v2's val-8 differs from v3's (newest-8 moved); (4) center-crop vs pad
+stays a wash (0.0055 vs 0.0056) — still a rollout decision.
+
+**v3cc center-crop ablation (2026-08-30)**: `industrial_packing_abc224_v3cc` (sky job 16, same
+episodes + same val 8 as v3, `--resize-mode center_crop`) →
+`pi05_siemens_packing_abcloader_v3cc_bs128` / `siemens_packing_pi05_combined_v3cc_20260829`,
+local 8×H100, **rc=0 wall 252min**. First run with train.py's live val pass (val_interval=1000):
+val 0.0122 @1k → best **0.0068 @8k** → 0.0072 @15k — **parity with padded v3 combined (0.0068)**;
+the pad-vs-center-crop choice doesn't move action-prediction val loss; decide on rollouts.
+Serving this ckpt requires **center_crop** preprocessing (bair-style), unlike all pad-lineage runs.
+Ckpts 5000/10000 lost (the mid-run keep-period patch lost its read race, orbax GC'd them locally
+and the S3 streams failed silently); 14999 safe on NFS, pushed to S3 2026-09-01. **SSO gotcha
+quantified**: the effective upload window after a token refresh was only ~3.5–5h (absolute session
+expiry, not 8h-per-refresh) — never let a checkpoint's only copy depend on an S3 stream.
+
+**v3 (2026-08-29)**: +33 eps (30 D405 sz_44/20260828, 3 ZED on new station sz_04 —
 crop formula verified visually, 1224×918 @ (442,282)). Export sky job 15
 (`sky/convert_siemens_abc_layout_v3.yaml` → `industrial_packing_abc224_v3`); local pipeline
 `scripts/run_v3_local_pipeline.sh` then trains `pi05_siemens_packing_abcloader_v3_zedonly_bs128`

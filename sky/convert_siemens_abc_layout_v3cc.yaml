@@ -1,0 +1,48 @@
+# v3cc: same episodes as v3 (job_episodes_v3.csv, 1480 eps, >=10s keeps 1468) but every
+# camera is CENTER-CROPPED to the largest square then scaled to 224 — no letterbox padding.
+# Wrists: full pixel budget, -37.5% horizontal FOV. ZED top: the D405-FOV-matched window is
+# applied first, then squared (~59deg effective hFOV). Val split logic unchanged -> the 8
+# val episodes are identical to v3's, so padded-vs-center-crop val losses are comparable.
+#
+# Launch:  uv run sky jobs launch sky/convert_siemens_abc_layout_v3cc.yaml -n siemens-abc-export-v3cc --yes
+
+name: siemens-abc-export-v3cc
+
+workdir: /home/karim/openpi
+
+resources:
+  infra: aws/us-west-2
+  cpus: 96+
+  memory: 128+
+  disk_size: 200
+
+num_nodes: 1
+
+envs:
+  S3_DATASET_PATH: s3://xdof-internal-research/siemens/datasets/industrial_packing_abc224_v3cc
+
+setup: |
+  echo "[SETUP] deps for abc-layout export"
+  if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
+  export DEBIAN_FRONTEND=noninteractive
+  $SUDO apt-get update && $SUDO apt-get install -y ffmpeg awscli curl
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  source $HOME/.local/bin/env 2>/dev/null || true
+  uv venv --python 3.11 $HOME/abcenv
+  uv pip install --python $HOME/abcenv/bin/python numpy mcap mcap-protobuf-support
+  echo "[SETUP] Complete"
+
+run: |
+  set -eo pipefail
+  echo "[1/2] Exporting raw MCAP episodes -> ABC layout, center-crop resize (>=10s filter, 8 val eps)"
+  $HOME/abcenv/bin/python scripts/yam_data/export_abc_layout_job.py \
+    --episode-csv job_episodes_v3.csv \
+    --out-dir "$HOME/abc_dataset/industrial_packing_abc224_v3cc" \
+    --min-duration-s 10 \
+    --val-episodes 8 \
+    --resize-mode center_crop \
+    --workers 48
+
+  echo "[2/2] Uploading to $S3_DATASET_PATH"
+  aws s3 sync "$HOME/abc_dataset/industrial_packing_abc224_v3cc" "$S3_DATASET_PATH" --only-show-errors
+  echo "[OK] ABC-layout dataset: $S3_DATASET_PATH"

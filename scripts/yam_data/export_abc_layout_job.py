@@ -151,17 +151,25 @@ def probe(path, *entries):
     return [int(x) for x in out.split(",")]
 
 
-def encode_aligned(video_path, width, height, needed, out_path, crop=None):
+def encode_aligned(video_path, width, height, needed, out_path, crop=None, resize_mode="pad"):
     """Decode raw video, emit frame needed[i] at tick i (duplicating as required), re-encode.
 
     Same as abc's encode_aligned but the input is an mp4 container rather than a raw
     .h264 elementary stream (ffmpeg handles both identically). crop: optional
     (x0, y0, w, h) applied before the scale (ZED top FOV harmonization).
+    resize_mode: "pad" letterboxes to OUT_WxOUT_H (openpi/abc convention, full FOV,
+    black bars); "center_crop" takes the largest centered square then scales — full
+    pixel budget, but narrows the horizontal FOV (wrists lose 37.5% of width; the
+    FOV-matched top window loses ~25%).
     """
     frame_bytes = width * height * 3
     crop_vf = f"crop={crop[2]}:{crop[3]}:{crop[0]}:{crop[1]}," if crop else ""
-    vf = (f"{crop_vf}scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease:flags=bicubic,"
-          f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2")
+    if resize_mode == "center_crop":
+        vf = (f"{crop_vf}crop='min(iw\\,ih)':'min(iw\\,ih)',"
+              f"scale={OUT_W}:{OUT_H}:flags=bicubic")
+    else:
+        vf = (f"{crop_vf}scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease:flags=bicubic,"
+              f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2,pad=width=ceil(iw/2)*2:height=ceil(ih/2)*2")
     dec = subprocess.Popen(
         ["ffmpeg", "-i", str(video_path), "-f", "rawvideo", "-pix_fmt", "rgb24", "-v", "error", "pipe:1"],
         stdout=subprocess.PIPE,
@@ -214,7 +222,7 @@ def read_scalar_streams(ep_dir: Path) -> dict[str, tuple[np.ndarray, np.ndarray]
     return out
 
 
-def export_episode(nfs_path: str, out_root: Path, split: str, raw_cache: Path, keep_raw: bool) -> dict | None:
+def export_episode(nfs_path: str, out_root: Path, split: str, raw_cache: Path, keep_raw: bool, resize_mode: str = "pad") -> dict | None:
     ep_name = Path(nfs_path).name
     ep_id = ep_name.removesuffix(".npy.mp4")
     raw_dir = raw_cache / ep_name
@@ -278,7 +286,7 @@ def export_episode(nfs_path: str, out_root: Path, split: str, raw_cache: Path, k
                 if n_frames > 0 and n_frames != len(ts):  # container frames != timestamps; respace
                     ts = np.linspace(ts[0], ts[-1], n_frames, dtype=np.int64)
                 mp4 = str(Path(work) / f"{cam_key}.mp4")
-                encode_aligned(video_path, width, height, floor_indices(ts, ticks), mp4, crop=crop)
+                encode_aligned(video_path, width, height, floor_indices(ts, ticks), mp4, crop=crop, resize_mode=resize_mode)
                 mp4s.append(mp4)
 
             combined = str(out_dir / "combined_camera-images-rgb.mp4")
@@ -304,7 +312,8 @@ def export_episode(nfs_path: str, out_root: Path, split: str, raw_cache: Path, k
                 "alignment": "fixed_clock_30hz_causal", "t0_ns": int(t0), "tick_ns": TICK_NS,
                 "num_steps": num_steps,
                 "station_type": meta_raw.get("station_metadata", {}).get("station_type"),
-                "top_fov_crop": list(top_crop) if top_crop else None}
+                "top_fov_crop": list(top_crop) if top_crop else None,
+                "resize_mode": resize_mode}
         (out_dir / "episode_metadata.json").write_text(json.dumps(meta, indent=2))
         print(f"[OK] {ep_id} ({split}): {num_steps} steps")
         return {"episode_id": ep_id, "split": split, "num_steps": num_steps}
@@ -349,6 +358,8 @@ def main():
     ap.add_argument("--val-episodes", type=int, default=8)
     ap.add_argument("--workers", type=int, default=48)
     ap.add_argument("--raw-cache-dir", type=Path, default=Path("/tmp/xdof_raw_abc"))
+    ap.add_argument("--resize-mode", choices=["pad", "center_crop"], default="pad",
+                    help="pad = letterbox (abc/openpi convention); center_crop = largest centered square, full pixel budget, narrower FOV")
     ap.add_argument("--keep-raw", action="store_true")
     ap.add_argument("--max-episodes", type=int, default=None)
     args = ap.parse_args()
@@ -372,7 +383,7 @@ def main():
     ok = 0
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futs = [
-            pool.submit(export_episode, r["nfs_path"], out_root, split, args.raw_cache_dir, args.keep_raw)
+            pool.submit(export_episode, r["nfs_path"], out_root, split, args.raw_cache_dir, args.keep_raw, args.resize_mode)
             for r, split in zip(rows, splits)
         ]
         for i, fut in enumerate(as_completed(futs)):

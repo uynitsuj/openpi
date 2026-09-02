@@ -7,6 +7,7 @@
 set -u
 cd /home/karim/openpi
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY socks_proxy SOCKS_PROXY all_proxy ALL_PROXY
+source "$(dirname "$0")/aws_turbo_env.sh"
 
 PY=/home/karim/openpi/.venv/bin/python
 CFG=pi05_siemens_simple_d405_v3_bs128

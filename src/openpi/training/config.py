@@ -2201,6 +2201,32 @@ _CONFIGS = [
         val_interval=1_000,
         project_name="siemens-industrial-packing",
     ),
+    # Center-crop ablation of the simple-D405 task (2026-09-02): same 2894-episode
+    # pool as siemens_simple_d405_v2 but baked with --resize-mode center_crop
+    # (640x480 -> center 480x480 -> 224, no letterbox — the bottles/sss45 look).
+    # Serving must center-crop to match. NOTE: episode numbering is scrambled per
+    # build, so this config's val episodes differ from v2's despite the same pool.
+    TrainConfig(
+        name="pi05_siemens_simple_d405_cc_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="siemens_simple_d405_cc",
+            default_prompt="industrial packing",
+            base_config=DataConfig(prompt_from_task=True),
+            val_frac=10 / 2892,
+            val_seed=0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        val_interval=1_000,
+        project_name="siemens-industrial-packing",
+    ),
     #
     # RABC / AWR weighted YAM tshirt folding configs.
     #

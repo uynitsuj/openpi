@@ -1,5 +1,32 @@
 # Siemens industrial packing — run ledger
 
+## simple-D405 line (2026-09-01/02) — DataEngine job 01a046a8-5ed0-7ea1-9064-f173a747688f
+
+All-D405 (sz_44) "simple" variant of the packing task; plain LeRobot yam pipeline
+(no crop), datasets `siemens_simple_d405{,_v2,_cc}` (2105 / 2892 / 2892 eps — the
+job grew from 2106→2894 rows over 9/1; v2 and cc share the same pool, cc is baked
+`--resize-mode center_crop` 640x480→480²→224, serving must center-crop). Val =
+`val_frac` holdouts (10/11/10 eps; episode numbering scrambles per build, so splits
+never match across builds). Live val + wandb (`siemens-industrial-packing`) on all runs.
+
+| run | init | steps | wall | flow-val floor | recon_mse_14 @5k/10k/final (arm/grip @final) |
+|---|---|---|---|---|---|
+| `pi05_siemens_simple_d405_bs128` / `..._pi05_20260901` | pi05_base | 15k | 318min | 0.0048 @8–10k | 0.00525 / 0.00441 / **0.00402** (0.00375/0.00564) |
+| `pi05_siemens_packing_yam_v3_bs128` / `..._5k_20260901` (stage 1, on `industrial_packing_yam_v3` = LeRobot rebuild of the v3 pool, 1468 eps) | pi05_base | 5k | 112min | 0.0051 @4k | — / — / 0.00524 @4999 (0.00348/0.01582) |
+| `pi05_siemens_simple_d405_v2_ft_bs128` / `..._v2_ft_20260901` (stage 2, fresh-data re-query at launch: +788 eps) | stage-1 @4999 | 15k | 319min | 0.0055–0.0057 @8k+ | 0.00642 / 0.00556 / 0.00532 (0.00457/0.00986) |
+| `pi05_siemens_simple_d405_cc_bs128` / `..._cc_20260902` (center-crop ablation) | pi05_base | 15k | in flight | — | — |
+
+Reads: (1) two-stage curriculum warm-start converges faster early (val 0.019 at
+step 0 vs 0.845 from base) but does NOT beat the direct baseline on recon — face
+value 0.00402 vs 0.00532, confounded by different val splits; the curriculum's
+gripper error (0.00986 vs 0.00564) suggests an inherited industrial-packing gripper
+bias. (2) recon improves monotonically through every schedule — serve the final
+checkpoints. (3) simple task gripper/arm error ratio ~1.5x vs 2–4.5x on the packing
+models. Checkpoints: NFS `/nfs_old/karim/siemens_tmp_ckpts` + verified byte-complete
+on `s3://xdof-internal-research/siemens/policy_ckpts/`. Ops note: SZ↔S3 was ~17KB/s
+with hard-hung streams the evening of 9/1 (watchdog + `timeout`-wrapped syncs added);
+recovered to ~50MB/s the next morning.
+
 ## v2 (2026-08-26): new data + FOV harmonization
 
 The job grew to 1,447 episodes: 1,358 on ZED stations (sz_43/48/50) + 89 on the D405 station

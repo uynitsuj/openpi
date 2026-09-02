@@ -112,11 +112,24 @@ class Config:
     min_duration_s: float = 10.0
     raw_cache_dir: Path = Path("/tmp/xdof_raw_eps")
     resize_size: int = 224
+    # "pad" (house convention: letterbox) or "center_crop" (largest square -> resize,
+    # e.g. 640x480 -> 480x480 -> 224x224; serving must center-crop to match).
+    resize_mode: str = "pad"
     fps: int = 30
     chunk_size: int = 1000
     max_workers: int = 24
     keep_raw: bool = False
     max_episodes: int | None = None  # for smoke tests
+
+
+def center_crop_resize(img: np.ndarray, size: int) -> np.ndarray:
+    """Center-crop to the largest square (e.g. 640x480 -> 480x480), then BILINEAR
+    resize to size x size. No letterbox bars — full pixel budget, narrower FOV."""
+    h, w = img.shape[:2]
+    s = min(h, w)
+    y0, x0 = (h - s) // 2, (w - s) // 2
+    im = Image.fromarray(img[y0 : y0 + s, x0 : x0 + s])
+    return np.asarray(im.resize((size, size), resample=Image.BILINEAR))
 
 
 def resize_with_pad(img: np.ndarray, size: int) -> np.ndarray:
@@ -206,7 +219,7 @@ def build_state(ep_dir: Path) -> np.ndarray:
 
 def transcode_camera(
     raw_video: Path, raw_ts: Path, ts_global: np.ndarray, out_path: Path, size: int, fps: int,
-    crop: tuple[int, int, int, int] | None = None,
+    crop: tuple[int, int, int, int] | None = None, resize_mode: str = "pad",
 ) -> int:
     """Decode raw video, pick nearest frame per global timestamp, resize-with-pad, encode h264.
 
@@ -237,7 +250,7 @@ def transcode_camera(
             if crop is not None:
                 x0, y0, w, h = crop
                 img = img[y0 : y0 + h, x0 : x0 + w]
-            small = resize_with_pad(img, size)
+            small = center_crop_resize(img, size) if resize_mode == "center_crop" else resize_with_pad(img, size)
             last_small = small
             while pos < n_out and needed[pos] == f_idx:
                 nf = av.VideoFrame.from_ndarray(small, format="rgb24")
@@ -297,7 +310,7 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
             video_dir.mkdir(parents=True, exist_ok=True)
             written = transcode_camera(
                 raw_dir / raw_video, raw_dir / raw_ts, ts_global_ns,
-                video_dir / f"episode_{ep_idx:06d}.mp4", cfg.resize_size, cfg.fps,
+                video_dir / f"episode_{ep_idx:06d}.mp4", cfg.resize_size, cfg.fps, resize_mode=cfg.resize_mode,
                 crop=top_crop if cam_key == "top_camera-images-rgb" else None,
             )
             if written != n_use:
@@ -469,6 +482,7 @@ def main(cfg: Config):
     info = {
         "codebase_version": "v2.1",
         "robot_type": "yams",
+        "resize_mode": cfg.resize_mode,
         "total_episodes": n_eps,
         "total_frames": total_frames,
         "total_tasks": len(tasks),

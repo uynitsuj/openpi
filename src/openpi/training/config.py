@@ -2252,6 +2252,30 @@ _CONFIGS = [
         val_interval=1_000,
         project_name="siemens-industrial-packing",
     ),
+    # v4 refresh (2026-09-02 evening): 3527 eps — audit_result not bad (all null at
+    # snapshot time), overall_quality not poor, duration > 20s. Tail-trimmed,
+    # pad+resize (no crop), same recipe as v3.
+    TrainConfig(
+        name="pi05_siemens_simple_d405_v4_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="siemens_simple_d405_v4",
+            default_prompt="industrial packing",
+            base_config=DataConfig(prompt_from_task=True),
+            val_frac=10 / 3527,  # ~10 held-out episodes
+            val_seed=0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        val_interval=1_000,
+        project_name="siemens-industrial-packing",
+    ),
     #
     # RABC / AWR weighted YAM tshirt folding configs.
     #

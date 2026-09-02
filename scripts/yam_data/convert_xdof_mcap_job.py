@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 import tyro
 from PIL import Image
+from tail_trim import PARK_POSE_SIMPLE_D405, detect_trim
 
 S3_RAW_BUCKET = "s3://xdof-de-prod"
 CAMERA_KEYS = ["left_camera-images-rgb", "right_camera-images-rgb", "top_camera-images-rgb"]
@@ -118,6 +119,11 @@ class Config:
     fps: int = 30
     chunk_size: int = 1000
     max_workers: int = 24
+    # Cut the operator stop-button tail (release grippers -> retract to park -> press stop,
+    # ~16% of frames on siemens_simple_d405_v2). See tail_trim.py for the detector + guards;
+    # episodes whose ending doesn't match the expected pattern are kept whole.
+    trim_tails: bool = False
+    trim_buffer_s: float = 1.0
     keep_raw: bool = False
     max_episodes: int | None = None  # for smoke tests
 
@@ -295,6 +301,13 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
             print(f"  ep {ep_idx} ({ep_name}): only {n_use} frames; skipping")
             return None
         state = state[:n_use]
+        trimmed_s = 0.0
+        if cfg.trim_tails:
+            trim, _flag = detect_trim(state, PARK_POSE_SIMPLE_D405, buffer_s=cfg.trim_buffer_s)
+            if trim is not None:
+                trimmed_s = (n_use - trim) / cfg.fps
+                n_use = trim
+                state = state[:n_use]
         ts_global_ns = to_ns(np.load(raw_dir / "timestamp.npy"))[:n_use]
 
         meta = json.loads((raw_dir / "metadata.json").read_text())
@@ -361,7 +374,7 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
                 "count": [n_use],
             }
 
-        return {"episode_index": ep_idx, "tasks": [task_name], "length": n_use, "stats": stats}
+        return {"episode_index": ep_idx, "tasks": [task_name], "length": n_use, "stats": stats, "trimmed_s": trimmed_s}
     except Exception:
         print(f"  ep {ep_idx} ({ep_name}) FAILED:\n{traceback.format_exc()}")
         return None
@@ -399,6 +412,14 @@ def main(cfg: Config):
                 print(f"progress: {i + 1}/{len(futures)} processed, {len(results)} ok")
 
     ok_indices = sorted(results)
+    if cfg.trim_tails:
+        trimmed = [results[i]["trimmed_s"] for i in ok_indices if results[i]["trimmed_s"] > 0]
+        print(
+            f"tail trim: {len(trimmed)}/{len(ok_indices)} episodes trimmed, "
+            f"{sum(trimmed) / 3600:.2f} h cut (median {np.median(trimmed):.2f} s/ep)"
+            if trimmed
+            else "tail trim: enabled but no episode qualified"
+        )
     print(f"converted {len(ok_indices)}/{len(df)} episodes; renumbering...")
 
     # Renumber to a contiguous 0..K-1 (failures leave holes) and fix global `index` offsets.

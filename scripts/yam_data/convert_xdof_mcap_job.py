@@ -463,6 +463,26 @@ def main(cfg: Config):
         episodes_stats.append({"episode_index": new_idx, "stats": stats})
         global_offset += n
 
+    # Explicit provenance: episode_index -> source episode. Numbering is
+    # deterministic (created_at-sorted CSV order minus failures), but nobody
+    # should have to re-derive that. A copy lands next to the dataset dir so
+    # it survives the v2.1 -> v3.0 migration.
+    manifest = pd.DataFrame(
+        {
+            "episode_index": np.arange(len(ok_indices), dtype=np.int64),
+            "task_id": [df.iloc[i].id for i in ok_indices],
+            "nfs_path": [df.iloc[i].nfs_path for i in ok_indices],
+            "created_at": [df.iloc[i].created_at for i in ok_indices],
+            "operator": [df.iloc[i].operator for i in ok_indices],
+            "duration_s": [df.iloc[i].duration_s for i in ok_indices],
+            "length_frames": [results[i]["length"] for i in ok_indices],
+            "trimmed_s": [results[i]["trimmed_s"] for i in ok_indices],
+        }
+    )
+    manifest.to_csv(base_dir / "meta" / "source_manifest.csv", index=False)
+    manifest.to_csv(base_dir.parent / f"{cfg.repo_name}_source_manifest.csv", index=False)
+    print(f"source manifest: {len(manifest)} rows -> meta/source_manifest.csv")
+
     with open(base_dir / "meta" / "episodes.jsonl", "w") as f:
         for e in episodes:
             f.write(json.dumps(e) + "\n")

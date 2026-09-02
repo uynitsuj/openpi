@@ -48,16 +48,30 @@ def main() -> None:
 
     cfg = _config.get_config(args.config_name)
     data_config = cfg.data.create(cfg.assets_dirs, cfg.model)
-    val_root = HF_LEROBOT_HOME / data_config.repo_id / "val"
-    station_types = getattr(data_config, "abc_station_types", None)
     ood = False
-    try:
-        ds = AbcLayoutDataset(val_root, action_horizon=cfg.model.action_horizon, station_types=station_types)
-    except ValueError:
-        ood = True
-        ds = AbcLayoutDataset(val_root, action_horizon=cfg.model.action_horizon, station_types=None)
-    n_eps = len(ds._episodes)  # noqa: SLF001
-    ds = _dl.transform_dataset(ds, data_config)
+    if getattr(data_config, "abc_layout", False):
+        val_root = HF_LEROBOT_HOME / data_config.repo_id / "val"
+        station_types = getattr(data_config, "abc_station_types", None)
+        try:
+            ds = AbcLayoutDataset(val_root, action_horizon=cfg.model.action_horizon, station_types=station_types)
+        except ValueError:
+            ood = True
+            ds = AbcLayoutDataset(val_root, action_horizon=cfg.model.action_horizon, station_types=None)
+        n_eps = len(ds._episodes)  # noqa: SLF001
+        ds = _dl.transform_dataset(ds, data_config)
+    elif data_config.val_episodes:
+        # LeRobot-backed split (val_frac/val_seed configs) — same episodes the
+        # training run held out, rebuilt with the training transform stack.
+        import dataclasses  # noqa: PLC0415
+
+        val_cfg = dataclasses.replace(
+            data_config, episodes=tuple(data_config.val_episodes), reject_zero_weighted_samples=False
+        )
+        ds = _dl.create_torch_dataset(val_cfg, cfg.model.action_horizon, cfg.model)
+        n_eps = len(data_config.val_episodes)
+        ds = _dl.transform_dataset(ds, val_cfg)
+    else:
+        raise SystemExit(f"{args.config_name}: no val split (neither abc-layout val/ nor val_episodes)")
     n = len(ds)
     bs = args.batch_size
     n_batches = n // bs

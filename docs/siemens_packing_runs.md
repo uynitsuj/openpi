@@ -14,7 +14,7 @@ never match across builds). Live val + wandb (`siemens-industrial-packing`) on a
 | `pi05_siemens_simple_d405_bs128` / `..._pi05_20260901` | pi05_base | 15k | 318min | 0.0048 @8–10k | 0.00525 / 0.00441 / **0.00402** (0.00375/0.00564) |
 | `pi05_siemens_packing_yam_v3_bs128` / `..._5k_20260901` (stage 1, on `industrial_packing_yam_v3` = LeRobot rebuild of the v3 pool, 1468 eps) | pi05_base | 5k | 112min | 0.0051 @4k | — / — / 0.00524 @4999 (0.00348/0.01582) |
 | `pi05_siemens_simple_d405_v2_ft_bs128` / `..._v2_ft_20260901` (stage 2, fresh-data re-query at launch: +788 eps) | stage-1 @4999 | 15k | 319min | 0.0055–0.0057 @8k+ | 0.00642 / 0.00556 / 0.00532 (0.00457/0.00986) |
-| `pi05_siemens_simple_d405_cc_bs128` / `..._cc_20260902` (center-crop ablation) | pi05_base | 15k | in flight | — | — |
+| `pi05_siemens_simple_d405_cc_bs128` / `..._cc_20260902` (center-crop ablation) | pi05_base | 15k | 326min | 0.0052–0.0053 @10k+ | 0.00670 / 0.00567 / 0.00566 (0.00484/0.01061) |
 
 Reads: (1) two-stage curriculum warm-start converges faster early (val 0.019 at
 step 0 vs 0.845 from base) but does NOT beat the direct baseline on recon — face

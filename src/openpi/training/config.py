@@ -2269,8 +2269,12 @@ _CONFIGS = [
         fsdp_devices=2,
         num_workers=8,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
-        num_train_steps=15_000,
+        # 2026-09-03: extended 15k -> 60k for the open-ended continuation of
+        # siemens_simple_d405_v4_20260903 (resumed from 14999; the first 15k
+        # ran with decay_steps=15_000, so the resume warm-restarts the LR at
+        # the 60k cosine's step-15k value, ~2.2e-5). Stop manually.
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
+        num_train_steps=60_000,
         save_interval=5_000,
         keep_period=5_000,
         val_interval=1_000,

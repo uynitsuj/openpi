@@ -2305,6 +2305,32 @@ _CONFIGS = [
         val_interval=1_000,
         project_name="siemens-industrial-packing",
     ),
+    # v5dj (2026-09-03): NEW LINEAGE — driver joint order ("dj": dataset built
+    # with --no-flip-joints; serving is STRAIGHT-THROUGH, no per-arm flip) and
+    # the explicit packing prompt baked in via --task-override. 4180 eps incl.
+    # the new sz_34 station. From pi05_base ONLY; never warm-start from or mix
+    # with flip-lineage (v1-v4) data or checkpoints. 20k steps.
+    TrainConfig(
+        name="pi05_siemens_simple_d405_v5dj_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="siemens_simple_d405_v5dj",
+            default_prompt="Pack one transparent bag into the cardboard box and flatten the bag.",
+            base_config=DataConfig(prompt_from_task=True),
+            val_frac=10 / 4180,  # ~10 held-out episodes
+            val_seed=0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        val_interval=1_000,
+        project_name="siemens-industrial-packing",
+    ),
     #
     # RABC / AWR weighted YAM tshirt folding configs.
     #

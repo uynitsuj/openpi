@@ -51,6 +51,17 @@ PARK_POSE_SIMPLE_D405 = np.array(
 )
 
 
+def flip_arm_order(pose: np.ndarray) -> np.ndarray:
+    """Reverse each arm's 6 joints (grippers 6/13 untouched). Converts a 14-vector
+    between the flipped (LeRobot-lineage) and raw driver joint orders; involutive.
+    PARK_POSE_SIMPLE_D405 above is in FLIPPED order — pass it through this when
+    trimming a driver-order (--no-flip-joints) conversion."""
+    out = pose.copy()
+    out[..., 0:6] = pose[..., 5::-1]
+    out[..., 7:13] = pose[..., 12:6:-1]
+    return out
+
+
 def detect_trim(
     states: np.ndarray,
     park: np.ndarray,

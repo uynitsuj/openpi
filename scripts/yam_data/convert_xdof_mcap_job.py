@@ -45,7 +45,7 @@ import numpy as np
 import pandas as pd
 import tyro
 from PIL import Image
-from tail_trim import PARK_POSE_SIMPLE_D405, detect_trim
+from tail_trim import PARK_POSE_SIMPLE_D405, detect_trim, flip_arm_order
 
 S3_RAW_BUCKET = "s3://xdof-de-prod"
 CAMERA_KEYS = ["left_camera-images-rgb", "right_camera-images-rgb", "top_camera-images-rgb"]
@@ -124,6 +124,15 @@ class Config:
     # episodes whose ending doesn't match the expected pattern are kept whole.
     trim_tails: bool = False
     trim_buffer_s: float = 1.0
+    # LEGACY DEFAULT: per-arm joint reversal (LeRobot-lineage convention; serving
+    # must flip state in / actions out). --no-flip-joints stores raw driver order
+    # instead (straight-through serving). NEVER mix lineages in one model: a
+    # checkpoint inherits the convention of its data, and fine-tunes inherit it
+    # from their parent checkpoint. Recorded as "joint_order" in info.json.
+    flip_joints: bool = True
+    # Bake this string as the dataset task/prompt instead of the DE task_name
+    # (prompt_from_task=True training reads it; serving must send the same string).
+    task_override: str | None = None
     keep_raw: bool = False
     max_episodes: int | None = None  # for smoke tests
 
@@ -209,8 +218,9 @@ def read_side_mcap(path: Path, side: str) -> dict[str, np.ndarray]:
     return out
 
 
-def build_state(ep_dir: Path) -> np.ndarray:
-    """(N,14) float32 state aligned to timestamp.npy, yam converter joint order (flipped)."""
+def build_state(ep_dir: Path, flip_joints: bool = True) -> np.ndarray:
+    """(N,14) float32 state aligned to timestamp.npy. flip_joints=True reverses each
+    arm's 6 joints (legacy LeRobot-lineage order); False keeps raw driver order."""
     ts_global_ns = to_ns(np.load(ep_dir / "timestamp.npy"))
     n = len(ts_global_ns)
     state = np.empty((n, 14), dtype=np.float32)
@@ -218,7 +228,8 @@ def build_state(ep_dir: Path) -> np.ndarray:
         d = read_side_mcap(ep_dir / f"{side}.mcap", side)
         ji = nearest_indices(d["joint_ts"], ts_global_ns)
         gi = nearest_indices(d["grip_ts"], ts_global_ns)
-        state[:, joint_slice] = np.flip(d["joint_pos"][ji], axis=1)
+        jp = d["joint_pos"][ji]
+        state[:, joint_slice] = np.flip(jp, axis=1) if flip_joints else jp
         state[:, grip_col] = d["grip_pos"][gi][:, 0]
     return state
 
@@ -295,7 +306,7 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
             return None
 
         # 2. state/actions aligned to the global clock; drop last frame (yam converter convention)
-        state = build_state(raw_dir)
+        state = build_state(raw_dir, cfg.flip_joints)
         n_use = len(state) - 1
         if n_use < cfg.fps:  # <1s of frames: junk
             print(f"  ep {ep_idx} ({ep_name}): only {n_use} frames; skipping")
@@ -303,7 +314,8 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
         state = state[:n_use]
         trimmed_s = 0.0
         if cfg.trim_tails:
-            trim, _flag = detect_trim(state, PARK_POSE_SIMPLE_D405, buffer_s=cfg.trim_buffer_s)
+            park = PARK_POSE_SIMPLE_D405 if cfg.flip_joints else flip_arm_order(PARK_POSE_SIMPLE_D405)
+            trim, _flag = detect_trim(state, park, buffer_s=cfg.trim_buffer_s)
             if trim is not None:
                 trimmed_s = (n_use - trim) / cfg.fps
                 n_use = trim
@@ -311,7 +323,7 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
         ts_global_ns = to_ns(np.load(raw_dir / "timestamp.npy"))[:n_use]
 
         meta = json.loads((raw_dir / "metadata.json").read_text())
-        task_name = meta.get("task_name", "industrial packing")
+        task_name = cfg.task_override or meta.get("task_name", "industrial packing")
         top_crop = top_crop_from_metadata(meta)
 
         # 3. videos (top source file + optional FOV crop are station-dependent)
@@ -524,6 +536,7 @@ def main(cfg: Config):
         "codebase_version": "v2.1",
         "robot_type": "yams",
         "resize_mode": cfg.resize_mode,
+        "joint_order": "flipped" if cfg.flip_joints else "driver",
         "total_episodes": n_eps,
         "total_frames": total_frames,
         "total_tasks": len(tasks),

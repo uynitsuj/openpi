@@ -306,6 +306,7 @@ def generate_sky_config(
     num_train_steps_override: Optional[int] = None,
     save_interval_override: Optional[int] = None,
     keep_period_override: Optional[int] = None,
+    use_spot: bool = False,
 ) -> dict:
     """Generate a single SkyPilot YAML with multi-cloud auto-failover.
 
@@ -343,6 +344,10 @@ def generate_sky_config(
                 'infra': infra,
                 'accelerators': accel,
                 'disk_size': disk_size,
+                # Explicit: managed jobs can default to spot; pin to on-demand
+                # unless the caller opts into spot. Avoids surprise preemptions
+                # mid-train (and the recovery churn) for short bounded runs.
+                'use_spot': use_spot,
             }
 
             if provider == 'aws' and aws_image_ids:

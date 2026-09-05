@@ -111,3 +111,14 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
             result[k] = flat_ref[k]
 
     return flax.traverse_util.unflatten_dict(result, sep="/")
+
+
+@dataclasses.dataclass(frozen=True)
+class DualCheckpointWeightLoader(CheckpointWeightLoader):
+    """Loads one trained checkpoint into BOTH the student (top level) and the frozen `teacher` submodule (Pi0Distill)."""
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        both = dict(loaded_params)
+        both["teacher"] = loaded_params
+        return _merge_params(both, params, missing_regex=self.missing_regex)

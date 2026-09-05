@@ -122,3 +122,22 @@ class Pi0Config(_model.BaseModelConfig):
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
+
+
+@dataclasses.dataclass(frozen=True)
+class Pi0DistillConfig(Pi0Config):
+    """Pi0Config + guidance-distillation knobs (anchor steering). null_state_norm = the normalized null command token
+    (raw zeros in state dims 14:17 under the training norm stats)."""
+    distill_w: float = 2.0
+    distill_flow_weight: float = 0.1
+    null_state_norm: tuple[float, float, float] = (-0.03021018177902278, -0.3862968262746754, -0.8125790961427297)
+
+    @override
+    def create(self, rng: at.KeyArrayLike):
+        from openpi.models.pi0 import Pi0Distill
+
+        return Pi0Distill(self, rngs=nnx.Rngs(rng))
+
+    @override
+    def get_freeze_filter(self) -> nnx.filterlib.Filter:
+        return nnx.filterlib.Any(super().get_freeze_filter(), nnx_utils.PathRegex(".*teacher.*"))

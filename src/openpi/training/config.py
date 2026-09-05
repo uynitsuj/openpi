@@ -2820,6 +2820,22 @@ _CONFIGS = [
         save_interval=2_500, keep_period=2_500, rabc_enabled=False,
     ),
     TrainConfig(
+        name="pi05_bottles_obedience_distill",
+        # GUIDANCE DISTILLATION on the human demos: student init = demoseg6, frozen teacher = demoseg6; target = the teacher's composed velocity (w=2); no dropout
+        model=pi0_config.Pi0DistillConfig(pi05=True, action_dim=32, action_horizon=16, distill_w=2.0, distill_flow_weight=0.1),
+        data=LeRobotYamRormModDropDataConfig(
+            repo_id="steer_lr_demoseg6",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            img_dropout=0.0, cmd_dropout=0.0,
+        ),
+        batch_size=64, num_workers=8,
+        weight_loader=weight_loaders.DualCheckpointWeightLoader("/data/work/ckpts_out/pi05_bottles_obedience_demoseg6/obedience_demoseg6/4999/params"),
+        freeze_filter=pi0_config.Pi0DistillConfig(pi05=True, action_dim=32, action_horizon=16).get_freeze_filter(),
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=200, peak_lr=1e-5, decay_steps=3_000, decay_lr=1e-6), num_train_steps=3_000,
+        save_interval=1_500, keep_period=1_500, rabc_enabled=False,
+    ),
+    TrainConfig(
         name="pi05_bottles_ctrl_h16",
         # pi05 defaults on purpose: discrete_state_input -> True, max_token_len
         # -> 200, matching pi05_abc_pretrain exactly so BOTH arms load with zero

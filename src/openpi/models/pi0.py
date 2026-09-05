@@ -535,3 +535,58 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+
+class Pi0Distill(Pi0):
+    """Guidance distillation (anchor steering, 2026-09-05). The student is this module's own weights; `teacher` is a frozen copy
+    loaded from the same checkpoint (DualCheckpointWeightLoader) and excluded from training (Pi0DistillConfig.get_freeze_filter).
+    Training target at the sampled (x_t, t): the teacher's COMPOSED velocity
+        v = v(img, null) + w * [v(no img, cmd) - v(no img, null)]
+    predicted by the student from the FULL observation (img + cmd), so plain w=1 sampling reproduces composed guidance at one
+    forward pass. A small flow-matching term keeps the student anchored to the data."""
+
+    def __init__(self, config, rngs: nnx.Rngs):
+        super().__init__(config, rngs)
+        self.teacher = Pi0(config, rngs)
+        self._distill_w = float(config.distill_w)
+        self._distill_flow_weight = float(config.distill_flow_weight)
+        self._null_state_norm = tuple(float(x) for x in config.null_state_norm)
+
+    def _velocity(self, m, observation, x_t, time):
+        prefix_tokens, prefix_mask, prefix_ar_mask = m.embed_prefix(observation)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = m.embed_suffix(observation, x_t, time)
+        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        attn_mask = make_attn_mask(input_mask, ar_mask)
+        positions = jnp.cumsum(input_mask, axis=1) - 1
+        (prefix_out, suffix_out), _ = m.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+        )
+        return m.action_out_proj(suffix_out[:, -m.action_horizon :])
+
+    @override
+    def compute_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+        import dataclasses as _dc
+        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        batch_shape = actions.shape[:-2]
+        noise = jax.random.normal(noise_rng, actions.shape)
+        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        time_expanded = time[..., None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+        null = jnp.asarray(self._null_state_norm, dtype=observation.state.dtype)
+        state_null = observation.state.at[..., 14:17].set(null)
+        zero_imgs = {k: jnp.zeros_like(v) for k, v in observation.images.items()}
+        zero_masks = {k: jnp.zeros_like(v) for k, v in observation.image_masks.items()}
+        obs_img_null = _dc.replace(observation, state=state_null)
+        obs_noimg_cmd = _dc.replace(observation, images=zero_imgs, image_masks=zero_masks)
+        obs_noimg_null = _dc.replace(obs_noimg_cmd, state=state_null)
+        v_in = jax.lax.stop_gradient(self._velocity(self.teacher, obs_img_null, x_t, time))
+        v_nc = jax.lax.stop_gradient(self._velocity(self.teacher, obs_noimg_cmd, x_t, time))
+        v_nn = jax.lax.stop_gradient(self._velocity(self.teacher, obs_noimg_null, x_t, time))
+        v_target = v_nn + (v_in - v_nn) + self._distill_w * (v_nc - v_nn)
+        v_s = self._velocity(self, observation, x_t, time)
+        return jnp.mean(jnp.square(v_s - v_target), axis=-1) + self._distill_flow_weight * jnp.mean(jnp.square(v_s - u_t), axis=-1)

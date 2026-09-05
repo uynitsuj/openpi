@@ -16,6 +16,20 @@ from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
+import openpi.transforms as _transforms
+
+
+def _training_prompt(data_config) -> str | None:
+    """The default prompt injected during training, if any.
+
+    Lives inside the model/data transforms as an InjectDefaultPrompt rather than
+    as a top-level DataConfig field, so we dig it out for serving reproducibility.
+    """
+    for group in (data_config.model_transforms, data_config.data_transforms):
+        for t in getattr(group, "inputs", ()) or ():
+            if isinstance(t, _transforms.InjectDefaultPrompt) and t.prompt is not None:
+                return str(t.prompt)
+    return None
 
 
 def initialize_checkpoint_dir(
@@ -77,6 +91,13 @@ def save_state(
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
             _normalize.save(directory / data_config.asset_id, norm_stats)
+        # Persist the training prompt next to the assets so a served checkpoint
+        # is self-describing (which prompt it was finetuned on).
+        prompt = _training_prompt(data_config)
+        if prompt is not None and data_config.asset_id is not None:
+            asset_dir = directory / data_config.asset_id
+            asset_dir.mkdir(parents=True, exist_ok=True)
+            (asset_dir / "prompt.txt").write_text(prompt)
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():

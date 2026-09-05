@@ -3,6 +3,7 @@
 import abc
 from collections.abc import Sequence
 import dataclasses
+import os
 import difflib
 import logging
 import pathlib
@@ -15,6 +16,7 @@ import tyro
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
+import openpi.models.pi0_dpo as pi0_dpo
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
@@ -865,6 +867,7 @@ class LeRobotYamDataConfig(DataConfigFactory):
 
 
 
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotYamRormDataConfig(DataConfigFactory):
     """
@@ -949,6 +952,33 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
     sarm_kappa: float = 0.01
     # Column name for absolute progress values.
     sarm_progress_key: str = "sarm_dense_progress"
+    # ── velocity-conditioned prompting (WARP-VC) ──
+    # When set to (lo, hi) velocity edges (raw RM units), inserts
+    # InjectSpeedBinPrompt BEFORE ComputeRABCWeights: each sample's prompt
+    # gets a ", speed: {slow|normal|fast}" suffix from the chunk's
+    # final-frame velocity (vel[-1] < lo -> slow, < hi -> normal, else fast).
+    # No samples are dropped or re-weighted by this transform. Default None
+    # = OFF (no behavior change for existing configs).
+    speed_bin_prompt_edges: tuple[float, float] | None = None
+    # ── ALIGN-style velocity conditioning via AdaRMS (WARP-VC-AdaRMS) ──
+    # When True, inserts InjectVelocityCondition BEFORE ComputeRABCWeights: each
+    # sample's chunk-final velocity (vel[-1]) is written to data["condition"]
+    # (raw RM units, NOT re-weighted or dropped). Pair with a
+    # Pi0Config(pi05=True, velocity_condition=True) model, which fuses it into
+    # the action expert's AdaRMS conditioning. Default False = OFF (no behavior
+    # change for existing configs). Independent of speed_bin_prompt_edges (the
+    # prompt-conditioning control), though both may be enabled together.
+    velocity_condition: bool = False
+    # Fixed condition value written at INFERENCE (velocity column absent). The
+    # "fast" analogue — a high value of the training vel[-1] distribution so the
+    # deployed policy is conditioned toward fast motion. For
+    # sim_put_bottles_mjwarp_rmsss15 warp_rm_signed_magnitude, p25/p75 of vel[-1]
+    # are 0.66/1.05; 1.5 sits clearly in the "fast" regime. The node operator
+    # can recompute p90 for a more principled value; only used when
+    # velocity_condition=True.
+    velocity_condition_inference_value: float = 1.5
+    velocity_condition_binarize_thr: float | None = None
+    velocity_condition_cfg_dropout: float = 0.0
     # Hard Q-filter: keep only the top fraction of episodes by mean rorm_q.
     top_q_frac: float | None = None
     # Length filter: keep only the shortest fraction of episodes by frame count.
@@ -1028,7 +1058,34 @@ class LeRobotYamRormDataConfig(DataConfigFactory):
                     self.repo_id, model_config.action_horizon, self.sarm_progress_key,
                 )
 
-        rabc_inputs: list[_transforms.DataTransformFn] = [
+        rabc_inputs: list[_transforms.DataTransformFn] = []
+        if self.speed_bin_prompt_edges is not None:
+            # WARP-VC: must run before ComputeRABCWeights (which pops the
+            # velocity key) and before tokenization (model transforms).
+            # base_prompt=default_prompt makes the training prompt fully
+            # deterministic ("<default_prompt>, speed: <bin>") — the
+            # prompt_from_task path yields a garbage "0" prompt on lerobot-v3
+            # task tables (see InjectSpeedBinPrompt.base_prompt docstring),
+            # and the eval client must be able to reproduce the exact string.
+            rabc_inputs.append(
+                _transforms.InjectSpeedBinPrompt(
+                    edges=tuple(self.speed_bin_prompt_edges),
+                    base_prompt=self.default_prompt,
+                )
+            )
+        if self.velocity_condition:
+            # WARP-VC-AdaRMS: must run before ComputeRABCWeights (which pops the
+            # velocity key). Writes data["condition"] = vel[-1] at training; at
+            # inference (no velocity column) writes the fixed "fast" value.
+            rabc_inputs.append(
+                _transforms.InjectVelocityCondition(
+                    inference_fixed_condition=self.velocity_condition_inference_value,
+                    base_prompt=self.default_prompt,
+                    binarize_threshold=self.velocity_condition_binarize_thr,
+                    cfg_dropout_p=self.velocity_condition_cfg_dropout,
+                )
+            )
+        rabc_inputs += [
             _transforms.ComputeRABCWeights(
                 clip_min=self.rabc_clip_min,
                 clip_max=self.rabc_clip_max,
@@ -1355,13 +1412,89 @@ class TrainConfig:
 # WARP-BC / vanilla-BC task table for the 06_10 d405 deliveries + tshirt folding.
 # short-name -> (base repo_id, default prompt, pi0 init checkpoint).
 # box/bottles init from base pi0 pretrained; tshirt from the tshirt-folding pi0 base.
+# Real-robot bottle-in-bin WARP-BC task (paper: bottle_results table).
+# box + tshirt exploration tasks removed for the paper-repro branch.
 _WARPBC_TASKS = {
-    "box":     ("fold_the_paper_box_d405_v021",                 "Fold the paper box",                 "gs://openpi-assets/checkpoints/pi0_base/params"),
     "bottles": ("put_the_plastic_bottles_in_the_bin_d405_v021", "Put the plastic bottles in the bin", "gs://openpi-assets/checkpoints/pi0_base/params"),
-    "tshirt":  ("tshirt_folding_d405_v010_20260420_gop10",      "Folding tshirt pile and stacking",   "s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
 }
 
 # Use `get_config` if you need to get a config by name in your code.
+class CmdDropout:
+    """Zero the command dims (state[14:17]) with prob p — CFG null token."""
+    def __init__(self, p: float):
+        self.p = p
+    def __call__(self, data):
+        import os as _os, numpy as _np
+        if _os.environ.get("STATE_CMD_DROPOUT_TRAIN") == "1" and _np.random.random() < self.p:
+            st = _np.array(data["state"], copy=True)
+            st[14:17] = 0.0
+            data = dict(data); data["state"] = st
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotYamRormCmdDropoutDataConfig(LeRobotYamRormDataConfig):
+    cmd_dropout: float = 0.25
+    def create(self, assets_dirs, model_config):
+        cfg = super().create(assets_dirs, model_config)
+        dt = cfg.data_transforms
+        return dataclasses.replace(cfg, data_transforms=_transforms.Group(
+            inputs=[CmdDropout(self.cmd_dropout)] + list(dt.inputs), outputs=list(dt.outputs)))
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotYamRormDpoDataConfig(LeRobotYamRormCmdDropoutDataConfig):
+    """Counterfactual (DPO-on-condition) data: carries 'state_neg' through repack ->
+    YamInputsWithNeg -> Normalize (norm_stats has a 'state_neg' entry) -> TokenizeNegPrompt."""
+    def create(self, assets_dirs, model_config):
+        from openpi.policies import yam_policy as _yp
+        from openpi.models import tokenizer as _tok
+        cfg = super().create(assets_dirs, model_config)
+        rp = cfg.repack_transforms.inputs[0]
+        mapping = dict(getattr(rp, "structure", {})); mapping["state_neg"] = "state_neg"
+        repack = _transforms.Group(inputs=[_transforms.RepackTransform(mapping)])
+        din = [(_yp.YamInputsWithNeg(action_dim=model_config.action_dim, model_type=model_config.model_type)
+                if isinstance(t, _yp.YamInputs) else t) for t in cfg.data_transforms.inputs]
+        mt = list(cfg.model_transforms.inputs)
+        idx = next(i for i, t in enumerate(mt) if isinstance(t, _transforms.TokenizePrompt))
+        mt.insert(idx, _transforms.TokenizeNegPrompt(_tok.PaligemmaTokenizer(model_config.max_token_len)))
+        return dataclasses.replace(cfg, repack_transforms=repack,
+                                   data_transforms=_transforms.Group(inputs=din, outputs=list(cfg.data_transforms.outputs)),
+                                   model_transforms=_transforms.Group(inputs=mt, outputs=list(cfg.model_transforms.outputs)))
+
+
+class ModalityDropout:
+    """Independent dropout of the images (all cameras: zero + mask False) and of the
+    command dims (state[14:17] = 0). Train-only: identity unless STATE_CMD_DROPOUT_TRAIN=1.
+    Gives composable guidance its three fields: v(img,cmd), v(img,0), v(0,cmd), v(0,0)."""
+    def __init__(self, p_img: float, p_cmd: float):
+        self.p_img = p_img; self.p_cmd = p_cmd
+    def __call__(self, data):
+        import os as _os, numpy as _np
+        if _os.environ.get("STATE_CMD_DROPOUT_TRAIN") != "1":
+            return data
+        data = dict(data)
+        if _np.random.random() < self.p_cmd:
+            st = _np.array(data["state"], copy=True); st[14:17] = 0.0; data["state"] = st
+        if _np.random.random() < self.p_img:
+            data["image"] = {k: _np.zeros_like(v) for k, v in data["image"].items()}
+            data["image_mask"] = {k: _np.zeros_like(_np.asarray(v), dtype=bool) for k, v in data["image_mask"].items()}
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotYamRormModDropDataConfig(LeRobotYamRormDataConfig):
+    img_dropout: float = 0.25
+    cmd_dropout: float = 0.25
+    def create(self, assets_dirs, model_config):
+        from openpi.policies import yam_policy as _yp
+        cfg = super().create(assets_dirs, model_config)
+        din = list(cfg.data_transforms.inputs)
+        idx = next(i for i, t in enumerate(din) if isinstance(t, _yp.YamInputs))
+        din.insert(idx + 1, ModalityDropout(self.img_dropout, self.cmd_dropout))
+        return dataclasses.replace(cfg, data_transforms=_transforms.Group(inputs=din, outputs=list(cfg.data_transforms.outputs)))
+
+
 _CONFIGS = [
     #
     # Inference Aloha configs.
@@ -1817,68 +1950,6 @@ _CONFIGS = [
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
     ),
-    #
-    # RABC / AWR weighted YAM tshirt folding configs.
-    #
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # SCIZOR sidecar gating — paper-faithful (anchor-frame, ε_s=0.58, binary
-    # weights). Reads scores from a separate parquet (no LeRobot mutation).
-    # See docs/scizor_sidecar_rabc.md for methodology.
-    TrainConfig(
-        name="pi0_yam_tshirt_scizor_sidecar_110612",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotScizorSidecarDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_singlefold_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            scizor_sidecar_path="s3://xdof-internal-research/repromo/baselines/scizor/tshirt_singlefold_110612/scizor_predictions.parquet",
-            scizor_eps_s=0.58,
-            scizor_weight_mode="binary",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    TrainConfig(
-        name="pi0_yam_tshirt_scizor_sidecar_122320",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotScizorSidecarDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_singlefold_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            scizor_sidecar_path="s3://xdof-internal-research/repromo/baselines/scizor/tshirt_singlefold_122320/scizor_predictions.parquet",
-            scizor_eps_s=0.58,
-            scizor_weight_mode="binary",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
     # ── SCIZOR baseline on the SARM centered_with_d405 datasets ──────────
     # Same datasets as the SARM-RABC / deminf / WARP-BC baselines (under60s,
     # under90s), rescored by SCIZOR so all curation methods compare on an
@@ -1911,91 +1982,6 @@ _CONFIGS = [
         for tag in ("under60s", "under90s")
     ],
     TrainConfig(
-        name="pi0_yam_tshirt_no_rabc_d405",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=False,
-    ),
-    # hlm_tshirt_reward_select — counterpart to the d405 rabc/no_rabc pair on
-    # the human-led-manipulation dataset. Reuses the same pi0 base ckpt as
-    # the d405 configs. repo_id targets the gop10-reencoded variant for
-    # faster random-access decode during training (run
-    # `openpi/scripts/reencode_dense_keyframes.py` once if not yet on disk).
-    TrainConfig(
-        name="pi0_hlm_rabc",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_tshirt_reward_select_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    TrainConfig(
-        name="pi0_hlm_no_rabc",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_tshirt_reward_select_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=False,
-    ),
-    # Merged hlm + d405-under-60s — counterpart to pi0_hlm_{rabc,no_rabc}
-    # but on the 2427-episode merge that adds short d405 demos to the hlm
-    # base. Same prompt + base ckpt; only repo_id changes. RABC variants
-    # (uniform-shape vs piecewise-shape) come from re-injecting the
-    # repromo_progress column with the appropriate RM checkpoint between
-    # launches.
-    TrainConfig(
-        name="pi0_merged_rabc",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_under60s_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-            rabc_use_final_action_condition=False,
-            rabc_threshold=None,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    TrainConfig(
         name="pi0_merged_no_rabc",
         model=pi0_config.Pi0Config(action_horizon=30),
         data=LeRobotYamRormDataConfig(
@@ -2013,149 +1999,6 @@ _CONFIGS = [
         keep_period=30_000,
         rabc_enabled=False,
     ),
-    # Merged hlm-dedup + ABC-t-shirt-fold re-encoded at true 30Hz — 2903 episodes
-    # (1649 hlm-dedup + 1254 ABC). Successor to pi0_merged_{rabc,no_rabc}: swaps the
-    # d405-under60s half for the ABC fold_and_stack demos, with ABC re-sampled from its
-    # native ~60Hz mcaps onto a uniform 30Hz grid (fixes the fps-doubling that made ABC
-    # episodes appear ~2× long). Reward columns are warp_rm_progress /
-    # warp_rm_signed_magnitude, injected by RORM on both halves; the RABC velocity signal
-    # comes from warp_rm_signed_magnitude (velocity_only mode). repo_id mirrors the S3
-    # push at s3://xdof-internal-research/repromo/datasets/hlm_dedup_plus_abc30hz_gop10.
-    #
-    # RABC variant: final-action condition ON, keep only chunks whose final-action
-    # weight is above the threshold (thr=1.0), and no upper cap on the kept-chunk
-    # weight (clip_max=inf) so weight reflects raw RM magnitude instead of saturating.
-    TrainConfig(
-        name="pi0_merged_abc30hz_rabc_finalaction_thr100_nomax",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_dedup_plus_abc30hz_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-            rabc_use_final_action_condition=True,
-            rabc_threshold=1.0,
-            rabc_clip_max=float("inf"),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    TrainConfig(
-        name="pi0_merged_abc30hz_no_rabc",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_dedup_plus_abc30hz_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=False,
-    ),
-    # Thomas t-shirt YAM dataset (thomas_tshirt_us05_gop10): 46 episodes / ~150k
-    # frames @ 30Hz, 14D state+actions, three camera views. Plain vanilla-BC YAM
-    # config (no reward columns in the dataset, so LeRobotYamDataConfig rather than
-    # the RORM variant). Primarily registered to compute norm stats for this dataset.
-    TrainConfig(
-        name="pi0_thomas_tshirt_us05",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamDataConfig(
-            repo_id="thomas_tshirt_us05_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-    ),
-    # Wider merge — hlm + d405 episodes ≤ 90s (4124 episodes total) instead
-    # of the under-60s 2427. More d405 demonstrations added to the training
-    # mix; downstream RABC + no-RABC pair to sweep whether the wider data
-    # window helps under the fs=2 RM signal.
-    TrainConfig(
-        name="pi0_merged90_rabc",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_under90s_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=False,  # preserve original mean-aggregator behavior
-            rabc_threshold=None,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # Threshold sweep: same data + RM as Run-1 but mean-aggregated RABC weight
-    # is zeroed when integrated < threshold; otherwise no upper cap. Three
-    # thresholds tested.
-    *[
-        TrainConfig(
-            name=f"pi0_merged90_rabc_thr{int(thr * 100):03d}_nomax",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id="hlm_plus_d405_under90s_gop10",
-                default_prompt="Folding tshirt pile and stacking",
-                base_config=DataConfig(prompt_from_task=True),
-                rabc_use_final_action_condition=False,
-                rabc_threshold=thr,
-                rabc_clip_max=float("inf"),
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-            num_train_steps=60_000,
-            save_interval=30_000,
-            keep_period=30_000,
-            rabc_enabled=True,
-        )
-        for thr in (0.50, 0.60, 0.75)
-    ],
-    # hlm+all-d405 (singlefold-pruned, no time filter, 7679 ep). Same data +
-    # injected RM as Run-4 (pi0_merged_singlefold_rabc); final-action gating
-    # with two thresholds.
-    *[
-        TrainConfig(
-            name=f"pi0_merged_singlefold_rabc_finalaction_thr{int(thr * 100):03d}",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id="hlm_plus_d405_singlefold_gop10",
-                default_prompt="Folding tshirt pile and stacking",
-                base_config=DataConfig(prompt_from_task=True),
-                rabc_use_final_action_condition=True,
-                rabc_threshold=thr,
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-            num_train_steps=60_000,
-            save_interval=30_000,
-            keep_period=30_000,
-            rabc_enabled=True,
-        )
-        for thr in (0.50, 0.75)
-    ],
     # 120s-cap vanilla BC baseline (no rabc). Counterpart to pi0_merged_no_rabc
     # (under60s) and pi0_merged90_no_rabc (under90s).
     TrainConfig(
@@ -2174,222 +2017,6 @@ _CONFIGS = [
         keep_period=30_000,
         rabc_enabled=False,
     ),
-    # sarm dataset variant: fs2_sss45-RM-injected dense+sparse subset, strict
-    # finalaction thr=1.00, no-max clip (raw RM magnitude flows to loss).
-    TrainConfig(
-        name="pi0_sarm_dense_sparse_rabc_finalaction_thr100_nomax",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="sarm_dense_and_sparse_only_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=True,
-            rabc_threshold=1.00,
-            rabc_clip_max=float("inf"),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    TrainConfig(
-        name="pi0_yam_tshirt_sarm_rabc_dense_progress_20260510",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="sarm_dense_and_sparse_only_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=True,
-            rabc_threshold=1.00,
-            rabc_clip_max=float("inf"),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=90_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # mean2s / mean1s_offset gates on merged90/120: aggregate vel over the
-    # action chunk + 1s after it (60-frame window = 2s @ 30fps), or only the
-    # 1s lookahead portion. Tests whether the model wants to be told about
-    # what comes AFTER the action it's predicting, not just within it.
-    # Defaults: thr=0.75 NOMAX (kept-weight = raw mean; no upper cap).
-    *[
-        TrainConfig(
-            name=f"pi0_merged{cap}_rabc_{aggname}_thr{int(thr*100):03d}_nomax",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id=f"hlm_plus_d405_under{cap}s_gop10",
-                default_prompt="Folding tshirt pile and stacking",
-                base_config=DataConfig(prompt_from_task=True),
-                rabc_use_final_action_condition=False,
-                rabc_threshold=thr,
-                rabc_clip_max=float("inf"),
-                rabc_velocity_aggregator=agg,
-                rabc_lookahead_frames=30,  # 1s lookahead at fps=30
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-            num_train_steps=60_000,
-            save_interval=30_000,
-            keep_period=30_000,
-            rabc_enabled=True,
-        )
-        for cap in (90, 120)
-        for agg, aggname in (("mean", "mean2s"), ("mean_lookahead", "mean1s_offset"))
-        for thr in (0.75, 1.00)
-    ],
-    # min(weight^2, 1) variants for merged90 / merged120 × {finalaction,
-    # mean2s, mean1s_offset}. Same as the nothr_nomax recipe except
-    # weight_power=2 and clip_max=1.0 (capped at 1 by construction). Suppresses
-    # medium-magnitude samples (which concentrate in long episodes) by ~12%
-    # more than the linear version per simulation.
-    *[
-        TrainConfig(
-            name=f"pi0_merged{cap}_rabc_{aggname}_sqclip",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id=f"hlm_plus_d405_under{cap}s_gop10",
-                default_prompt="Folding tshirt pile and stacking",
-                base_config=DataConfig(prompt_from_task=True),
-                rabc_use_final_action_condition=use_fac,
-                rabc_threshold=None,
-                rabc_clip_max=1.0,
-                rabc_velocity_aggregator=agg,
-                rabc_lookahead_frames=lookahead,
-                rabc_weight_power=2.0,
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-            num_train_steps=60_000,
-            save_interval=30_000,
-            keep_period=30_000,
-            rabc_enabled=True,
-        )
-        for cap in (90, 120)
-        for use_fac, agg, aggname, lookahead in (
-            (True, "mean", "finalaction", 0),
-            (False, "mean", "mean2s", 30),
-            (False, "mean_lookahead", "mean1s_offset", 30),
-        )
-    ],
-    # sarm dataset × {finalaction, mean2s, mean1s_offset}, all thr=None NOMAX.
-    # Re-uses the d405-short25 RM injection (separately scored via launch_score
-    # on sarm — uses repromo_signed_magnitude / repromo_quality columns).
-    *[
-        TrainConfig(
-            name=f"pi0_sarm_dense_sparse_rabc_{aggname}_nothr_nomax",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id="sarm_dense_and_sparse_only_gop10",
-                default_prompt="Folding tshirt pile and stacking",
-                base_config=DataConfig(prompt_from_task=True),
-                rabc_use_final_action_condition=use_fac,
-                rabc_threshold=None,
-                rabc_clip_max=float("inf"),
-                rabc_velocity_aggregator=agg,
-                rabc_lookahead_frames=lookahead,
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-            num_train_steps=60_000,
-            save_interval=30_000,
-            keep_period=30_000,
-            rabc_enabled=True,
-        )
-        for use_fac, agg, aggname, lookahead in (
-            (True, "mean", "finalaction", 0),
-            (False, "mean", "mean2s", 30),
-            (False, "mean_lookahead", "mean1s_offset", 30),
-        )
-    ],
-    # No-threshold + no-max-cap variants for merged60/90/120 × {finalaction,
-    # mean2s, mean1s_offset}. With threshold=None and clip_max=inf the weight
-    # is raw vel passed through (clipped at clip_min=0 floor so negative
-    # motion → 0 → filtered by subset). Tests whether removing the threshold
-    # entirely and just letting magnitude flow is better than gating.
-    *[
-        TrainConfig(
-            name=f"pi0_merged{cap}_rabc_{aggname}_nothr_nomax",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id=f"hlm_plus_d405_under{cap}s_gop10",
-                default_prompt="Folding tshirt pile and stacking",
-                base_config=DataConfig(prompt_from_task=True),
-                rabc_use_final_action_condition=use_fac,
-                rabc_threshold=None,
-                rabc_clip_max=float("inf"),
-                rabc_velocity_aggregator=agg,
-                rabc_lookahead_frames=lookahead,
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-            num_train_steps=60_000,
-            save_interval=30_000,
-            keep_period=30_000,
-            rabc_enabled=True,
-        )
-        for cap in (60, 90, 120)
-        for use_fac, agg, aggname, lookahead in (
-            (True, "mean", "finalaction", 0),  # vel[-1] passthrough
-            (False, "mean", "mean2s", 30),     # mean over 60-frame window
-            (False, "mean_lookahead", "mean1s_offset", 30),  # mean over lookahead 30 frames
-        )
-    ],
-    # 60s-cap variant: thr=1.00 strict finalaction on hlm + d405<60s.
-    TrainConfig(
-        name="pi0_merged60_rabc_finalaction_thr100",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_under60s_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=True,
-            rabc_threshold=1.00,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # 120s-cap variants: hlm + d405<120s, d405-short25-RM injected, final-action
-    # gating. thr=0.75 keeps ~52% of frames; thr=1.00 keeps ~22% (long-episode
-    # frames almost entirely drop). thr=0.50 retired 2026-05-08 — the strict
-    # gate without cond_accel kept ~80% which under-filtered long episodes
-    # relative to RM-prediction shape.
-    *[
-        TrainConfig(
-            name=f"pi0_merged120_rabc_finalaction_thr{int(thr * 100):03d}",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id="hlm_plus_d405_under120s_gop10",
-                default_prompt="Folding tshirt pile and stacking",
-                base_config=DataConfig(prompt_from_task=True),
-                rabc_use_final_action_condition=True,
-                rabc_threshold=thr,
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-            num_train_steps=60_000,
-            save_interval=30_000,
-            keep_period=30_000,
-            rabc_enabled=True,
-        )
-        for thr in (0.75, 1.00)
-    ],
     # No-max-cap variants of the 120s strict-gate trains. clip_max=inf lets
     # the kept-sample weight reflect raw RM magnitude (vel can be > 1.0)
     # rather than saturating at 1.0. Tests whether the cap was suppressing
@@ -2414,50 +2041,8 @@ _CONFIGS = [
             keep_period=30_000,
             rabc_enabled=True,
         )
-        for thr in (0.75, 1.00)
+        for thr in (1.00,)
     ],
-    # Run-5b variant: same as finalaction, but multiply weight by q_norm
-    # (min-max from injected pinned Q). Q comes from injected repromo_quality.
-    TrainConfig(
-        name="pi0_merged90_rabc_finalaction_mult",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_under90s_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=True,
-            rabc_threshold=0.50,
-            rabc_mode="multiplicative",
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # Run-5 variant: pi0 on merged90 with d405-short25-RM, RABC weight
-    # additionally gated by the final-action condition. Same data + RM as
-    # Run-1 (pi0_merged90_rabc) — only the transform flag differs.
-    TrainConfig(
-        name="pi0_merged90_rabc_finalaction",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_under90s_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=True,
-            rabc_threshold=0.50,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
     # NOMAX (clip_max=inf) sibling of thr=1.0 strict on merged90: keeps the
     # same ~34% of frames but lets kept-weight magnitude pass through raw
     # rather than saturating at 1.0.
@@ -2480,58 +2065,8 @@ _CONFIGS = [
         keep_period=30_000,
         rabc_enabled=True,
     ),
-    # IID-RM ablation twin: same recipe as pi0_merged90_rabc_finalaction_thr100_nomax,
-    # but repo_id points at the duplicated merged90 dataset whose
-    # `repromo_signed_magnitude` was injected with the IID-trained RM
-    # (repromo_full_tshirt_folding_d405_v010_20260420_shortest25_win32_iid_15k)
-    # rather than the canonical AR(1)-trained RM. Used to isolate the
-    # contribution of the AR(1) speed-process correlation in the RM training
-    # sampler on downstream policy quality.
-    TrainConfig(
-        name="pi0_merged90_rabc_finalaction_thr100_nomax_iidrm",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_under90s_iidrm_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=True,
-            rabc_threshold=1.00,
-            rabc_clip_max=float("inf"),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # Mean-over-chunk sibling of the above: same dataset and thr/nomax, but
-    # uses the default velocity_aggregator="mean" path instead of the final-
-    # action gate. Keep iff mean(vel[t:t+H]) > 1.0; kept weight = clip(mean,
-    # None, inf) = mean. clip_max=inf so high-velocity stretches retain their
-    # magnitude rather than saturating at 1.0.
-    TrainConfig(
-        name="pi0_merged90_rabc_mean_thr100_nomax",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_under90s_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=False,
-            rabc_threshold=1.00,
-            rabc_clip_max=float("inf"),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # NOMAX sibling for merged60 thr=1.0 strict (same dataset as
-    # pi0_merged60_rabc_finalaction_thr100 but no upper cap).
+    # WARP-BC on D1 (<=60s tier): final-action gate, thr=1.0, continuous
+    # (clip_max=inf) reweighting of kept chunks.
     TrainConfig(
         name="pi0_merged60_rabc_finalaction_thr100_nomax",
         model=pi0_config.Pi0Config(action_horizon=30),
@@ -2542,117 +2077,6 @@ _CONFIGS = [
             rabc_use_final_action_condition=True,
             rabc_threshold=1.00,
             rabc_clip_max=float("inf"),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # Task finetune: adapt the pi0_merged60_rabc_finalaction_thr100_nomax 60k
-    # checkpoint to the small thomas_tshirt_us05 subset (46 eps / 149,816 frames).
-    # Plain BC — this dataset has no repromo_*/rorm_* reward columns, so it uses
-    # LeRobotYamDataConfig (not the Rorm variant) with rabc_enabled=False.
-    #
-    # Weights load from the base checkpoint on S3 (the SkyPilot worker is a
-    # remote node with no access to the local /nfs_us_2 copy). Norm stats REUSE
-    # the base checkpoint's: instead of an asset override (which the launcher
-    # keys by asset_id but the worker run-script keys by repo_id — inconsistent),
-    # the base norm_stats.json is seeded into
-    # assets/pi0_thomas_tshirt_us05_ft/thomas_tshirt_us05_gop10/ so the launcher
-    # uploads it and the worker skips recompute. Same 14-D YAM space, so the base
-    # stats match the pretrained weights (thomas-vs-base: mean shift <0.2σ avg,
-    # 0.8σ worst on L_j5; std ratio 0.72–1.37).
-    #
-    # 10k steps ≈ 2.1 epochs at batch 32; save every 2k (5 kept) to pick the best
-    # checkpoint by eval before overfitting. AWS has no 2-GPU nodes and offers
-    # 80GB GPUs only in 8-packs, so this targets a 4× L40S node (g6e.12xlarge,
-    # 45GB × 4 = 180GB, far easier to schedule than 8× A100/H100). fsdp_devices=4
-    # shards the ~3.3B pi0 + AdamW/EMA state across all 4 GPUs; mesh = (dp=1,
-    # fsdp=4), batch 32 % 4 == 0.
-    TrainConfig(
-        name="pi0_thomas_tshirt_us05_ft",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamDataConfig(
-            repo_id="thomas_tshirt_us05_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        batch_size=32,
-        num_workers=8,
-        fsdp_devices=4,
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "s3://xdof-internal-research/model_ckpts/pi0_merged60_rabc_finalaction_thr100_nomax/pi0_merged60_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511/59999/params"
-        ),
-        num_train_steps=10_000,
-        save_interval=2_000,
-        keep_period=2_000,
-        rabc_enabled=False,
-    ),
-    # RABC counterpart of pi0_thomas_tshirt_us05_ft, mirroring the abc30hz RABC
-    # recipe (final-action condition ON, thr=1.0, clip_max=inf, velocity_only).
-    # BLOCKED until rewards are injected: thomas_tshirt_us05_gop10 has NO reward
-    # columns yet, so a reward model must first inject repromo_signed_magnitude /
-    # repromo_quality into the dataset in place (as hlm_plus_d405_under60s_gop10
-    # has). Until then the RORM data loader has nothing to weight by and this
-    # config errors on load — it's registered so the pair is ready to launch once
-    # rewards exist. Same S3 base weights, fsdp_devices=2, and 10k/2k schedule.
-    TrainConfig(
-        name="pi0_thomas_tshirt_us05_ft_rabc",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="thomas_tshirt_us05_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=True,
-            rabc_threshold=1.0,
-            rabc_clip_max=float("inf"),
-        ),
-        batch_size=32,
-        num_workers=8,
-        fsdp_devices=4,
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "s3://xdof-internal-research/model_ckpts/pi0_merged60_rabc_finalaction_thr100_nomax/pi0_merged60_rabc_finalaction_thr100_nomax_d405short25rm_strict_subset_20260511/59999/params"
-        ),
-        num_train_steps=10_000,
-        save_interval=2_000,
-        keep_period=2_000,
-        rabc_enabled=True,
-    ),
-    # thr=1.0 strict variant — the most aggressive filter; long-episode frames
-    # are nearly all dropped. Expected keep ~34% on under90s.
-    TrainConfig(
-        name="pi0_merged90_rabc_finalaction_thr100",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_under90s_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=True,
-            rabc_threshold=1.00,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # thr=0.75 strict variant of pi0_merged90_rabc_finalaction. Drops cond_accel
-    # rescue (handled in transforms.py) and raises threshold so long-episode
-    # frames with mid-range velocity are filtered out. Expected keep ~61%.
-    TrainConfig(
-        name="pi0_merged90_rabc_finalaction_thr075",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_under90s_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=True,
-            rabc_threshold=0.75,
         ),
         batch_size=32,
         num_workers=8,
@@ -2677,592 +2101,6 @@ _CONFIGS = [
         save_interval=30_000,
         keep_period=30_000,
         rabc_enabled=False,
-    ),
-    # Run-2 variant: pi0 on merged90 forked with truear-trained d405 RM
-    # (--sampler truear). Forked S3 prefix because 171/172 spent 3h+ in
-    # capacity-PENDING — the in-place re-inject race that "non-spot makes
-    # negligible" reopens when 171/172 haven't even synced yet. Forking
-    # restores correctness; the fork videos are already on S3.
-    TrainConfig(
-        name="pi0_merged90_truearrm_rabc",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_under90s_truearrm_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=False,
-            rabc_threshold=None,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # Run-3 variant: pi0 on merged90 with d405-short25-RM sidecar but window
-    # weight = MIN(velocity) instead of mean. Stricter — any anti-progress
-    # frame in the chunk drives the weight down.
-    TrainConfig(
-        name="pi0_merged90_rabc_minwin",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_under90s_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_velocity_aggregator="min",
-            rabc_use_final_action_condition=False,
-            rabc_threshold=None,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # Run-4 dataset: hlm + singlefold-d405 (no time filter, multi-fold pruned).
-    # 7679 episodes — adds the full surviving d405 single-fold corpus to hlm.
-    TrainConfig(
-        name="pi0_merged_singlefold_rabc",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="hlm_plus_d405_singlefold_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=False,
-            rabc_threshold=None,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # Hard Q-filter ablations — train on top-N% episodes by rorm_q, no soft weighting.
-    # Direct counterpart to the multiplicative/additive RABC runs for A/B comparison.
-    *[
-        TrainConfig(
-            name=f"pi0_yam_tshirt_topq{int(frac * 100):02d}",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id="tshirt_folding_d405_v010_20260420_gop10",
-                default_prompt="Folding tshirt pile and stacking",
-                base_config=DataConfig(prompt_from_task=True),
-                top_q_frac=frac,
-                val_frac=0.1,
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-            num_train_steps=60_000,
-            save_interval=30_000,
-            keep_period=30_000,     
-            rabc_enabled=False,
-        )
-        for frac in (0.10, 0.25, 0.50, 0.75)
-    ],
-    *[
-        TrainConfig(
-            name=f"pi0_yam_tshirt_topq{int(frac * 100):02d}_lora",
-            model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-            data=LeRobotYamRormDataConfig(
-                repo_id="tshirt_folding_d405_v010_20260420_gop10",
-                default_prompt="Folding tshirt pile and stacking",
-                base_config=DataConfig(prompt_from_task=True),
-                top_q_frac=frac,
-                val_frac=0.1,
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-            num_train_steps=60_000,
-            save_interval=30_000,
-            keep_period=30_000,     
-            rabc_enabled=False,
-            freeze_filter=pi0_config.Pi0Config(
-                action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-            ).get_freeze_filter(),
-            ema_decay=None,
-        )
-        for frac in (0.10, 0.25, 0.50, 0.75)
-    ],
-    # Shortest-episode filter ablations — train on shortest N% of episodes by frame count.
-    # Shortest demos tend to be cleaner/more confident executions.
-    *[
-        TrainConfig(
-            name=f"pi0_yam_tshirt_shortest_{int(frac * 100):02d}",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id="tshirt_folding_d405_v010_20260420_gop10",
-                default_prompt="Folding tshirt pile and stacking",
-                base_config=DataConfig(prompt_from_task=True),
-                top_shortest_frac=frac,
-                val_frac=0.1,
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-            num_train_steps=60_000,
-            save_interval=30_000,
-            keep_period=30_000,     
-            rabc_enabled=False,
-        )
-        for frac in (0.10, 0.20, 0.50, 0.75)
-    ],
-    # Q-weighted RABC — multiplicative: w = v_weight * q_norm
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_q_mult",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="multiplicative",
-            val_frac=0.1,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,     
-        rabc_enabled=True,
-    ),
-    # q_threshold (linear): per-episode velocity threshold = 1 - q_norm.
-    # Best episodes pass anything; worst require vel >= 1.0.
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_q_thresh_linear",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="q_threshold",
-            q_threshold_shape="linear",
-            q_threshold_low=1.0,
-            q_threshold_high=0.0,
-            val_frac=0.1,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,     
-        rabc_enabled=True,
-    ),
-    # q_threshold (sigmoid centered at top 5% — q_norm rank=0.95).
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_q_thresh_sig_top5",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="q_threshold",
-            q_threshold_shape="sigmoid",
-            q_threshold_center=0.95,
-            q_threshold_steepness=25.0,
-            q_threshold_low=1.0,
-            q_threshold_high=0.0,
-            val_frac=0.1,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # q_threshold (sigmoid centered at top 10% — q_norm rank=0.90).
-    # Sharp transition: top ~10% pass freely, the rest require near-1.0 vel.
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_q_thresh_sig_top10",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="q_threshold",
-            q_threshold_shape="sigmoid",
-            q_threshold_center=0.90,
-            q_threshold_steepness=20.0,
-            q_threshold_low=1.0,
-            q_threshold_high=0.0,
-            val_frac=0.1,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,     
-        rabc_enabled=True,
-    ),
-    # q_threshold (sigmoid centered at top 25% — q_norm rank=0.75).
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_q_thresh_sig_top25",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="q_threshold",
-            q_threshold_shape="sigmoid",
-            q_threshold_center=0.75,
-            q_threshold_steepness=15.0,
-            q_threshold_low=1.0,
-            q_threshold_high=0.0,
-            val_frac=0.1,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-    ),
-    # q_threshold + final_action variants: q-derived threshold replaces the
-    # static threshold in the final-action keep rule. Sample is kept iff
-    # vel[-1] is positive-and-accelerating OR vel[-1] > q-derived threshold.
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_q_thresh_linear_fa",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="q_threshold",
-            rabc_use_final_action_condition=True,
-            q_threshold_shape="linear",
-            q_threshold_low=1.0,
-            q_threshold_high=0.0,
-            val_frac=0.1,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=20_000,
-        keep_period=40_000,
-        rabc_enabled=True,
-    ),
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_q_thresh_sig_top5_fa",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="q_threshold",
-            rabc_use_final_action_condition=True,
-            q_threshold_shape="sigmoid",
-            q_threshold_center=0.95,
-            q_threshold_steepness=25.0,
-            q_threshold_low=1.0,
-            q_threshold_high=0.0,
-            val_frac=0.1,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=20_000,
-        keep_period=40_000,
-        rabc_enabled=True,
-    ),
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_q_thresh_sig_top10_fa",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="q_threshold",
-            rabc_use_final_action_condition=True,
-            q_threshold_shape="sigmoid",
-            q_threshold_center=0.90,
-            q_threshold_steepness=20.0,
-            q_threshold_low=1.0,
-            q_threshold_high=0.0,
-            val_frac=0.1,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=20_000,
-        keep_period=40_000,
-        rabc_enabled=True,
-    ),
-    # No-clip RABC — disable both clip bounds so v_weight passes through unmodified.
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_no_clip",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_clip_min=float("-inf"),
-            rabc_clip_max=float("inf"),
-            val_frac=0.1,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,     
-        rabc_enabled=True,
-    ),
-    # use_final_action_condition: keep samples by final-velocity rule, threshold=0.80.
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_use_final_action_cond",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_use_final_action_condition=True,
-            rabc_threshold=0.50,
-            rabc_clip_max=1.0,
-            val_frac=0.1,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,     
-        rabc_enabled=True,
-    ),
-    # Combined: top-10% Q-filter + multiplicative Q-weighted RABC.
-    TrainConfig(
-        name="pi0_yam_tshirt_topq10_rabc_q_mult",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            top_q_frac=0.10,
-            rabc_mode="multiplicative",
-            val_frac=0.1,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,     
-        rabc_enabled=True,
-    ),
-    # Q-weighted RABC — additive: w = 0.5 * (v_weight + q_norm)
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_q_add",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="additive",
-            val_frac=0.1,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,     
-        rabc_enabled=True,
-    ),
-    # LoRA variants of the new ablation configs (topq, shortest, q_mult, q_add).
-    *[
-        TrainConfig(
-            name=f"pi0_yam_tshirt_shortest_{int(frac * 100):02d}_lora",
-            model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-            data=LeRobotYamRormDataConfig(
-                repo_id="tshirt_folding_d405_v010_20260420_gop10",
-                default_prompt="Folding tshirt pile and stacking",
-                base_config=DataConfig(prompt_from_task=True),
-                top_shortest_frac=frac,
-                val_frac=0.1,
-            ),
-            batch_size=8,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-            num_train_steps=60_000,
-            save_interval=20_000,
-            keep_period=40_000,
-            rabc_enabled=False,
-            freeze_filter=pi0_config.Pi0Config(
-                action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-            ).get_freeze_filter(),
-            ema_decay=None,
-        )
-        for frac in (0.10, 0.20, 0.50, 0.75)
-    ],
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_false",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="velocity_only",
-            val_frac=0.1,
-        ),
-        batch_size=8,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=20_000,
-        keep_period=40_000,
-        rabc_enabled=True,
-    ),
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_only",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="velocity_only",
-            val_frac=0.1,
-        ),
-        batch_size=8,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=20_000,
-        keep_period=40_000,
-        rabc_enabled=True,
-    ),
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_q_mult_lora",
-        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="multiplicative",
-            val_frac=0.1,
-        ),
-        batch_size=8,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=20_000,
-        keep_period=40_000,
-        rabc_enabled=True,
-        freeze_filter=pi0_config.Pi0Config(
-            action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(),
-        ema_decay=None,
-    ),
-    TrainConfig(
-        name="pi0_yam_tshirt_rabc_q_add_lora",
-        model=pi0_config.Pi0Config(action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
-        data=LeRobotYamRormDataConfig(
-            repo_id="tshirt_folding_d405_v010_20260420_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="additive",
-            val_frac=0.1,
-        ),
-        batch_size=8,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
-        num_train_steps=60_000,
-        save_interval=20_000,
-        keep_period=40_000,
-        rabc_enabled=True,
-        freeze_filter=pi0_config.Pi0Config(
-            action_horizon=30, paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
-        ).get_freeze_filter(),
-        ema_decay=None,
-    ),
-    # ── Online Reward Model RABC (David Chen's HybridRM) ─────────────────
-    TrainConfig(
-        name="pi0_yam_tshirt_online_rm_rabc",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamDataConfig(
-            repo_id="Qianzhong-Chen/tshirt_folding_10h_hlm_yam_white_0810",
-            default_prompt="fold the tshirt",
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        online_rm_enabled=True,
-        online_rm_weight_method="float",
-    ),
-    TrainConfig(
-        name="pi0_yam_tshirt_online_rm_rabc_binary",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamDataConfig(
-            repo_id="Qianzhong-Chen/tshirt_folding_10h_hlm_yam_white_0810",
-            default_prompt="fold the tshirt",
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        online_rm_enabled=True,
-        online_rm_weight_method="binary",
-    ),
-    # ── SARM vanilla BC (no weighting, baseline comparison) ─────────────
-    TrainConfig(
-        name="pi0_yam_tshirt_sarm_bc",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamDataConfig(
-            repo_id="sarm_dense_and_sparse_only_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=90_000,
-        save_interval=30_000,
-        keep_period=30_000,
-    ),
-    # ── SARM cached RABC sparse head ────────────────────────────────────
-    TrainConfig(
-        name="pi0_yam_tshirt_sarm_rabc_sparse",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="sarm_dense_and_sparse_only_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="sarm_progress_delta",
-            sarm_kappa=0.01,
-            sarm_progress_key="sarm_sparse_progress",
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=90_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-        rabc_normalize_weights=True,
     ),
     # ── SARM cached RABC sparse head — centered+d405 under90s dataset ───
     TrainConfig(
@@ -3330,26 +2168,6 @@ _CONFIGS = [
         keep_period=30_000,
         rabc_enabled=False,
     ),
-    # ── SARM cached RABC (pre-computed dense progress predictions) ──────
-    TrainConfig(
-        name="pi0_yam_tshirt_sarm_rabc",
-        model=pi0_config.Pi0Config(action_horizon=30),
-        data=LeRobotYamRormDataConfig(
-            repo_id="sarm_dense_and_sparse_only_gop10",
-            default_prompt="Folding tshirt pile and stacking",
-            base_config=DataConfig(prompt_from_task=True),
-            rabc_mode="sarm_progress_delta",
-            sarm_kappa=0.01,
-        ),
-        batch_size=32,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=60_000,
-        save_interval=30_000,
-        keep_period=30_000,
-        rabc_enabled=True,
-        rabc_normalize_weights=True,
-    ),
     # ── SARM sparse — under60s + full variants of the centered_with_d405 set
     *[
         TrainConfig(
@@ -3372,7 +2190,7 @@ _CONFIGS = [
             rabc_enabled=True,
             rabc_normalize_weights=True,
         )
-        for tag in ("full", "under60s")
+        for tag in ("under60s",)
     ],
     # ── d405-short25 RM (repromo_signed_magnitude) finalaction thr=1.0 NOMAX
     #    on the same 3 centered_with_d405 datasets — A/B vs the SARM method.
@@ -3397,164 +2215,617 @@ _CONFIGS = [
             keep_period=20_000,
             rabc_enabled=True,
         )
-        for tag in ("full", "under90s", "under60s")
+        for tag in ("under90s", "under60s")
     ],
-    # Per-task pi0 finetunes on the 5 sim datasets with RABC final-action
-    # gating (keep iff repromo_velocity[-1] > threshold). repromo_velocity /
-    # repromo_quality columns must be written into each LeRobot dataset
-    # offline by the corresponding best_model_*_no_abs.pt repromo checkpoint
-    # before training. HF_LEROBOT_HOME must point at /home/karimelrafi/datasets.
-    *[
-        TrainConfig(
-            name=f"pi0_sim_{short}_rabc_finalaction_thr100",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id=repo_id,
-                default_prompt=prompt,
-                base_config=DataConfig(prompt_from_task=True),
-                rabc_use_final_action_condition=True,
-                rabc_threshold=1.00,
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-            num_train_steps=30_000,
-            save_interval=10_000,
-            keep_period=10_000,
-            rabc_enabled=True,
-        )
-        for short, repo_id, prompt in (
-            ("hang_mug",       "sim_hang_the_mug_on_the_mug_rack_gop10",       "Hang the mug on the mug rack"),
-            ("load_plates",    "sim_load_the_plates_into_the_dish_rack_gop10", "Load the plates into the dish rack"),
-            ("put_bottles",    "sim_put_the_plastic_bottles_in_the_bin_gop10", "Put the plastic bottles in the bin"),
-            ("sweep_paper",    "sim_sweep_away_paper_scraps_from_the_table",   "Sweep away paper scraps from the table"),
-            ("throw_bottles",  "sim_throw_plastic_bottles_in_bin_gop10",       "Throw the plastic bottles in the bin"),
-        )
-    ],
-    # Vanilla-BC counterparts to the 5 sim rabc_finalaction_thr100 configs above.
-    # rabc_enabled=False bypasses both the loss reweighting and the subset filter
-    # (data_loader.py forces reject_zero_weighted_samples=False), so every sample
-    # trains at weight=1.0. Same dataset / init / step budget / save schedule as
-    # the rabc variants — only the gate is removed, for a clean ablation.
-    *[
-        TrainConfig(
-            name=f"pi0_sim_{short}_no_rabc",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id=repo_id,
-                default_prompt=prompt,
-                base_config=DataConfig(prompt_from_task=True),
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-            num_train_steps=30_000,
-            save_interval=10_000,
-            keep_period=10_000,
-            rabc_enabled=False,
-        )
-        for short, repo_id, prompt in (
-            ("hang_mug",       "sim_hang_the_mug_on_the_mug_rack_gop10",       "Hang the mug on the mug rack"),
-            ("load_plates",    "sim_load_the_plates_into_the_dish_rack_gop10", "Load the plates into the dish rack"),
-            ("put_bottles",    "sim_put_the_plastic_bottles_in_the_bin_gop10", "Put the plastic bottles in the bin"),
-            ("sweep_paper",    "sim_sweep_away_paper_scraps_from_the_table",   "Sweep away paper scraps from the table"),
-            ("throw_bottles",  "sim_throw_plastic_bottles_in_bin_gop10",       "Throw the plastic bottles in the bin"),
-        )
-    ],
-    # ── Vanilla BC (no_rabc) for the canonical 30hz sim datasets
-    #    (s3://xdof-internal-research/repromo/datasets/sim_<task>_30hz_gop10).
-    #    Counterparts to the sim RABC runs (same pi0_base init / 30k steps /
-    #    save schedule; only the reward gate removed). DISTINCT from the
-    #    pi0_sim_<task>_no_rabc configs above, which point at the STALE 15hz
-    #    `_gop10` datasets — these use the 30hz canonical data so they're a
-    #    clean ablation against the 30hz RABC runs.
-    *[
-        TrainConfig(
-            name=f"pi0_sim_{short}_no_rabc_30hz",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id=repo_id,
-                default_prompt=prompt,
-                base_config=DataConfig(prompt_from_task=True),
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-            # Extended 30k -> 60k (resumed from the 29999 ckpts). decay_steps must
-            # match the 60k horizon (default CosineDecaySchedule decay_steps=30k is
-            # fixed, not tied to num_train_steps) so the cosine spans the full run
-            # rather than sitting at the 2.5e-6 floor for steps 30k-60k. Resuming the
-            # 30k-decayed ckpts gives a warm-restart LR bump at step 30k (intended).
-            lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
-            num_train_steps=60_000,
-            save_interval=10_000,
-            keep_period=10_000,
-            rabc_enabled=False,
-        )
-        for short, repo_id, prompt in (
-            ("load_plates",   "sim_load_the_plates_into_the_dish_rack_30hz_gop10",    "Load the plates into the dish rack"),
-            ("put_bottles",   "sim_put_the_plastic_bottles_in_the_bin_30hz_gop10",    "Put the plastic bottles in the bin"),
-            ("throw_bottles", "sim_throw_plastic_bottles_in_bin_30hz_gop10",          "Throw the plastic bottles in the bin"),
-            ("turn_mug",      "sim_turn_the_mug_right_side_up_30hz_gop10",            "Turn the mug right side up"),
-            ("sweep_paper",   "sim_sweep_away_paper_scraps_from_the_table_30hz_gop10","Sweep away paper scraps from the table"),
-        )
-    ],
-    # ── Per-task RABC trains on the canonical 30hz sim datasets, gating on the
-    #    inline `repromo_signed_magnitude` column injected by the new sss45
-    #    WARP-RM checkpoints (collaborator-uploaded 2026-06-25 to
-    #    s3://xdof-internal-research/repromo/datasets/mjgl_sim_30hz/<slug>/ and
-    #    promoted to s3://xdof-internal-research/lerobot/<slug>/).
-    #    Recipe: final-action gate at thr=1.0 (keep iff vel[-1] > 1.0), default
-    #    rabc_clip_max=1.0 → binary keep semantics (matches the original
-    #    pi0_sim_*_rabc_finalaction_thr100 runs, not the box/bottles/tshirt
-    #    `warpbc_sss{n}` continuous-reweight variant). top_shortest_frac unset.
-    #    Step budget 60k + cosine decay_steps=60k mirrors pi0_sim_*_no_rabc_30hz
-    #    so the RABC-vs-vanilla-BC comparison is apples-to-apples.
-    *[
-        TrainConfig(
-            name=f"pi0_sim_{short}_rabc_30hz",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id=repo_id,
-                default_prompt=prompt,
-                base_config=DataConfig(prompt_from_task=True),
-                rabc_use_final_action_condition=True,
-                rabc_threshold=1.00,
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-            lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
-            num_train_steps=60_000,
-            save_interval=10_000,
-            keep_period=10_000,
-            rabc_enabled=True,
-        )
-        for short, repo_id, prompt in (
-            ("hang_mug",      "sim_hang_the_mug_on_the_mug_rack_30hz_gop10",          "Hang the mug on the mug rack"),
-            ("load_plates",   "sim_load_the_plates_into_the_dish_rack_30hz_gop10",    "Load the plates into the dish rack"),
-            ("put_bottles",   "sim_put_the_plastic_bottles_in_the_bin_30hz_gop10",    "Put the plastic bottles in the bin"),
-            ("sweep_paper",   "sim_sweep_away_paper_scraps_from_the_table_30hz_gop10","Sweep away paper scraps from the table"),
-            ("throw_bottles", "sim_throw_plastic_bottles_in_bin_30hz_gop10",          "Throw the plastic bottles in the bin"),
-            ("turn_mug",      "sim_turn_the_mug_right_side_up_30hz_gop10",            "Turn the mug right side up"),
-        )
-    ],
-    # ── put_bottles MJWARP RABC matrix (mirrors the DiT-XL mjwarp Table-A arms:
-    #    perobj RM, overall RM, + no_rabc baseline). Trains on the mjwarp
-    #    re-rendered 30hz dataset (2438 eps, 14-dim state/actions) with the
-    #    per-frame `warp_rm_signed_magnitude` column injected from the DiT
-    #    velocity_rm_{perobj,overall}.bin sidecars (an exact copy of the RM's
-    #    per-frame signal — verified bit-for-bit against abc/score_to_sidecar).
-    #    Two videos-on-S3 dataset copies:
-    #      sim_put_bottles_mjwarp_rmperobj  <- velocity_rm_perobj.bin
-    #      sim_put_bottles_mjwarp_rmoverall <- velocity_rm_overall.bin
-    #    Recipe = pi0_sim_put_bottles_rabc_30hz (final-action gate thr=1.0,
-    #    default clip_max=1.0 binary-keep, ah=30, pi0_base init, 60k cosine,
-    #    bs=32). Baseline reuses the perobj copy with rabc_enabled=False (the
-    #    reward column is ignored when RABC is off — RM-agnostic vanilla BC).
+    # ── WARP-BC champion for the sim bottle-in-bin table (paper:
+    #    sim_bottle_results). Repo sim_put_bottles_mjwarp_rmsss15 has the
+    #    per-frame warp_rm_* columns injected RAW (no rescale)
+    #    from the wr_A_rm_perobj_s25_mjwarp_sss15_20k dense sidecar
+    #    (/mnt/data/warp_rm/sidecars/rm_perobj_sss15, dense_predictions.parquet,
+    #    verified exact float32 2438/2438 eps). Raw thr=1.0 keeps ~31.5% of
+    #    chunks (32.55% of frames have vel > 1.0).
     TrainConfig(
-        name="pi0_put_bottles_mjwarp_rabc_perobj",
+        name="pi0_put_bottles_mjwarp_rabc_sss15",
         model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmsss15",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=True,
+    ),
+    # ── WARP-VC: velocity-CONDITIONED sibling of ..._rabc_sss15. Uses the
+    #    PROVEN sss15@30Hz RM signal (sim_put_bottles_mjwarp_rmsss15, the
+    #    rabc_sss15 arm's dataset — arm eval 4.57); REDIRECTED 2026-07-07
+    #    off sim_put_bottles_mjwarp_rmsss15_60 after its rabc arm collapsed
+    #    to vanilla (4.03 vs no_rabc 4.07). Recipe (ah=30, pi0_base init,
+    #    30k cosine, bs=32), but NO rejection / weighting:
+    #    rabc_enabled=False skips the subset filter + loss weight,
+    #    so ALL chunks train. Instead each sample's prompt gets a per-sample
+    #    ", speed: {slow|normal|fast}" suffix from the chunk-final velocity
+    #    vel[-1] (the same statistic the RABC gate thresholds on). Edges
+    #    (0.66, 1.05) = empirical p25/p75 of vel[-1] over all 2,228,979
+    #    chunk starts (2438 eps) of THIS dataset's warp_rm_signed_magnitude
+    #    (raw p25/p75 = 0.6594/1.0508) -> slow/normal/fast = 25.1/49.8/25.1%.
+    #    The base prompt is overridden with default_prompt (deterministic
+    #    "Put the plastic bottles in the bin, speed: <bin>") because the
+    #    prompt_from_task path yields the garbage prompt "0" on this
+    #    dataset's lerobot-v3 task table (as it did for ALL sibling arms —
+    #    harmless there, fatal for prompt-borne conditioning).
+    #    At eval, send "Put the plastic bottles in the bin, speed: fast".
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_velcond",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmsss15",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            speed_bin_prompt_edges=(0.66, 1.05),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=False,
+    ),
+    # ── WARP-VC-AdaRMS: ALIGN-style velocity conditioning via the pi0.5 action
+    #    expert's AdaRMS, on the SAME dataset (sim_put_bottles_mjwarp_rmsss15)
+    #    and RM signal (warp_rm_signed_magnitude, chunk-final vel[-1]) as the
+    #    prompt-conditioning velcond arm — a clean INJECTION-METHOD ablation.
+    #    Motivation: the base-pi0 prompt velcond arm learned the correct
+    #    condition->speed direction but expressed it only WEAKLY (~0.55x the
+    #    diffusion-noise floor) because the language->action-expert pathway is
+    #    attenuated. Here the scalar velocity is injected DIRECTLY into every
+    #    action-expert layer's scale/shift/gate via AdaRMS (bypassing
+    #    SigLIP+Gemma): adarms_cond = time_emb + cond_mlp(condition), with
+    #    cond_mlp's final layer zero-init so it starts as an exact no-op
+    #    (identity w.r.t. pi05_base — a safe fine-tune start). Data routing:
+    #    InjectVelocityCondition writes data["condition"] = vel[-1] per chunk
+    #    (before ComputeRABCWeights pops the vel key), and (base_prompt) fixes
+    #    the training prompt to the deterministic base sentence. rabc_enabled
+    #    =False: ALL chunks train (no gate/reweight), each conditioned on its
+    #    OWN velocity. weight_loader = pi05_base; missing_regex widened so the
+    #    new cond_mlp is treated as fresh (kept, not dropped) at merge time.
+    #    Deploy: condition is fixed to velocity_condition_inference_value (1.5,
+    #    the "fast" analogue) at serve — see InjectVelocityCondition.
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_velcond_adarms",
+        model=pi0_config.Pi0Config(action_horizon=30, pi05=True, velocity_condition=True),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmsss15",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            velocity_condition=True,
+            velocity_condition_inference_value=1.5,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=".*(lora|cond_mlp).*",
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=False,
+    ),
+    # ── WARP-VC-prompt (pi0.5 control): the prompt-conditioning method (SAME
+    #    ", speed: {slow|normal|fast}" suffix / edges as pi0_put_bottles_mjwarp_
+    #    velcond) but on the pi0.5 backbone + pi05_base init — so it differs
+    #    from ..._velcond_adarms ONLY in injection method (prompt vs AdaRMS),
+    #    isolating the ALIGN hypothesis on a matched backbone. No cond_mlp / no
+    #    new params, so the default missing_regex (LoRA-only) is correct.
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_velcond_prompt_pi05",
+        model=pi0_config.Pi0Config(action_horizon=30, pi05=True),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmsss15",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            speed_bin_prompt_edges=(0.66, 1.05),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=False,
+    ),
+    # ── pi0.5-VANILLA control: plain pi0.5 BC on rmsss15, NO conditioning + NO
+    #    RABC (differs from velcond_prompt_pi05 by dropping the speed-bin prompt
+    #    conditioning + rabc fields). The fundamental control for the AdaRMS
+    #    study: isolates the pi0.5 BACKBONE from any conditioning method. Eval on
+    #    the shared base prompt "Put the plastic bottles in the bin".
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_velcond_vanilla_pi05",
+        model=pi0_config.Pi0Config(action_horizon=30, pi05=True),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmsss15",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_warpbc",
+        model=pi0_config.Pi0Config(action_horizon=30, pi05=True, discrete_state_input=False, max_token_len=48),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            velocity_condition=True,
+            velocity_condition_inference_value=1.0,
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=".*(lora|state_proj|cond_mlp).*",
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=7_500,
+        keep_period=7_500,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi05_bottles_warpcfg",
+        model=pi0_config.Pi0Config(action_horizon=30, pi05=True, discrete_state_input=False, max_token_len=48, velocity_condition=True),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            velocity_condition=True,
+            velocity_condition_inference_value=1.0,
+            velocity_condition_binarize_thr=1.0,
+            velocity_condition_cfg_dropout=0.1,
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=".*(lora|state_proj|cond_mlp).*",
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=7_500,
+        keep_period=7_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_v1",
+        # Obedience fine-tune: warm start from the frozen steering host
+        # (ctrl_h16/14999) on the steered-rollout corpus. The point prompt
+        # and outcome bit ride in the task string (prompt_from_task).
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormDataConfig(
+            repo_id="steer_lr_merged",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/work/ckpt/14999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_v2",
+        # v2: command in the STATE channel (17-dim state: 14 + u_n, v_n, ok)
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormDataConfig(
+            repo_id="steer_lr_v2state",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/work/ckpt/14999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_v3",
+        # v3: success-only corpus, state channel (17-dim state: 14 + u_n, v_n, ok)
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormDataConfig(
+            repo_id="steer_lr_v3succ",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/work/ckpt/14999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_v4",
+        # v2: command in the STATE channel (17-dim state: 14 + u_n, v_n, ok)
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormDataConfig(
+            repo_id="steer_lr_v4succ",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/work/ckpt/14999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_v5",
+        # v2: command in the STATE channel (17-dim state: 14 + u_n, v_n, ok)
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormDataConfig(
+            repo_id="steer_lr_v5succ",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/work/ckpt/14999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_v5hind",
+        # v2: command in the STATE channel (17-dim state: 14 + u_n, v_n, ok)
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormDataConfig(
+            repo_id="steer_lr_v5hind",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/work/ckpt/14999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_v5hindcfg",
+        # hindsight (base-arm) labels + 25% command dropout for CFG at inference
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormCmdDropoutDataConfig(
+            repo_id="steer_lr_v5hind",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            cmd_dropout=0.25,
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/work/ckpt/14999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_demohindcfg",
+        # ORIGINAL DEMOS hindsight labels (MCAP ground truth) + 25% command dropout for CFG
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormCmdDropoutDataConfig(
+            repo_id="steer_lr_demohind",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            cmd_dropout=0.25,
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/work/ckpt/14999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_demodpo",
+        # ORIGINAL DEMOS, hindsight label (pos) + counterfactual command (neg); DPO-on-condition loss; 25% command dropout
+        model=pi0_dpo.Pi0DpoConfig(pi05=True, action_dim=32, action_horizon=16, dpo_beta=5.0, dpo_lambda=1.0),
+        data=LeRobotYamRormDpoDataConfig(
+            repo_id="steer_lr_demodpo",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            cmd_dropout=0.25,
+        ),
+        batch_size=64,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/work/ckpt/14999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=6_000),
+        num_train_steps=6_000,
+        save_interval=2_000,
+        keep_period=2_000,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_demomoddrop2",
+        # ORIGINAL DEMOS hindsight labels; INDEPENDENT image + command dropout for composable guidance at inference
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormModDropDataConfig(
+            repo_id="steer_lr_demohind",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            img_dropout=0.25, cmd_dropout=0.25,
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/work/ckpt/14999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=5_000),
+        num_train_steps=5_000,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_demomoddrop",
+        # hindsight (base-arm) labels; INDEPENDENT image + command dropout for composable guidance at inference
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormModDropDataConfig(
+            repo_id="steer_lr_v5hind",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            img_dropout=0.25, cmd_dropout=0.25,
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/work/ckpt/14999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=5_000),
+        num_train_steps=5_000,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_demodpo_eval",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormDataConfig(
+            repo_id="steer_lr_demodpo",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=64, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/work/ckpt/14999/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=6_000), num_train_steps=6_000,
+        save_interval=2_000, keep_period=2_000, rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_v6nogate",
+        # v2: command in the STATE channel (17-dim state: 14 + u_n, v_n, ok)
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormDataConfig(
+            repo_id="steer_lr_v6nogate",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/work/ckpt/14999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_demotrim",
+        # route 3 on ORIGINAL HUMAN DEMOS with the initial still segment trimmed (motion onset); image/command dropout 0.25/0.25
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormModDropDataConfig(
+            repo_id="steer_lr_demotrim",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            img_dropout=0.25, cmd_dropout=0.25,
+        ),
+        batch_size=128, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/work/ckpt/14999/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=5_000), num_train_steps=5_000,
+        save_interval=2_500, keep_period=2_500, rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_demoseg",
+        # route 3 on ORIGINAL HUMAN DEMOS trimmed + SEGMENT-LEVEL hindsight labels (every pick segment carries its own command); image/command dropout 0.25/0.25
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormModDropDataConfig(
+            repo_id="steer_lr_demoseg",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            img_dropout=0.25, cmd_dropout=0.25,
+        ),
+        batch_size=128, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/work/ckpt/14999/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=5_000), num_train_steps=5_000,
+        save_interval=2_500, keep_period=2_500, rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_demoseg6",
+        # route 3 on ORIGINAL HUMAN DEMOS trimmed + SEGMENT-LEVEL APPROACH-ONLY hindsight labels (s6: window ends at the ORACLE lift onset, null after); image/command dropout 0.25/0.25
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormModDropDataConfig(
+            repo_id="steer_lr_demoseg6",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            img_dropout=0.25, cmd_dropout=0.25,
+        ),
+        batch_size=128, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/work/ckpt/14999/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=5_000), num_train_steps=5_000,
+        save_interval=2_500, keep_period=2_500, rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_rollseg",
+        # route 3 on ORIGINAL HUMAN DEMOS BASE-ARM ROLLOUTS with approach-only segment labels (command only from segment start to grasp closure; null after); image/command dropout 0.25/0.25
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormModDropDataConfig(
+            repo_id="steer_lr_rollseg",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            img_dropout=0.25, cmd_dropout=0.25,
+        ),
+        batch_size=128, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/work/ckpt/14999/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=5_000), num_train_steps=5_000,
+        save_interval=2_500, keep_period=2_500, rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_demomoddrop_p50",
+        # route 3 sweep: base-arm hindsight labels, image dropout 0.5 (vs 0.25), command dropout 0.25
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormModDropDataConfig(
+            repo_id="steer_lr_v5hind",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            img_dropout=0.5, cmd_dropout=0.25,
+        ),
+        batch_size=128, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/work/ckpt/14999/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=5_000), num_train_steps=5_000,
+        save_interval=2_500, keep_period=2_500, rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_kin",
+        # route 3 with KINEMATIC labels (FK pinch at first gripper closure; no object identity)
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormModDropDataConfig(
+            repo_id="steer_lr_kin",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            img_dropout=0.25, cmd_dropout=0.25,
+        ),
+        batch_size=128, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/work/ckpt/14999/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=5_000), num_train_steps=5_000,
+        save_interval=2_500, keep_period=2_500, rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_noise20",
+        # route 3 label-noise tolerance: 20% of episodes relabelled to a random other bottle
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormModDropDataConfig(
+            repo_id="steer_lr_noise20",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            img_dropout=0.25, cmd_dropout=0.25,
+        ),
+        batch_size=128, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/work/ckpt/14999/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=5_000), num_train_steps=5_000,
+        save_interval=2_500, keep_period=2_500, rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_kin1901",
+        # route 3 with KINEMATIC labels (k3: FK pinch at the lift-confirmed closure; no object state) on the SAME 1,901 episodes as the COM-label set
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormModDropDataConfig(
+            repo_id="steer_lr_kin1901",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            img_dropout=0.25, cmd_dropout=0.25,
+        ),
+        batch_size=128, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/work/ckpt/14999/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=5_000), num_train_steps=5_000,
+        save_interval=2_500, keep_period=2_500, rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_obedience_kinseg",
+        # route 3 on the base-arm rollouts with k4 labels: SEGMENT-LEVEL APPROACH-ONLY KINEMATIC labels (FK pinch at each lift-confirmed closure, null after the lift); no object state
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
+        data=LeRobotYamRormModDropDataConfig(
+            repo_id="steer_lr_kinseg",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            img_dropout=0.25, cmd_dropout=0.25,
+        ),
+        batch_size=128, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data/work/ckpt/14999/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=5_000), num_train_steps=5_000,
+        save_interval=2_500, keep_period=2_500, rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_ctrl_h16",
+        # pi05 defaults on purpose: discrete_state_input -> True, max_token_len
+        # -> 200, matching pi05_abc_pretrain exactly so BOTH arms load with zero
+        # randomly initialized parameters. Do NOT copy the shipped bottles
+        # configs' discrete_state_input=False here — see patch_bottles_h16.py.
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
         data=LeRobotYamRormDataConfig(
             repo_id="sim_put_bottles_mjwarp_rmperobj",
             default_prompt="Put the plastic bottles in the bin",
@@ -3562,32 +2833,86 @@ _CONFIGS = [
             rabc_use_final_action_condition=True,
             rabc_threshold=1.00,
         ),
-        batch_size=32,
+        batch_size=128,
         num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
-        num_train_steps=60_000,
-        save_interval=10_000,
-        keep_period=10_000,
-        rabc_enabled=True,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=False,
     ),
     TrainConfig(
-        name="pi0_put_bottles_mjwarp_rabc_overall",
-        model=pi0_config.Pi0Config(action_horizon=30),
+        name="pi05_bottles_abc_h16",
+        # pi05 defaults on purpose: discrete_state_input -> True, max_token_len
+        # -> 200, matching pi05_abc_pretrain exactly so BOTH arms load with zero
+        # randomly initialized parameters. Do NOT copy the shipped bottles
+        # configs' discrete_state_input=False here — see patch_bottles_h16.py.
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=16),
         data=LeRobotYamRormDataConfig(
-            repo_id="sim_put_bottles_mjwarp_rmoverall",
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
             default_prompt="Put the plastic bottles in the bin",
             base_config=DataConfig(prompt_from_task=True),
             rabc_use_final_action_condition=True,
             rabc_threshold=1.00,
         ),
-        batch_size=32,
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get(
+                "ABC_CKPT_PARAMS",
+                "/scratch/warprm/checkpoints/pi05_abc_pretrain/abc_designB/25000/params",
+            )
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi05_bottles_vanilla",
+        model=pi0_config.Pi0Config(action_horizon=30, pi05=True, discrete_state_input=False, max_token_len=48),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+            velocity_condition=True,
+            velocity_condition_inference_value=1.0,
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=".*(lora|state_proj|cond_mlp).*",
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=7_500,
+        keep_period=7_500,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi0_bottles_design_ctrl",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_bottles_ctrl",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.0027,
+        ),
+        batch_size=128,
         num_workers=8,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
-        num_train_steps=60_000,
-        save_interval=10_000,
-        keep_period=10_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=7_500,
+        keep_period=7_500,
         rabc_enabled=True,
     ),
     TrainConfig(
@@ -3603,47 +2928,12 @@ _CONFIGS = [
         batch_size=32,
         num_workers=8,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
-        num_train_steps=60_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
         save_interval=10_000,
         keep_period=10_000,
         rabc_enabled=False,
     ),
-    # ── NOMAX siblings of pi0_sim_<task>_rabc_30hz. Identical recipe except
-    #    rabc_clip_max=inf — chunks above thr=1.0 keep their raw vel[-1]
-    #    weight magnitude rather than saturating at 1.0. clip_min left at
-    #    default 0.0 (dead under threshold-gating; see transforms.py:332,
-    #    `np.clip(final_vel, None, self.clip_max)` ignores clip_min).
-    *[
-        TrainConfig(
-            name=f"pi0_sim_{short}_rabc_30hz_nomax",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id=repo_id,
-                default_prompt=prompt,
-                base_config=DataConfig(prompt_from_task=True),
-                rabc_use_final_action_condition=True,
-                rabc_threshold=1.00,
-                rabc_clip_max=float("inf"),
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-            lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=60_000),
-            num_train_steps=60_000,
-            save_interval=10_000,
-            keep_period=10_000,
-            rabc_enabled=True,
-        )
-        for short, repo_id, prompt in (
-            ("hang_mug",      "sim_hang_the_mug_on_the_mug_rack_30hz_gop10",          "Hang the mug on the mug rack"),
-            ("load_plates",   "sim_load_the_plates_into_the_dish_rack_30hz_gop10",    "Load the plates into the dish rack"),
-            ("put_bottles",   "sim_put_the_plastic_bottles_in_the_bin_30hz_gop10",    "Put the plastic bottles in the bin"),
-            ("sweep_paper",   "sim_sweep_away_paper_scraps_from_the_table_30hz_gop10","Sweep away paper scraps from the table"),
-            ("throw_bottles", "sim_throw_plastic_bottles_in_bin_30hz_gop10",          "Throw the plastic bottles in the bin"),
-            ("turn_mug",      "sim_turn_the_mug_right_side_up_30hz_gop10",            "Turn the mug right side up"),
-        )
-    ],
     # ── WARP-BC (reward-aligned BC) + vanilla BC: 06_10 d405 deliveries
     #    (box, bottles) + tshirt folding. 9 WARP-BC (3 tasks × {sss15,sss30,sss45}
     #    RM strides) + 3 vanilla BC = 12 runs.
@@ -3679,42 +2969,7 @@ _CONFIGS = [
             rabc_enabled=True,
         )
         for short, (repo, prompt, base_ckpt) in _WARPBC_TASKS.items()
-        for n in (15, 30, 45)
-    ],
-    # ── Multi-cam (3-camera concat RM) WARP-BC: IDENTICAL recipe to
-    #    pi0_{short}_warpbc_sss{n} above, EXCEPT the velocity column is produced
-    #    by the 3-camera (top + left/right wrist) concat reward model and scored
-    #    into the copy <repo>_mc3_sss{n}. Only name + repo_id differ — same
-    #    τ=1.0, clip_max=inf, finalaction, top_shortest_frac=0.5, action_horizon,
-    #    base init (incl tshirt's special pi0_yam_tshirt ckpt), steps — so the
-    #    single-cam-vs-multi-cam comparison is clean and the downstream
-    #    real-robot eval is the only differing signal (RM val was ~tied).
-    #    PREREQUISITE: <repo>_mc3_sss{n} produced by
-    #    warprm2/scripts/launch_mc3_scoring_sky.sh (concat-RM dense inference,
-    #    cache-hit over shortest-60%, inject warp_rm_signed_magnitude).
-    *[
-        TrainConfig(
-            name=f"pi0_{short}_warpbc_mc3_sss{n}",
-            model=pi0_config.Pi0Config(action_horizon=30),
-            data=LeRobotYamRormDataConfig(
-                repo_id=f"{repo}_mc3_sss{n}",
-                default_prompt=prompt,
-                base_config=DataConfig(prompt_from_task=True),
-                rabc_use_final_action_condition=True,
-                rabc_threshold=1.00,
-                rabc_clip_max=float("inf"),
-                top_shortest_frac=0.5,
-            ),
-            batch_size=32,
-            num_workers=8,
-            weight_loader=weight_loaders.CheckpointWeightLoader(base_ckpt),
-            num_train_steps=60_000,
-            save_interval=30_000,
-            keep_period=30_000,
-            rabc_enabled=True,
-        )
-        for short, (repo, prompt, base_ckpt) in _WARPBC_TASKS.items()
-        for n in (15, 30, 45)
+        for n in (45,)
     ],
     *[
         TrainConfig(
@@ -3736,6 +2991,294 @@ _CONFIGS = [
         )
         for short, (repo, prompt, base_ckpt) in _WARPBC_TASKS.items()
     ],
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_scizor_matched",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotScizorSidecarDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            scizor_sidecar_path="/home/nvidia/warprm_repro/scizor_out/scizor_predictions.parquet",
+            scizor_eps_s=0.12448952496069646,
+            scizor_weight_mode="binary",
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_warpbc_crop_center",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_bottles_crop_center",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_sweep_sss3",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_bottles_sss3_squash",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000, save_interval=30_000, keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_sweep_sss5",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_bottles_sss5_squash",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000, save_interval=30_000, keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_sweep_sss7",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_bottles_sss7_squash",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000, save_interval=30_000, keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_sweep_iid",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_bottles_iid_squash",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.047659,
+        ),
+        batch_size=32, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000, save_interval=30_000, keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_continuous",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=0.993983,
+            rabc_clip_max=float("inf"),
+        ),
+        batch_size=32, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000, save_interval=30_000, keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_sarm",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotScizorSidecarDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            scizor_sidecar_path="/home/nvidia/warprm_repro/sarm_out/sarm_sidecar.parquet",
+            scizor_eps_s=-0.03764558,
+            scizor_weight_mode="binary",
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_pb_ctrl",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_bottles_pb_ctrl",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.0,
+        ),
+        batch_size=32, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000, save_interval=30_000, keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_pb_logu",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_bottles_pb_logu",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.0,
+        ),
+        batch_size=32, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000, save_interval=30_000, keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_pb_floor",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_bottles_pb_floor",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.0,
+        ),
+        batch_size=32, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000, save_interval=30_000, keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_cellA",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_bottles_cellA",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.0,
+        ),
+        batch_size=32, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000, save_interval=30_000, keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_reingest",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_bottles_reingest",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.0,
+        ),
+        batch_size=32, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000, save_interval=30_000, keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_rmonly",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_bottles_rmonly",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.0,
+        ),
+        batch_size=32, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000, save_interval=30_000, keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_warpbc_repro",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=0.993983,
+        ),
+        batch_size=32, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000, save_interval=30_000, keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_lenstrat",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotScizorSidecarDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            scizor_sidecar_path="/scratch/warprm/lenstrat_out/lenstrat_predictions.parquet",
+            scizor_eps_s=0.5,
+            scizor_weight_mode="binary",
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=30_000,
+        keep_period=30_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_warpbc_thr10",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            rabc_use_final_action_condition=True,
+            rabc_threshold=1.00,
+        ),
+        batch_size=32, num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000, save_interval=30_000, keep_period=30_000,
+        rabc_enabled=True,
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

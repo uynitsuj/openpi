@@ -77,8 +77,10 @@ class YamInputs(transforms.DataTransformFn):
             base_image = np.zeros((224, 224, 3), dtype=np.uint8)
 
         match self.model_type:
-            case _model.ModelType.PI0:
-                # Map YAM cameras to standard PI0 camera names
+            case _model.ModelType.PI0 | _model.ModelType.PI05:
+                # Map YAM cameras to standard PI0/PI05 camera names (identical
+                # image layout + IMAGE_KEYS; pi05's discrete_state_input is
+                # handled downstream by TokenizePrompt, not here).
                 images = {
                     "base_0_rgb": processed_images.get("top_camera-images-rgb", np.zeros_like(base_image)),  # Top camera as base
                     "left_wrist_0_rgb": processed_images.get("left_camera-images-rgb", np.zeros_like(base_image)),  # Left camera
@@ -122,10 +124,24 @@ class YamInputs(transforms.DataTransformFn):
         if "sample_weights" in data:
             inputs["sample_weights"] = np.asarray(data["sample_weights"], dtype=np.float32)
 
+        # Scalar velocity-conditioning signal (velocity_condition arm). Pass
+        # through like sample_weights so it survives to Observation.from_dict.
+        if "condition" in data:
+            inputs["condition"] = np.asarray(data["condition"], dtype=np.float32)
+
         return inputs
 
 
 @dataclasses.dataclass(frozen=True)
+class YamInputsWithNeg(YamInputs):
+    """YamInputs plus pass-through of 'state_neg' (padded to action_dim) for DPO-on-condition training."""
+    def __call__(self, data: dict) -> dict:
+        out = super().__call__(data)
+        if "state_neg" in data:
+            out["state_neg"] = transforms.pad_to_dim(np.asarray(data["state_neg"], dtype=np.float32), self.action_dim)
+        return out
+
+
 class YamOutputs(transforms.DataTransformFn):
     """Outputs for the YAM policy."""
 

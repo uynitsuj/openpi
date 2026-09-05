@@ -78,6 +78,10 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.discrete_state_input = config.discrete_state_input
+        # ALIGN-style velocity conditioning is only meaningful on the pi0.5
+        # AdaRMS pathway; force off for plain pi0 (no adarms_cond exists).
+        self.velocity_condition = bool(config.pi05 and config.velocity_condition)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -104,6 +108,27 @@ class Pi0(_model.BaseModel):
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
+            if not config.discrete_state_input:
+                # Hybrid host: pi0.5 action expert (adaRMS time/cond injection)
+                # with the pi0-style CONTINUOUS state suffix token. Without
+                # this, pi05 + discrete_state_input=False is proprioception-
+                # blind: the model drops the state token AND the transforms
+                # never tokenize state into the prompt.
+                self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+            if self.velocity_condition:
+                # Small MLP: scalar condition -> action-expert width, fused
+                # additively into adarms_cond. Final layer is zero-init so the
+                # whole term starts at exactly 0 (identity w.r.t. pi05_base):
+                # a safe fine-tune start where the condition has no effect until
+                # gradients push cond_mlp_out off zero.
+                self.cond_mlp_in = nnx.Linear(1, action_expert_config.width, rngs=rngs)
+                self.cond_mlp_out = nnx.Linear(
+                    action_expert_config.width,
+                    action_expert_config.width,
+                    kernel_init=nnx.initializers.zeros,
+                    bias_init=nnx.initializers.zeros,
+                    rngs=rngs,
+                )
         else:
             self.state_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -159,7 +184,7 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
-        if not self.pi05:
+        if (not self.pi05) or (not self.discrete_state_input):
             # add a single state token
             state_token = self.state_proj(obs.state)[:, None, :]
             tokens.append(state_token)
@@ -178,6 +203,22 @@ class Pi0(_model.BaseModel):
             time_emb = nnx.swish(time_emb)
             action_expert_tokens = action_tokens
             adarms_cond = time_emb
+            # ALIGN-style velocity conditioning: fuse a scalar condition into
+            # the AdaRMS conditioning vector, bypassing the SigLIP+Gemma
+            # backbone. No-op when the flag is off or no condition is supplied
+            # (e.g. fake_obs / non-conditioning eval) — preserves pi05_base.
+            if self.velocity_condition and obs.condition is not None:
+                cond = obs.condition[:, None].astype(time_emb.dtype)  # (b, 1)
+                # WARP-CFG: NaN = per-sample classifier-free null. cond_emb is
+                # zeroed for those samples -> exact unconditional branch
+                # (adarms_cond = time_emb), which is pi05_base behavior.
+                keep = ~jnp.isnan(cond)
+                cond_in = jnp.nan_to_num(cond)
+                cond_emb = self.cond_mlp_in(cond_in)
+                cond_emb = nnx.swish(cond_emb)
+                cond_emb = self.cond_mlp_out(cond_emb)
+                cond_emb = jnp.where(keep, cond_emb, jnp.zeros_like(cond_emb))
+                adarms_cond = time_emb + cond_emb
         else:
             # mix timestep + action information using an MLP (no adaRMS)
             time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
@@ -232,6 +273,11 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        # WARP-CFG guidance weight. None = plain conditioned sampling (w==1
+        # semantics via the transform-injected condition). Set w to sample
+        # pi(a|s)*p(o|s,a)^w: two suffix passes per step (cond + null),
+        # shared prefix KV cache, v = v_n + w*(v_c - v_n).
+        cfg_weight: float | at.Float[at.Array, ""] | None = None,
         # --- Real-Time Chunking (RTC) --------------------------------------- #
         # When ``action_prefix`` is supplied, dispatch to the RTC-guided
         # denoiser (``sample_actions_rtc``). Otherwise this function is the
@@ -262,6 +308,17 @@ class Pi0(_model.BaseModel):
             )
 
         observation = _model.preprocess_observation(None, observation, train=False)
+        use_cfg = (
+            cfg_weight is not None
+            and self.velocity_condition
+            and observation.condition is not None
+        )
+        if use_cfg:
+            import dataclasses as _dc
+            obs_uncond = _dc.replace(
+                observation, condition=jnp.full_like(observation.condition, jnp.nan)
+            )
+            w_cfg = jnp.asarray(cfg_weight, dtype=jnp.float32)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
@@ -277,35 +334,34 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
-            )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
-            assert full_attn_mask.shape == (
-                batch_size,
-                suffix_tokens.shape[1],
-                prefix_tokens.shape[1] + suffix_tokens.shape[1],
-            )
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                [None, suffix_tokens],
-                mask=full_attn_mask,
-                positions=positions,
-                kv_cache=kv_cache,
-                adarms_cond=[None, adarms_cond],
-            )
-            assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            def _v(obs_branch):
+                suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                    obs_branch, x_t, jnp.broadcast_to(time, batch_size)
+                )
+                suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+                prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+                full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+                assert full_attn_mask.shape == (
+                    batch_size,
+                    suffix_tokens.shape[1],
+                    prefix_tokens.shape[1] + suffix_tokens.shape[1],
+                )
+                positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+                (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                    [None, suffix_tokens],
+                    mask=full_attn_mask,
+                    positions=positions,
+                    kv_cache=kv_cache,
+                    adarms_cond=[None, adarms_cond],
+                )
+                assert prefix_out is None
+                return self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+            v_t = _v(observation)
+            if use_cfg:
+                v_n = _v(obs_uncond)
+                v_t = v_n + w_cfg * (v_t - v_n)
 
             return x_t + dt * v_t, time + dt
 

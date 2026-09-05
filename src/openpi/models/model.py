@@ -99,9 +99,18 @@ class Observation(Generic[ArrayT]):
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
     # Tokenized prompt mask.
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
+    # counterfactual command prompt (DPO-on-condition training only)
+    tokenized_prompt_neg: at.Int[ArrayT, "*b l"] | None = None
+    tokenized_prompt_neg_mask: at.Bool[ArrayT, "*b l"] | None = None
 
     # RABC / AWR per-sample weight. When present, used to weight the loss per sample.
     sample_weights: at.Float[ArrayT, "*b"] | None = None
+
+    # Optional scalar conditioning signal (one value per example). Used by the
+    # velocity-conditioning arm (Pi0Config.velocity_condition): fused into the
+    # pi0.5 AdaRMS `adarms_cond` via a small MLP in embed_suffix. Default None so
+    # existing (non-conditioning) obs construction and models are unaffected.
+    condition: at.Float[ArrayT, "*b"] | None = None
 
     # pi0-fast model specific fields.
 
@@ -127,8 +136,11 @@ class Observation(Generic[ArrayT]):
             image_masks=data["image_mask"],
             state=data["state"],
             sample_weights=data.get("sample_weights"),
+            condition=data.get("condition"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
+            tokenized_prompt_neg=data.get("tokenized_prompt_neg"),
+            tokenized_prompt_neg_mask=data.get("tokenized_prompt_neg_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -229,6 +241,7 @@ def preprocess_observation(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
+        condition=observation.condition,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,

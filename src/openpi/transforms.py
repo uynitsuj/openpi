@@ -460,6 +460,182 @@ class ComputeRABCWeights(DataTransformFn):
         return data
 
 
+@dataclasses.dataclass(frozen=True)
+class InjectSpeedBinPrompt(DataTransformFn):
+    """Velocity-CONDITIONED prompting (WARP-VC): append a discrete speed-bin
+    suffix to the language prompt from the chunk's final-frame RM velocity.
+
+    Reads the same per-frame signed-magnitude window that ComputeRABCWeights
+    consumes (shape ``(action_horizon,)``, stacked by ``extra_horizon_keys``)
+    but instead of producing a weight/gate, maps ``vel[-1]`` — the exact
+    statistic the RABC final-action gate thresholds on — to a discrete bin
+    and rewrites the prompt per SAMPLE:
+
+        "Put the plastic bottles in the bin" -> "..., speed: fast"
+
+    Binning: vel[-1] <  edges[0]              -> bin_names[0] ("slow")
+             edges[0] <= vel[-1] < edges[1]   -> bin_names[1] ("normal")
+             vel[-1] >= edges[1]              -> bin_names[2] ("fast")
+
+    No samples are dropped or re-weighted — this transform must run BEFORE
+    ComputeRABCWeights (which pops the velocity key) and BEFORE tokenization
+    (it edits the plain-text ``prompt``). It intentionally does NOT pop the
+    velocity key so a downstream ComputeRABCWeights still sees it.
+
+    At inference the velocity column is absent from the input dict, so this
+    is a no-op and the client-supplied prompt (which should carry the desired
+    suffix, e.g. ", speed: fast") rides through untouched.
+    """
+
+    # (lo, hi) velocity edges, raw RM units. Required — pick from the
+    # empirical distribution of chunk-final velocities on the target dataset.
+    edges: tuple[float, float]
+    bin_names: tuple[str, str, str] = ("slow", "normal", "fast")
+    suffix_template: str = ", speed: {}"
+    # When set, REPLACES the incoming per-sample prompt with this string
+    # before appending the suffix, so the training prompt is fully
+    # deterministic: "<base_prompt>, speed: <bin>". This sidesteps the
+    # lerobot-v3 tasks coercion bug in create_torch_dataset (DataFrame
+    # indexed by task_index with the string in a 'task' column -> the
+    # {int(idx): str(task)} inversion yields {0: '0'}, i.e. prompt_from_task
+    # datasets train with the literal prompt "0"), and guarantees the eval
+    # client can reproduce the exact training prompt.
+    base_prompt: str | None = None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        # Same key precedence as ComputeRABCWeights.__call__ (canonical name
+        # first, then legacy fallbacks).
+        vel_key = next(
+            (
+                k
+                for k in (
+                    "warp_rm_signed_magnitude",
+                    "repromo_signed_magnitude",
+                    "rorm_velocity",
+                    "sarm_dense_signed_magnitude",
+                )
+                if k in data
+            ),
+            None,
+        )
+        if vel_key is None:
+            # Inference (or velocity-less dataset): leave the prompt alone.
+            return data
+        vel = np.asarray(data[vel_key], dtype=np.float32).ravel()
+        if len(vel) == 0:
+            return data
+        final_vel = float(vel[-1])
+        lo, hi = self.edges
+        if final_vel < lo:
+            name = self.bin_names[0]
+        elif final_vel < hi:
+            name = self.bin_names[1]
+        else:
+            name = self.bin_names[2]
+
+        if self.base_prompt is not None:
+            prompt = self.base_prompt
+        else:
+            prompt = data.get("prompt")
+            if prompt is None:
+                # Velocity present but no prompt: this is a training-side
+                # wiring bug (prompt_from_task / default_prompt missing). Fail
+                # loudly rather than silently training an unconditioned policy.
+                raise ValueError(
+                    "InjectSpeedBinPrompt requires 'prompt' in the data dict when "
+                    "a velocity column is present (or set base_prompt). Set "
+                    "prompt_from_task=True or place this transform after prompt "
+                    "injection."
+                )
+            if not isinstance(prompt, str):
+                prompt = np.asarray(prompt).item()
+                if isinstance(prompt, bytes):
+                    prompt = prompt.decode("utf-8")
+        return {**data, "prompt": f"{prompt}{self.suffix_template.format(name)}"}
+
+
+@dataclasses.dataclass(frozen=True)
+class InjectVelocityCondition(DataTransformFn):
+    """ALIGN-style velocity conditioning (WARP-VC-AdaRMS): write the chunk's
+    final-frame RM velocity into ``data["condition"]`` as a scalar so the
+    pi0.5 action expert can fuse it into AdaRMS (see Pi0Config.velocity_condition).
+
+    Reads the SAME per-frame signed-magnitude window ComputeRABCWeights /
+    InjectSpeedBinPrompt consume (shape ``(action_horizon,)``, stacked by
+    ``extra_horizon_keys``) and writes ``condition = float(vel[-1])`` — the
+    exact statistic the RABC final-action gate thresholds on and the
+    prompt-conditioning arm bins. This is the raw RM velocity (NOT normalized
+    by norm_stats — the cond MLP consumes it directly).
+
+    Ordering: must run BEFORE ComputeRABCWeights (which pops the velocity key).
+    It intentionally does NOT pop the velocity key, so a downstream
+    ComputeRABCWeights (and/or InjectSpeedBinPrompt) still sees it.
+
+    Inference: the velocity column is absent from the serve input dict. If
+    ``inference_fixed_condition`` is set, that fixed value (the "fast" analogue,
+    a high quantile of the training vel[-1] distribution) is written so the
+    deployed policy is conditioned on high velocity. If a ``condition`` is
+    already present (e.g. a client explicitly supplied one) it is left
+    untouched. If neither, this is a no-op and the model falls back to
+    unconditioned behavior (adarms_cond = time_emb).
+    """
+
+    # Fixed condition value written at inference (velocity column absent).
+    # None -> no-op at inference (leave condition unset).
+    inference_fixed_condition: float | None = None
+    # WARP-CFG: binarize the condition to the o-bit [vel > thr] before writing.
+    # None -> raw velocity (the original velcond arm).
+    binarize_threshold: float | None = None
+    # WARP-CFG: classifier-free dropout — with this probability the training
+    # condition is replaced by NaN. The model zeroes cond_emb for NaN samples
+    # (per-sample unconditional branch == pi05_base behavior), which trains
+    # the marginal the guidance formula needs.
+    cfg_dropout_p: float = 0.0
+    # When set, REPLACES the training prompt with this deterministic string
+    # (same rationale as InjectSpeedBinPrompt.base_prompt: the prompt_from_task
+    # path yields a garbage "0" prompt on lerobot-v3 task tables). Applied only
+    # at training (velocity column present) so the AdaRMS arm shares the SAME
+    # base prompt as the prompt-conditioning control — the only difference being
+    # the injection method. At inference the client prompt rides through.
+    base_prompt: str | None = None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        vel_key = next(
+            (
+                k
+                for k in (
+                    "warp_rm_signed_magnitude",
+                    "repromo_signed_magnitude",
+                    "rorm_velocity",
+                    "sarm_dense_signed_magnitude",
+                )
+                if k in data
+            ),
+            None,
+        )
+        if vel_key is not None:
+            vel = np.asarray(data[vel_key], dtype=np.float32).ravel()
+            if len(vel) == 0:
+                return data
+            # Do NOT pop the velocity key — ComputeRABCWeights runs next.
+            cond = float(vel[-1])
+            if self.binarize_threshold is not None:
+                cond = 1.0 if cond > self.binarize_threshold else 0.0
+            if self.cfg_dropout_p > 0.0 and np.random.random() < self.cfg_dropout_p:
+                cond = float("nan")  # CFG null sentinel
+            out = {**data, "condition": np.float32(cond)}
+            if self.base_prompt is not None:
+                out["prompt"] = self.base_prompt
+            return out
+
+        # Inference / velocity-less dataset.
+        if "condition" in data:
+            return data
+        if self.inference_fixed_condition is not None:
+            return {**data, "condition": np.float32(self.inference_fixed_condition)}
+        return data
+
+
 # Module-level cache for sidecar parquet contents. Keyed on the sidecar path
 # (resolved) + (mtime, size) so swapping sidecar files between runs in the
 # same process invalidates correctly. Holds a (per_episode dict, score_column)
@@ -819,6 +995,23 @@ class TokenizePrompt(DataTransformFn):
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenizeNegPrompt(DataTransformFn):
+    """Tokenize (prompt, state_neg) into tokenized_prompt_neg(+mask). state_neg is the
+    same proprio with a counterfactual command in dims 14-16. Leaves 'prompt' in place."""
+    tokenizer: _tokenizer.PaligemmaTokenizer
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "state_neg" not in data:
+            return data
+        prompt = data["prompt"]
+        if not isinstance(prompt, str):
+            prompt = prompt.item()
+        tokens, masks = self.tokenizer.tokenize(prompt, data["state_neg"])
+        out = {k: v for k, v in data.items() if k != "state_neg"}
+        return {**out, "tokenized_prompt_neg": tokens, "tokenized_prompt_neg_mask": masks}
 
 
 @dataclasses.dataclass(frozen=True)

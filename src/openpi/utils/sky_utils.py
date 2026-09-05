@@ -220,32 +220,26 @@ def _build_run_script() -> str:
         'export WANDB_TAGS="skypilot,$SKYPILOT_CLUSTER_NAME"',
         'export WANDB_NOTES="task_id=$SKYPILOT_TASK_ID cluster=$SKYPILOT_CLUSTER_NAME"',
         '',
-        '# Auto-resume for preemption/spot safety. SkyPilot re-runs this script on',
-        '# a fresh instance after a spot preemption or machine failure. If this run',
-        '# already has step checkpoints in S3 (from a prior attempt), resume from',
-        '# the LATEST one instead of overwriting and restarting from scratch. Also',
-        '# honors an explicit RESUME=true (manual resume of a stopped run).',
+        '# Resume mode: pull existing checkpoints from S3 into the local checkpoint dir',
+        '# BEFORE training so train.py can pick up from where it stopped.',
         'LOCAL_CKPT_DIR="$CHECKPOINT_BASE_DIR/$CONFIG_NAME/$EXP_NAME"',
-        '# Latest step already present in S3 (checkpoint step dirs are named by int step).',
-        'LATEST_S3_STEP=$(aws s3 ls "$S3_CHECKPOINT_PATH/" 2>/dev/null | grep -oE "PRE [0-9]+/" | grep -oE "[0-9]+" | sort -n | tail -1)',
-        'if [ -n "$LATEST_S3_STEP" ]; then',
-        '  echo "[INFO] Found S3 checkpoint at step $LATEST_S3_STEP; resuming from it"',
-        '  mkdir -p "$LOCAL_CKPT_DIR/$LATEST_S3_STEP"',
-        '  # Pull only the latest step (orbax reconstructs manager state from the',
-        '  # step dir; avoids re-downloading every accumulated checkpoint on each',
-        '  # recovery). Skip partial orbax tmp dirs from an interrupted write.',
-        '  aws s3 sync "$S3_CHECKPOINT_PATH/$LATEST_S3_STEP" "$LOCAL_CKPT_DIR/$LATEST_S3_STEP" \\',
-        '    --exclude "*.orbax-checkpoint-tmp-*"',
-        '  df -h "$LOCAL_CKPT_DIR" | tail -1',
-        '  RESUME_ARG="--resume --no-overwrite"',
-        'elif [ "$RESUME" = "true" ]; then',
-        '  # Manual resume requested but nothing in S3 yet (e.g. preempted before the',
-        '  # first save). --resume is a no-op on an empty dir, so this starts fresh.',
-        '  echo "[INFO] RESUME set but no S3 checkpoint yet; starting fresh"',
+        'if [ "$RESUME" = "true" ]; then',
+        '  echo "[INFO] Resume mode: syncing prior checkpoints from $S3_CHECKPOINT_PATH"',
         '  mkdir -p "$LOCAL_CKPT_DIR"',
+        '  # Skip orbax tmp dirs from previous failed writes — they\'re partial/corrupt.',
+        '  aws s3 sync "$S3_CHECKPOINT_PATH" "$LOCAL_CKPT_DIR" \\',
+        '    --exclude "*.orbax-checkpoint-tmp-*"',
+        '  # Free disk: keep only the latest checkpoint locally; older steps still in S3.',
+        '  # Also remove any orbax tmp dirs that slipped through (defensive).',
+        '  find "$LOCAL_CKPT_DIR" -maxdepth 1 -mindepth 1 -type d -name "*orbax-checkpoint-tmp*" -exec rm -rf {} + 2>/dev/null',
+        '  LATEST_STEP=$(find "$LOCAL_CKPT_DIR" -maxdepth 1 -mindepth 1 -type d -regextype posix-extended -regex ".*/[0-9]+" -printf "%f\\n" 2>/dev/null | sort -n | tail -1)',
+        '  if [ -n "$LATEST_STEP" ]; then',
+        '    echo "[INFO] Latest checkpoint: $LATEST_STEP. Removing older local checkpoints (still on S3)."',
+        '    find "$LOCAL_CKPT_DIR" -maxdepth 1 -mindepth 1 -type d -regextype posix-extended -regex ".*/[0-9]+" ! -name "$LATEST_STEP" -exec rm -rf {} +',
+        '    df -h "$LOCAL_CKPT_DIR" | tail -1',
+        '  fi',
         '  RESUME_ARG="--resume --no-overwrite"',
         'else',
-        '  echo "[INFO] No prior checkpoint in S3; starting fresh"',
         '  RESUME_ARG="--overwrite"',
         'fi',
         '',
@@ -254,7 +248,6 @@ def _build_run_script() -> str:
         'if [ -n "$NUM_TRAIN_STEPS_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --num-train-steps=$NUM_TRAIN_STEPS_OVERRIDE"; fi',
         'if [ -n "$SAVE_INTERVAL_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --save-interval=$SAVE_INTERVAL_OVERRIDE"; fi',
         'if [ -n "$KEEP_PERIOD_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --keep-period=$KEEP_PERIOD_OVERRIDE"; fi',
-        'if [ -n "$FSDP_DEVICES_OVERRIDE" ]; then EXTRA_ARGS="$EXTRA_ARGS --fsdp-devices=$FSDP_DEVICES_OVERRIDE"; fi',
         '',
         '# Run training',
         'echo "[INFO] Running training: $CONFIG_NAME exp=$EXP_NAME (resume=$RESUME, extras=$EXTRA_ARGS)"',
@@ -288,9 +281,7 @@ def generate_sky_config(
     s3_checkpoint_base: str,
     wandb_api_key: Optional[str] = None,
     provider_regions: Optional[dict[str, str]] = None,
-    aws_regions: Optional[List[str]] = None,
     aws_image_ids: Optional[dict[str, str]] = None,
-    use_spot: bool = False,
     idle_minutes: int = 10,
     xla_mem_fraction: float = 0.95,
     managed: bool = True,
@@ -299,7 +290,6 @@ def generate_sky_config(
     num_train_steps_override: Optional[int] = None,
     save_interval_override: Optional[int] = None,
     keep_period_override: Optional[int] = None,
-    fsdp_devices_override: Optional[int] = None,
 ) -> dict:
     """Generate a single SkyPilot YAML with multi-cloud auto-failover.
 
@@ -313,17 +303,7 @@ def generate_sky_config(
         provider_regions: Optional map pinning providers to a region,
             e.g. {"aws": "us-west-2"}. Unpinned providers let SkyPilot
             choose the cheapest available region.
-        aws_regions: Optional list of AWS regions to fail over across,
-            e.g. ["us-west-2", "us-east-1"]. When set, overrides the single
-            ``provider_regions["aws"]`` pin and emits one candidate per
-            (region, accelerator) using the region's AMI from aws_image_ids.
-            Regions without an AMI in aws_image_ids are skipped.
         aws_image_ids: Map of AWS region to AMI ID for the Deep Learning AMI.
-        use_spot: If True, add a spot variant of every candidate (in addition
-            to the on-demand one). SkyPilot prefers the cheaper spot candidates
-            and falls back to on-demand when no spot capacity is available. On
-            preemption, managed-job recovery re-queues and the run script
-            auto-resumes from the latest S3 checkpoint.
         managed: If True, config is for ``sky jobs launch`` (auto-teardown).
     """
     provider_regions = provider_regions or {}
@@ -334,59 +314,36 @@ def generate_sky_config(
     if wandb_api_key:
         secrets['WANDB_API_KEY'] = wandb_api_key
 
-    # Build one resource candidate per (provider, region, accelerator) tuple.
+    # Build one resource candidate per (provider, accelerator) pair.
     # Within any_of entries, accelerators must be a single string.
     # SkyPilot picks the cheapest available and auto-fails-over.
     candidates = []
     for provider in providers:
-        # Determine the region(s) to try for this provider. aws_regions, when
-        # set, expands aws across multiple regions; otherwise fall back to the
-        # single provider_regions pin (which may be None = any region).
-        if provider == 'aws' and aws_regions:
-            regions = list(aws_regions)
-        else:
-            regions = [provider_regions.get(provider)]
+        region = provider_regions.get(provider)
+        infra = f"{provider}/{region}" if region else provider
 
-        for region in regions:
-            infra = f"{provider}/{region}" if region else provider
+        for accel in accelerators:
+            entry = {
+                'infra': infra,
+                'accelerators': accel,
+                'disk_size': disk_size,
+            }
 
-            for accel in accelerators:
-                entry = {
-                    'infra': infra,
-                    'accelerators': accel,
-                    'disk_size': disk_size,
-                }
+            if provider == 'aws' and aws_image_ids:
+                if region and region in aws_image_ids:
+                    entry['image_id'] = aws_image_ids[region]
+                elif not region:
+                    entry['image_id'] = aws_image_ids
 
-                if provider == 'aws' and aws_image_ids:
-                    if region and region in aws_image_ids:
-                        entry['image_id'] = aws_image_ids[region]
-                    elif region and region not in aws_image_ids:
-                        # No AMI for this region — skip it rather than launch
-                        # with an arbitrary default image.
-                        print(f"[WARN] No AMI in aws_image_ids for region {region}; skipping.")
-                        continue
-                    elif not region:
-                        entry['image_id'] = aws_image_ids
-
-                # Prefer spot (cheaper) with on-demand as fallback. SkyPilot's
-                # optimizer orders any_of by price, so the spot variant is tried
-                # first and on-demand only when no spot capacity exists anywhere.
-                if use_spot:
-                    candidates.append({**entry, 'use_spot': True})
-                candidates.append(entry)
+            candidates.append(entry)
 
     if len(candidates) == 1:
         resources = candidates[0]
     else:
         resources = {'any_of': candidates}
 
-    # Repo root = parents[3] of src/openpi/utils/sky_utils.py. Derived at
-    # runtime so the launcher works regardless of which user/home checks out
-    # the repo (was previously hardcoded to a specific user's home dir).
-    repo_root = str(Path(__file__).resolve().parents[3])
-
     config = {
-        'workdir': repo_root,
+        'workdir': '/home/justinyu/openpi',
         'envs': {
             'DATASET_PATH': dataset_s3_path,
             'CONFIG_NAME': config_name,
@@ -400,7 +357,6 @@ def generate_sky_config(
             'NUM_TRAIN_STEPS_OVERRIDE': str(num_train_steps_override) if num_train_steps_override is not None else '',
             'SAVE_INTERVAL_OVERRIDE': str(save_interval_override) if save_interval_override is not None else '',
             'KEEP_PERIOD_OVERRIDE': str(keep_period_override) if keep_period_override is not None else '',
-            'FSDP_DEVICES_OVERRIDE': str(fsdp_devices_override) if fsdp_devices_override is not None else '',
         },
         'resources': resources,
         'num_nodes': 1,

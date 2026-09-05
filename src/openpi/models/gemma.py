@@ -31,6 +31,8 @@ from typing import Literal, TypeAlias
 
 import einops
 import flax.linen as nn
+import os
+
 import jax
 import jax.numpy as jnp
 
@@ -360,8 +362,24 @@ class Module(nn.Module):
             Block,
             prevent_cse=False,
             static_argnums=(5,),  # 0=self, 6=deterministic
-            policy=jax.checkpoint_policies.nothing_saveable,
+            policy=getattr(jax.checkpoint_policies,
+                           os.environ.get("OPENPI_REMAT_POLICY", "nothing_saveable")),
         )
+        if os.environ.get("OPENPI_UNROLL_SCAN"):
+            # S8 probe: python-unrolled layer stack (no nn.scan). Fresh-init
+            # profiling only — param tree is per-layer, NOT ckpt-compatible
+            # with the stacked scan layout.
+            self.layers = [
+                block_cls(
+                    configs=self.configs,
+                    dropout=self.dropout,
+                    dropout_bdims=self.dropout_bdims,
+                    name=f"unrolled_layer_{i}",
+                )
+                for i in range(self.configs[0].depth)
+            ]
+            self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
+            return
         self.layers = nn.scan(
             block_cls,
             variable_axes={"params": 0},
@@ -402,7 +420,20 @@ class Module(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
+        if isinstance(self.layers, (list, tuple)):
+            # S8 probe: unrolled layer loop, kv_cache sliced per layer.
+            kv_outs = []
+            for i, layer in enumerate(self.layers):
+                kv_i = None if kv_cache is None else jax.tree.map(lambda a, i=i: a[i], kv_cache)
+                embedded, kv_out = layer(embedded, kv_i, positions, mask, adarms_cond, deterministic)
+                kv_outs.append(kv_out)
+            kv_cache = (
+                jax.tree.map(lambda *xs: jnp.stack(xs), *kv_outs)
+                if kv_outs and kv_outs[0] is not None
+                else None
+            )
+        else:
+            embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
 
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 

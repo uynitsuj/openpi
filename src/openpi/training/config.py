@@ -2403,6 +2403,55 @@ _CONFIGS = [
         val_interval=1_000,
         project_name="siemens-industrial-packing",
     ),
+    # v8dj generation (2026-09-07): fresh query of the same job with ~3 more days
+    # of collection. Same filters/lineage as v6dj/v7dj (completed, >20s, exclude
+    # explicitly-bad, driver joint order via --no-flip-joints, baked packing
+    # prompt). Two pools from one query (data through 2026-09-06 02:01Z):
+    #   full  : 7376 CSV eps (v6dj was 4232, +3144)
+    #   recent: 4492 CSV eps, created>=2026-09-02 02:50Z (v7dj_recent was 2670, +1822)
+    # From pi05_base ONLY; never mix with flip-lineage v1-v4. 20k steps.
+    TrainConfig(
+        name="pi05_siemens_simple_d405_v8dj_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="siemens_simple_d405_v8dj",
+            default_prompt="Pack one transparent bag into the cardboard box and flatten the bag.",
+            base_config=DataConfig(prompt_from_task=True),
+            val_frac=10 / 7376,  # CSV eps; refine to converted count post-conversion
+            val_seed=0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        val_interval=1_000,
+        project_name="siemens-industrial-packing",
+    ),
+    TrainConfig(
+        name="pi05_siemens_simple_d405_v8dj_recent_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="siemens_simple_d405_v8dj_recent",
+            default_prompt="Pack one transparent bag into the cardboard box and flatten the bag.",
+            base_config=DataConfig(prompt_from_task=True),
+            val_frac=10 / 4492,  # CSV eps; refine to converted count post-conversion
+            val_seed=0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        val_interval=1_000,
+        project_name="siemens-industrial-packing",
+    ),
     #
     # RABC / AWR weighted YAM tshirt folding configs.
     #

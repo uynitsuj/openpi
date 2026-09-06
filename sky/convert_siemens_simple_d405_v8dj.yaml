@@ -1,0 +1,95 @@
+# simple-D405 v8dj FULL (2026-09-07): fresh query, 7376 eps (v6dj was 4232). No date
+# filter. audit not bad, quality not poor,
+# driver joint order (--no-flip-joints -> straight-through serving, NO per-arm
+# flip) + explicit prompt via --task-override. Same filters: >20s, not poor,
+# audit not bad. Train from pi05_base ONLY — never warm-start from flip-lineage.
+# Standard pipeline: resize_with_pad to 224 (letterbox), NO center crop.
+# --trim-tails cuts the operator stop-button tail (release grippers -> retract to
+# park -> press stop; 16.2% of frames on v2). See scripts/yam_data/tail_trim.py.
+#
+# Launch:  uv run sky jobs launch sky/convert_siemens_simple_d405_v8dj.yaml -n siemens-simple-d405-v8dj-convert -d --yes
+
+name: siemens-simple-d405-v8dj-convert
+
+workdir: /home/karim/openpi
+
+resources:
+  infra: aws/us-west-2
+  cpus: 96+
+  memory: 128+
+  disk_size: 500
+
+num_nodes: 1
+
+envs:
+  REPO_NAME: siemens_simple_d405_v8dj
+  CONFIG_NAME: pi05_siemens_simple_d405_v8dj_bs128
+  S3_DATASET_PATH: s3://xdof-internal-research/siemens/datasets/siemens_simple_d405_v8dj
+  EPISODE_CSV: job_episodes_simple_d405_v8dj.csv
+  MIN_EPISODES: "6500"
+
+setup: |
+  echo "[SETUP] Setting up openpi for dataset conversion"
+  conda deactivate 2>/dev/null; conda deactivate 2>/dev/null; true
+  if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
+  export DEBIAN_FRONTEND=noninteractive
+  $SUDO apt-get update && $SUDO apt-get install -y git curl pkg-config software-properties-common awscli
+  if $SUDO add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg7; then
+    $SUDO apt-get update
+  else
+    echo "[SETUP] FFmpeg 7 PPA unavailable; falling back to distro FFmpeg packages"
+  fi
+  $SUDO apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavdevice-dev libavutil-dev libavfilter-dev libswscale-dev libswresample-dev
+  $SUDO ldconfig || true
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  source $HOME/.local/bin/env 2>/dev/null || true
+  uv venv --python 3.11
+  source .venv/bin/activate
+  GIT_LFS_SKIP_SMUDGE=1 uv sync
+  GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+  uv pip install mcap mcap-protobuf-support
+  echo "[SETUP] Complete"
+
+run: |
+  set -eo pipefail
+  conda deactivate 2>/dev/null; conda deactivate 2>/dev/null; true
+  source .venv/bin/activate
+
+  echo "[1/5] Converting raw MCAP episodes -> LeRobot v2.1 (duration filter >20s, tail trim)"
+  python scripts/yam_data/convert_xdof_mcap_job.py \
+    --episode-csv "$EPISODE_CSV" \
+    --repo-name "$REPO_NAME" \
+    --min-duration-s 20 \
+    --trim-tails \
+    --no-flip-joints \
+    --task-override "Pack one transparent bag into the cardboard box and flatten the bag." \
+    --max-workers 48
+
+  echo "[2/5] Migrating v2.1 -> v3.0 (single data file: avoids the 0.4.5 rollover bug)"
+  python -m lerobot.datasets.v30.convert_dataset_v21_to_v30 \
+    --repo-id "$REPO_NAME" \
+    --root "$HOME/.cache/huggingface/lerobot/$REPO_NAME" \
+    --data-file-size-in-mb 100000 \
+    --push-to-hub false
+  rm -rf "$HOME/.cache/huggingface/lerobot/${REPO_NAME}_old"
+
+  echo "[3/5] Sanity-loading the converted dataset"
+  python - <<'PYEOF'
+  import os
+  from lerobot.datasets.lerobot_dataset import LeRobotDataset
+  repo = os.environ["REPO_NAME"]
+  ds = LeRobotDataset(repo)
+  print(f"frames={ds.num_frames} episodes={ds.num_episodes} fps={ds.fps}")
+  assert ds.num_episodes > int(os.environ["MIN_EPISODES"]), (ds.num_episodes, os.environ["MIN_EPISODES"])
+  to_idx = ds.meta.episodes["dataset_to_index"][-1]
+  assert to_idx == ds.num_frames == len(ds.hf_dataset), (to_idx, ds.num_frames, len(ds.hf_dataset))
+  print("episode boundary check OK")
+  PYEOF
+
+  echo "[4/5] Uploading dataset to $S3_DATASET_PATH"
+  aws s3 sync "$HOME/.cache/huggingface/lerobot/$REPO_NAME" "$S3_DATASET_PATH" --only-show-errors
+
+  echo "[5/5] Computing openpi norm stats (50k frames) + upload"
+  python scripts/compute_norm_stats.py --config-name "$CONFIG_NAME" --max-frames 50000
+  aws s3 cp "assets/$CONFIG_NAME/$REPO_NAME/norm_stats.json" "$S3_DATASET_PATH/norm_stats/$CONFIG_NAME/norm_stats.json"
+  echo "[OK] Dataset build complete: $S3_DATASET_PATH"

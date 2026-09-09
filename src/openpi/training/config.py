@@ -2589,7 +2589,7 @@ _CONFIGS = [
             repo_id="siemens_simple_d405_v11dj_recent",
             default_prompt="Pack one transparent bag into the cardboard box and flatten the bag.",
             base_config=DataConfig(prompt_from_task=True),
-            val_frac=10 / 7721,  # CSV eps; refine to converted count post-conversion
+            val_frac=10 / 6651,  # 7721 CSV eps -> 6651 converted (de-prod upload lag; leader-actions lineage)
             val_seed=0,
         ),
         batch_size=128,

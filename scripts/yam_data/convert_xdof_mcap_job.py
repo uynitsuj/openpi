@@ -6,6 +6,7 @@ modern xdof station format directly:
 
     episode_<ts>_<id>.npy.mp4/
         left.mcap / right.mcap            # /​{side}-robot-state (6D pos @ ~290Hz), /{side}-gripper-state (1D)
+        action-left.mcap / action-right.mcap  # /action-{side}-robot-state and -gripper-state
         timestamp.npy                     # 30Hz global clock (seconds)
         {left,right}_camera-images-rgb.mp4
         top_camera-images-left_rgb.mp4    # ZED-X stereo left eye = canonical top view
@@ -15,10 +16,12 @@ modern xdof station format directly:
 Episodes are streamed from S3 (s3://xdof-de-prod + nfs_path), converted, and raw files deleted
 immediately, so peak disk usage stays ~num_workers x 150MB.
 
-Conventions match convert_yam_data.py / LeRobotYamDataConfig exactly:
+State and action vectors use absolute joint positions at 30 Hz:
     state[0:6]  = flip(left-joint_pos)   state[6]  = left-gripper_pos
     state[7:13] = flip(right-joint_pos)  state[13] = right-gripper_pos
-    actions = state (absolute joint positions), fps 30, 224x224 resize-with-pad videos.
+    actions use the recorded action-left/right streams in the same joint order.
+    --no-flip-joints preserves driver order for both state and actions.
+    By default, the top camera is center-cropped to a square and wrists are padded to 224x224.
 
 Camera frames are aligned to the global 30Hz clock via nearest-neighbor on the per-camera
 timestamps (instead of take-first-N).
@@ -39,6 +42,7 @@ import subprocess
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Literal
 
 import av
 import numpy as np
@@ -57,7 +61,10 @@ RAW_VIDEO_FOR_KEY = {
     "left_camera-images-rgb": ("left_camera-images-rgb.mp4", "left_camera-timestamp.npy"),
     "right_camera-images-rgb": ("right_camera-images-rgb.mp4", "right_camera-timestamp.npy"),
 }
-RAW_FILES = ["left.mcap", "right.mcap", "timestamp.npy", "metadata.json", "top_camera-timestamp.npy"] + [
+RAW_FILES = [
+    "left.mcap", "right.mcap", "action-left.mcap", "action-right.mcap",
+    "timestamp.npy", "metadata.json", "top_camera-timestamp.npy",
+] + [
     f for pair in RAW_VIDEO_FOR_KEY.values() for f in pair
 ]
 
@@ -113,9 +120,9 @@ class Config:
     min_duration_s: float = 10.0
     raw_cache_dir: Path = Path("/tmp/xdof_raw_eps")
     resize_size: int = 224
-    # "pad" (house convention: letterbox) or "center_crop" (largest square -> resize,
-    # e.g. 640x480 -> 480x480 -> 224x224; serving must center-crop to match).
-    resize_mode: str = "pad"
+    # Crop the top view to its largest centered square; retain the wrists' full FOV
+    # with padding. Explicit "pad" / "center_crop" still apply to all three views.
+    resize_mode: Literal["pad", "center_crop", "top_center_crop"] = "top_center_crop"
     fps: int = 30
     chunk_size: int = 1000
     max_workers: int = 24
@@ -135,6 +142,12 @@ class Config:
     task_override: str | None = None
     keep_raw: bool = False
     max_episodes: int | None = None  # for smoke tests
+
+    @property
+    def camera_resize_modes(self) -> dict[str, str]:
+        if self.resize_mode == "top_center_crop":
+            return {cam: "center_crop" if cam == "top_camera-images-rgb" else "pad" for cam in CAMERA_KEYS}
+        return dict.fromkeys(CAMERA_KEYS, self.resize_mode)
 
 
 def center_crop_resize(img: np.ndarray, size: int) -> np.ndarray:
@@ -218,27 +231,32 @@ def read_side_mcap(path: Path, side: str) -> dict[str, np.ndarray]:
     return out
 
 
-def build_state(ep_dir: Path, flip_joints: bool = True) -> np.ndarray:
-    """(N,14) float32 state aligned to timestamp.npy. flip_joints=True reverses each
-    arm's 6 joints (legacy LeRobot-lineage order); False keeps raw driver order."""
+def build_state_and_actions(ep_dir: Path, flip_joints: bool = True) -> tuple[np.ndarray, np.ndarray]:
+    """Align follower states and recorded actions independently to timestamp.npy.
+
+    Both arrays are (N,14) float32. flip_joints=True reverses each arm's 6 joints;
+    False keeps raw driver order. Grippers stay at indices 6 and 13.
+    """
     ts_global_ns = to_ns(np.load(ep_dir / "timestamp.npy"))
     n = len(ts_global_ns)
-    state = np.empty((n, 14), dtype=np.float32)
-    for side, joint_slice, grip_col in [("left", slice(0, 6), 6), ("right", slice(7, 13), 13)]:
-        d = read_side_mcap(ep_dir / f"{side}.mcap", side)
-        ji = nearest_indices(d["joint_ts"], ts_global_ns)
-        gi = nearest_indices(d["grip_ts"], ts_global_ns)
-        jp = d["joint_pos"][ji]
-        state[:, joint_slice] = np.flip(jp, axis=1) if flip_joints else jp
-        state[:, grip_col] = d["grip_pos"][gi][:, 0]
-    return state
+    state, actions = (np.empty((n, 14), dtype=np.float32) for _ in range(2))
+    for prefix, vectors in [("", state), ("action-", actions)]:
+        for side, joint_slice, grip_col in [("left", slice(0, 6), 6), ("right", slice(7, 13), 13)]:
+            stream = f"{prefix}{side}"
+            d = read_side_mcap(ep_dir / f"{stream}.mcap", stream)
+            ji = nearest_indices(d["joint_ts"], ts_global_ns)
+            gi = nearest_indices(d["grip_ts"], ts_global_ns)
+            jp = d["joint_pos"][ji]
+            vectors[:, joint_slice] = np.flip(jp, axis=1) if flip_joints else jp
+            vectors[:, grip_col] = d["grip_pos"][gi][:, 0]
+    return state, actions
 
 
 def transcode_camera(
     raw_video: Path, raw_ts: Path, ts_global: np.ndarray, out_path: Path, size: int, fps: int,
     crop: tuple[int, int, int, int] | None = None, resize_mode: str = "pad",
 ) -> int:
-    """Decode raw video, pick nearest frame per global timestamp, resize-with-pad, encode h264.
+    """Decode raw video, pick nearest frame per global timestamp, resize, encode h264.
 
     crop: optional (x0, y0, w, h) applied before the resize (ZED top FOV harmonization).
     """
@@ -306,7 +324,7 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
             return None
 
         # 2. state/actions aligned to the global clock; drop last frame (yam converter convention)
-        state = build_state(raw_dir, cfg.flip_joints)
+        state, actions = build_state_and_actions(raw_dir, cfg.flip_joints)
         n_use = len(state) - 1
         if n_use < cfg.fps:  # <1s of frames: junk
             print(f"  ep {ep_idx} ({ep_name}): only {n_use} frames; skipping")
@@ -320,6 +338,7 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
                 trimmed_s = (n_use - trim) / cfg.fps
                 n_use = trim
                 state = state[:n_use]
+        actions = actions[:n_use]
         ts_global_ns = to_ns(np.load(raw_dir / "timestamp.npy"))[:n_use]
 
         meta = json.loads((raw_dir / "metadata.json").read_text())
@@ -335,7 +354,8 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
             video_dir.mkdir(parents=True, exist_ok=True)
             written = transcode_camera(
                 raw_dir / raw_video, raw_dir / raw_ts, ts_global_ns,
-                video_dir / f"episode_{ep_idx:06d}.mp4", cfg.resize_size, cfg.fps, resize_mode=cfg.resize_mode,
+                video_dir / f"episode_{ep_idx:06d}.mp4", cfg.resize_size, cfg.fps,
+                resize_mode=cfg.camera_resize_modes[cam_key],
                 crop=top_crop if cam_key == "top_camera-images-rgb" else None,
             )
             if written != n_use:
@@ -345,7 +365,7 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
         df = pd.DataFrame(
             {
                 "state": [row for row in state],
-                "actions": [row for row in state.copy()],
+                "actions": [row for row in actions],
                 "timestamp": (np.arange(n_use) / cfg.fps).astype(np.float32),
                 "frame_index": np.arange(n_use, dtype=np.int64),
                 "episode_index": np.full(n_use, ep_idx, dtype=np.int64),
@@ -360,7 +380,7 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
         # 5. per-episode stats (legacy v2.1 serialization; image stats use the [0,1] defaults
         # like convert_yam_data.py — openpi norm stats are computed separately)
         stats = {}
-        for feat, arr in [("state", state), ("actions", state)]:
+        for feat, arr in [("state", state), ("actions", actions)]:
             stats[feat] = {
                 "min": arr.min(axis=0).tolist(),
                 "max": arr.max(axis=0).tolist(),
@@ -536,7 +556,9 @@ def main(cfg: Config):
         "codebase_version": "v2.1",
         "robot_type": "yams",
         "resize_mode": cfg.resize_mode,
+        "camera_resize_modes": cfg.camera_resize_modes,
         "joint_order": "flipped" if cfg.flip_joints else "driver",
+        "action_source": "action_mcap",
         "total_episodes": n_eps,
         "total_frames": total_frames,
         "total_tasks": len(tasks),

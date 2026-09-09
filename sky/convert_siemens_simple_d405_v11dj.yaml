@@ -26,7 +26,7 @@ envs:
   CONFIG_NAME: pi05_siemens_simple_d405_v11dj_bs128
   S3_DATASET_PATH: s3://xdof-internal-research/siemens/datasets/siemens_simple_d405_v11dj
   EPISODE_CSV: job_episodes_simple_d405_v11dj.csv
-  MIN_EPISODES: "9000"
+  MIN_EPISODES: "7000"
 
 setup: |
   echo "[SETUP] Setting up openpi for dataset conversion"

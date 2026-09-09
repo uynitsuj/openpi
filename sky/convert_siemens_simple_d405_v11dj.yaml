@@ -15,8 +15,8 @@ workdir: /home/karim/openpi
 
 resources:
   infra: aws/us-west-2
-  cpus: 96+
-  memory: 128+
+  cpus: 128+
+  memory: 384+
   disk_size: 600
 
 num_nodes: 1
@@ -64,7 +64,7 @@ run: |
     --no-flip-joints \
     --resize-mode top_center_crop \
     --task-override "Pack one transparent bag into the cardboard box and flatten the bag." \
-    --max-workers 48
+    --max-workers 112
 
   echo "[2/5] Migrating v2.1 -> v3.0 (single data file: avoids the 0.4.5 rollover bug)"
   python -m lerobot.datasets.v30.convert_dataset_v21_to_v30 \

@@ -5,7 +5,7 @@ Unlike convert_yam_data.py (which expects pre-extracted *-joint_pos.npy files), 
 modern xdof station format directly:
 
     episode_<ts>_<id>.npy.mp4/
-        left.mcap / right.mcap            # /​{side}-robot-state (6D pos @ ~290Hz), /{side}-gripper-state (1D)
+        left.mcap / right.mcap            # /{side}-robot-state (6D pos @ ~290Hz), /{side}-gripper-state (1D)
         action-left.mcap / action-right.mcap  # /action-{side}-robot-state and -gripper-state
         timestamp.npy                     # 30Hz global clock (seconds)
         {left,right}_camera-images-rgb.mp4
@@ -35,21 +35,24 @@ Usage:
         --output-dir ~/.cache/huggingface/lerobot --repo-name industrial_packing_yam
 """
 
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import as_completed
 import dataclasses
 import json
+from pathlib import Path
 import shutil
 import subprocess
 import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from pathlib import Path
 from typing import Literal
 
 import av
 import numpy as np
 import pandas as pd
-import tyro
 from PIL import Image
-from tail_trim import PARK_POSE_SIMPLE_D405, detect_trim, flip_arm_order
+from tail_trim import PARK_POSE_SIMPLE_D405
+from tail_trim import detect_trim
+from tail_trim import flip_arm_order
+import tyro
 
 S3_RAW_BUCKET = "s3://xdof-de-prod"
 CAMERA_KEYS = ["left_camera-images-rgb", "right_camera-images-rgb", "top_camera-images-rgb"]
@@ -231,7 +234,7 @@ def read_side_mcap(path: Path, side: str) -> dict[str, np.ndarray]:
     return out
 
 
-def build_state_and_actions(ep_dir: Path, flip_joints: bool = True) -> tuple[np.ndarray, np.ndarray]:
+def build_state_and_actions(ep_dir: Path, *, flip_joints: bool = True) -> tuple[np.ndarray, np.ndarray]:
     """Align follower states and recorded actions independently to timestamp.npy.
 
     Both arrays are (N,14) float32. flip_joints=True reverses each arm's 6 joints;
@@ -324,7 +327,7 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
             return None
 
         # 2. state/actions aligned to the global clock; drop last frame (yam converter convention)
-        state, actions = build_state_and_actions(raw_dir, cfg.flip_joints)
+        state, actions = build_state_and_actions(raw_dir, flip_joints=cfg.flip_joints)
         n_use = len(state) - 1
         if n_use < cfg.fps:  # <1s of frames: junk
             print(f"  ep {ep_idx} ({ep_name}): only {n_use} frames; skipping")
@@ -364,8 +367,8 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
         # 4. parquet (index column is fixed to global offsets in the finalize step)
         df = pd.DataFrame(
             {
-                "state": [row for row in state],
-                "actions": [row for row in actions],
+                "state": list(state),
+                "actions": list(actions),
                 "timestamp": (np.arange(n_use) / cfg.fps).astype(np.float32),
                 "frame_index": np.arange(n_use, dtype=np.int64),
                 "episode_index": np.full(n_use, ep_idx, dtype=np.int64),

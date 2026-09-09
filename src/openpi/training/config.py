@@ -2548,6 +2548,61 @@ _CONFIGS = [
         val_interval=1_000,
         project_name="siemens-industrial-packing",
     ),
+    # v11dj generation (2026-09-09): NEW LINEAGE vs v6-v10. Two changes baked at
+    # conversion time (convert_xdof_mcap_job.py @ 0556d2c):
+    #   1) actions = recorded LEADER stream (action-*.mcap), not the follower state copy.
+    #   2) top camera CENTER-CROPPED to its largest square (--resize-mode top_center_crop);
+    #      wrists stay letterbox-padded. All 224x224.
+    # Still driver joint order (--no-flip-joints -> straight-through serving, no flip)
+    # + baked packing prompt, from pi05_base. SERVING must center-crop the top view to
+    # match, and this lineage's norm stats differ (leader-action distribution) — never
+    # mix with v6-v10 (follower/pad) or flip-lineage v1-v4 checkpoints/data.
+    # Fresh query, data through 2026-09-09 08:16Z:
+    #   full  : 10605 CSV eps (v10 was 9305, +1300)
+    #   recent: 7721 CSV eps, created>=2026-09-02 02:50Z (v10 was 6421, +1300)
+    # 20k steps.
+    TrainConfig(
+        name="pi05_siemens_simple_d405_v11dj_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="siemens_simple_d405_v11dj",
+            default_prompt="Pack one transparent bag into the cardboard box and flatten the bag.",
+            base_config=DataConfig(prompt_from_task=True),
+            val_frac=10 / 10605,  # CSV eps; refine to converted count post-conversion
+            val_seed=0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        val_interval=1_000,
+        project_name="siemens-industrial-packing",
+    ),
+    TrainConfig(
+        name="pi05_siemens_simple_d405_v11dj_recent_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="siemens_simple_d405_v11dj_recent",
+            default_prompt="Pack one transparent bag into the cardboard box and flatten the bag.",
+            base_config=DataConfig(prompt_from_task=True),
+            val_frac=10 / 7721,  # CSV eps; refine to converted count post-conversion
+            val_seed=0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        val_interval=1_000,
+        project_name="siemens-industrial-packing",
+    ),
     #
     # RABC / AWR weighted YAM tshirt folding configs.
     #

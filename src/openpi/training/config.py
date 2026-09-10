@@ -2619,7 +2619,7 @@ _CONFIGS = [
             repo_id="siemens_simple_d405_v12dj_recent",
             default_prompt="Pack one transparent bag into the cardboard box and flatten the bag.",
             base_config=DataConfig(prompt_from_task=True),
-            val_frac=10 / 6651,  # same CSV as v11_recent (7721); refine to converted count post-conversion
+            val_frac=10 / 7287,  # same CSV as v11_recent (7721) but 7287 converted (vs v11's 6651: de-prod caught up on ~636 lagged eps) -> v12 has ~10% more data, a mild A/B confound alongside the wrist-crop change
             val_seed=0,
         ),
         batch_size=128,

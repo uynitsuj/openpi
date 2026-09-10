@@ -2603,6 +2603,36 @@ _CONFIGS = [
         val_interval=1_000,
         project_name="siemens-industrial-packing",
     ),
+    # v12dj_recent (2026-09-10): EXPERIMENT vs v11dj_recent — center-crop the WRIST
+    # cameras too (--resize-mode center_crop -> all three views center-cropped),
+    # where v11 center-cropped only the top and letterbox-padded the wrists. Goal:
+    # give the wrist views full pixel budget (no letterbox bars) so the gripper can
+    # resolve the transparent bag when grasping. Trade-off: ~25% narrower wrist FOV.
+    # Clean A/B — SAME episodes as v11dj_recent (reuses its CSV), same leader-action
+    # lineage, driver joint order, baked packing prompt, from pi05_base. Top view is
+    # IDENTICAL to v11 (center-crop unchanged); only the wrists differ. 20k steps.
+    # SERVING must center-crop the wrists too (in addition to the top) to match.
+    TrainConfig(
+        name="pi05_siemens_simple_d405_v12dj_recent_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="siemens_simple_d405_v12dj_recent",
+            default_prompt="Pack one transparent bag into the cardboard box and flatten the bag.",
+            base_config=DataConfig(prompt_from_task=True),
+            val_frac=10 / 6651,  # same CSV as v11_recent (7721); refine to converted count post-conversion
+            val_seed=0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        val_interval=1_000,
+        project_name="siemens-industrial-packing",
+    ),
     #
     # RABC / AWR weighted YAM tshirt folding configs.
     #

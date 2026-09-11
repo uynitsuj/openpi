@@ -2872,7 +2872,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "/nfs_exp/karim/siemens_tmp_ckpts/pi05_siemens_simple_d405_v13dj_recent_bs128/siemens_simple_d405_v13dj_recent_20k_20260911/19999/params"
         ),
-        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        # Fine-tune LR: default peak 2.5e-5 dragged the converged model off its optimum
+        # (val climbed 0.0061 -> 0.0076 by 5k, first attempt 2026-09-11). 5x gentler.
+        lr_schedule=_optimizer.CosineDecaySchedule(peak_lr=5e-6, decay_steps=20_000, decay_lr=5e-7),
         num_train_steps=20_000,
         save_interval=5_000,
         keep_period=5_000,

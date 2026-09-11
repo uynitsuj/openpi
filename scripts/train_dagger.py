@@ -41,9 +41,14 @@ def preflight(config) -> dict:
     """Decode samples from every source/split before allocating model weights."""
     components = config.data.create_components(config.assets_dirs, config.model)
     report = {"components": [], "initial_weights": dataclasses.asdict(config.weight_loader)}
+    # val_interval == 0 means a zero-holdout run: no val split exists to decode
+    # or count, and the training loop never builds a validation loader.
+    splits = ("train", "val") if config.val_interval > 0 else ("train",)
+    if config.val_interval == 0:
+        logging.info("preflight: validation disabled (no held-out data) — checking train splits only")
     train_sizes = []
     for source, (data_config, weight) in enumerate(components):
-        for split in ("train", "val"):
+        for split in splits:
             current = data_config
             if split == "val":
                 current = (
@@ -81,8 +86,9 @@ def preflight(config) -> dict:
     # Exercise the actual mixture path, including its shared-normalization gate.
     loader = data_loader.create_data_loader(config, num_batches=1)
     next(iter(loader))
-    validation = data_loader.create_mixture_torch_data_loader(config, validation=True, num_batches=1)
-    next(iter(validation))
+    if config.val_interval > 0:
+        validation = data_loader.create_mixture_torch_data_loader(config, validation=True, num_batches=1)
+        next(iter(validation))
     return report
 
 

@@ -86,6 +86,16 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
         if np.any(stats[key].std < 0) or np.any(stats[key].q99 < stats[key].q01):
             raise ValueError(f"Invalid normalization ordering: {key}")
     dataset_manifest = read_json(Path(plan.dagger_root) / "manifest.json")
+    # Zero-holdout exports (2026-09-11 decision: the corrections corpus is too
+    # small to spare) have no val episodes; disable the offline validation loop
+    # entirely — evaluation is physical rollouts. Any val presence keeps the
+    # base config's cadence.
+    has_new_val = any(row["split"] == "val" for row in dataset_manifest["episodes"])
+    if not has_new_val:
+        logging.warning(
+            "DAgger export has no validation split — offline val loop disabled (val_interval=0); "
+            "rely on physical evaluation"
+        )
     if dataset_manifest.get("image_resize") != "pil_bilinear_224":
         raise ValueError("DAgger export must match v12 PIL BILINEAR resize; reconvert it")
     if dataset_manifest["image_modes"] != dict.fromkeys(CAMERAS, "center_crop"):
@@ -160,6 +170,7 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
         "controller_profiles": controller_profiles,
         "action_source": "old_leader_targets_new_verified_follower_commands",
         "chunk_selection": "reviewed_valid_full_horizon_single_authority_segment",
+        "new_data_holdout": has_new_val,
         "optimizer_policy": "initialize from checkpoint weights with a fresh optimizer; --resume is same-run only",
     }
     shared_assets = config_lib.AssetsConfig(assets_dir=str(assets), asset_id=plan.asset_id)
@@ -211,6 +222,7 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
         seed=plan.seed,
         checkpoint_base_dir=plan.checkpoint_base_dir,
         wandb_enabled=plan.wandb_enabled,
+        val_interval=(base.val_interval if has_new_val else 0),
         weight_loader=weight_loaders.CheckpointWeightLoader(str(initial / "params")),
         lr_schedule=dataclasses.replace(
             base.lr_schedule,

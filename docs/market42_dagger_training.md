@@ -447,13 +447,25 @@ alternative of retaining failures' correction segments, worth revisiting as an
 experiment arm since those corrections were ~19% of teleop chunks). The policy
 is **episode-level batch review, not interval-level human scrubbing**: teleop
 approved for successes, policy segments likewise successes-only. Groups are
-per-collection hour blocks; val groups are deterministic and identical across
-both image-mode variants. Eligible 30-action chunks: train 47,834 teleop +
-1,722 policy; val 20,390 teleop + 868 policy (identical across variants;
-data.npz bit-identical cc vs tc). Policy chunks are thin relative to approved
-policy time because bursty policy command publishing trips the 50 ms freshness
-gate and each of the 288 handoffs excludes 1.6 s — a future round could
-consider a segment-aware freshness bound, evidence first.
+per-collection hour blocks. Round 1 holds out **no** DAgger data
+(`--val-fraction 0`, 2026-09-11 decision: the corrections corpus is too small
+to spare; evaluation is physical rollouts) — `dagger_config` detects the
+missing val split and disables the offline validation loop (`val_interval=0`).
+Eligible 30-action chunks (all train): 68,224 teleop + 2,590 policy, identical
+across variants with bit-identical data.npz. The teleop/policy count imbalance
+does not affect the training mix — sampling shares come from the plan weights,
+not catalog sizes; the smaller policy catalog simply repeats more often within
+its share. Policy chunks are thin relative to approved policy time because
+bursty policy command publishing trips the 50 ms freshness gate and each of
+the 288 handoffs excludes 1.6 s — a future round could consider a
+segment-aware freshness bound, evidence first.
+
+Metadata-only edits (split relabels, dropping whole episodes) should be applied
+to an existing export in place — rewrite review.json/manifest.json and the
+affected per-episode provenance.json + checksums coherently — rather than
+re-running conversion; the video/data artifacts do not depend on them. Edits
+that change approval or validity masks rewrite data.npz (its `reviewed` array)
+but still never require re-decoding video.
 
 - `/nfs_exp/karim/market42_dagger/review_round1_cc.json` → `round1_cc/`
   (all three cameras center-cropped; v12 lineage)

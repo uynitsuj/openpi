@@ -31,6 +31,7 @@ envs:
   ASSUMED_RAMP_S: "1.5"
   REVIEWER: karim
   WORKERS: "24"
+  VAL_FRACTION: "0"  # zero holdout (2026-09-11 decision); >0 re-enables hour-block val groups
 
 setup: |
   echo "[SETUP] Setting up openpi for Market42 DAgger conversion"
@@ -63,6 +64,7 @@ run: |
       --collection 20260911="$HOME/dagger_raw/20260911/20260911" \
       --collection 20260911_ug="$HOME/dagger_raw/20260911/20260911_updated_gain" \
       --modes "$modes" --assumed-ramp-s "$ASSUMED_RAMP_S" --reviewer "$REVIEWER" \
+      --val-fraction "$VAL_FRACTION" \
       --out "$HOME/review_$v.json"
   done
 

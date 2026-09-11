@@ -118,7 +118,10 @@ def main() -> None:
     parser.add_argument("--collection", action="append", required=True, metavar="LABEL=DIR")
     parser.add_argument("--modes", required=True, help="top,left,right modes, e.g. center_crop,pad,pad")
     parser.add_argument("--prompt", default="Pack one transparent bag into the cardboard box and flatten the bag.")
-    parser.add_argument("--val-fraction", type=float, default=0.15)
+    # Default 0: no held-out DAgger data (2026-09-11 decision — the corrections
+    # corpus is too small to spare; evaluation is physical rollouts). A positive
+    # fraction re-enables deterministic hour-block val groups per collection.
+    parser.add_argument("--val-fraction", type=float, default=0.0)
     parser.add_argument("--assumed-ramp-s", type=float, default=1.5)
     parser.add_argument("--reviewer", required=True)
     parser.add_argument(
@@ -142,10 +145,14 @@ def main() -> None:
                 hour = episode.name.split("_")[1] + "_" + episode.name.split("_")[2][:2]
                 entry["group"] = f"{label}_{hour}"
                 collection_entries.append(entry)
-        # Deterministic, evenly spaced val groups within each collection.
+        # Deterministic, evenly spaced val groups within each collection (none
+        # when val_fraction is 0 — every episode trains).
         groups = sorted({entry["group"] for entry in collection_entries})
-        n_val = max(1, round(len(groups) * args.val_fraction))
-        val_groups = {groups[i] for i in np.linspace(0, len(groups) - 1, n_val * 2 + 1).astype(int)[1::2]}
+        if args.val_fraction > 0:
+            n_val = max(1, round(len(groups) * args.val_fraction))
+            val_groups = {groups[i] for i in np.linspace(0, len(groups) - 1, n_val * 2 + 1).astype(int)[1::2]}
+        else:
+            val_groups = set()
         for entry in collection_entries:
             entry["split"] = "val" if entry["group"] in val_groups else "train"
         entries.extend(collection_entries)
@@ -158,6 +165,8 @@ def main() -> None:
         del entry["_success"]
     for split, per_authority in approved_s.items():
         print(f"{split}: " + "  ".join(f"{k}={v/60:.1f}min" for k, v in per_authority.items()))
+        if split == "val" and args.val_fraction == 0:
+            continue
         if min(per_authority.values()) <= 0:
             raise SystemExit(f"{split} split has an authority with zero approved time — adjust val groups")
 

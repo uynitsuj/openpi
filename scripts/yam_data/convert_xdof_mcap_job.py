@@ -145,6 +145,14 @@ class Config:
     task_override: str | None = None
     keep_raw: bool = False
     max_episodes: int | None = None  # for smoke tests
+    # Force-include these task ids even if below min_duration_s (manual QA rescue of
+    # valid-but-short demos). Path to a CSV with an `id` column.
+    keep_ids_csv: str | None = None
+    # After conversion + trim, keep only the shortest this-fraction of episodes by
+    # TRIMMED length (e.g. 0.25 = shortest quartile). Selection is crop-independent
+    # (trim uses joint state, not images), so two runs differing only in resize_mode
+    # select the identical episode set.
+    shortest_frac: float | None = None
 
     @property
     def camera_resize_modes(self) -> dict[str, str]:
@@ -421,12 +429,23 @@ def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> 
 def main(cfg: Config):
     df = pd.read_csv(cfg.episode_csv)
     n_total = len(df)
-    df = df[df["duration_s"].astype(float) >= cfg.min_duration_s].copy()
+    keep_ids: set[str] = set()
+    if cfg.keep_ids_csv:
+        keep_ids = set(pd.read_csv(cfg.keep_ids_csv)["id"].astype(str))
+    dur = df["duration_s"].astype(float)
+    mask = dur >= cfg.min_duration_s
+    if keep_ids:
+        mask = mask | df["id"].astype(str).isin(keep_ids)
+    n_rescued = int((mask & (dur < cfg.min_duration_s)).sum())
+    df = df[mask].copy()
     # oldest-first for deterministic episode numbering
     df = df.sort_values("created_at").reset_index(drop=True)
     if cfg.max_episodes:
         df = df.head(cfg.max_episodes)
-    print(f"{n_total} episodes in job; {len(df)} pass the >={cfg.min_duration_s}s filter")
+    print(
+        f"{n_total} episodes in job; {len(df)} pass the >={cfg.min_duration_s}s filter"
+        + (f" (+{n_rescued} short kept via keep-list)" if n_rescued else "")
+    )
 
     base_dir = cfg.output_dir / cfg.repo_name
     if base_dir.exists():
@@ -456,6 +475,27 @@ def main(cfg: Config):
             else "tail trim: enabled but no episode qualified"
         )
     print(f"converted {len(ok_indices)}/{len(df)} episodes; renumbering...")
+
+    if cfg.shortest_frac is not None and 0.0 < cfg.shortest_frac < 1.0:
+        # Keep only the shortest fraction by TRIMMED length. Delete the dropped
+        # episodes' already-written files so the renumber loop leaves no orphans
+        # (kept episodes always renumber to new_idx <= old_idx, so writing over the
+        # compacted range never clobbers an unread kept file).
+        ranked = sorted(ok_indices, key=lambda i: results[i]["length"])
+        k = max(1, round(len(ranked) * cfg.shortest_frac))
+        keep = set(ranked[:k])
+        dropped = [i for i in ok_indices if i not in keep]
+        for old_idx in dropped:
+            oc = old_idx // cfg.chunk_size
+            (base_dir / "data" / f"chunk-{oc:03d}" / f"episode_{old_idx:06d}.parquet").unlink(missing_ok=True)
+            for cam_key in CAMERA_KEYS:
+                (base_dir / "videos" / f"chunk-{oc:03d}" / cam_key / f"episode_{old_idx:06d}.mp4").unlink(missing_ok=True)
+        cutoff = results[ranked[k - 1]]["length"]
+        ok_indices = sorted(keep)
+        print(
+            f"shortest_frac={cfg.shortest_frac}: kept {len(ok_indices)} shortest of {len(ranked)} "
+            f"by trimmed length (cutoff {cutoff} frames = {cutoff / cfg.fps:.1f}s); dropped {len(dropped)}"
+        )
 
     # Renumber to a contiguous 0..K-1 (failures leave holes) and fix global `index` offsets.
     tasks: dict[str, int] = {}

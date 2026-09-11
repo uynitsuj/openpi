@@ -463,7 +463,10 @@ source. This implementation does not launch a robot trial or upload datasets.
 Selectively reused the weighted sampler, loader refactor, normalization-stat
 mixture support, and tests from `origin/karim/mixture-datasets` at
 `ced6d2c3375cba76c8e055ea85a3b3cb1a747873` (plus its factory definition from the
-preceding commit). Unrelated v13 configurations/manifests were not imported.
+preceding commit). The subsequent merge of the published
+`karim/industrial-packing-v3` tip at `69a014dc4420dae54cec269a3ab73a026b0ae19f`
+also preserves its v13 configurations/manifests. Those do not change the
+explicit v12 lineage supported by this initial DAgger continuation plan.
 Added DAgger-specific validation rather than treating a generic weighted mixture
 as an authority-aware dataset. Source probabilities hold in expectation,
 independently of dataset sizes, not exactly within every batch.

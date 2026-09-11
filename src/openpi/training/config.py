@@ -2712,6 +2712,41 @@ _CONFIGS = [
         val_interval=1_000,
         project_name="siemens-industrial-packing",
     ),
+    # v13dj_recent (2026-09-11): CONTINUATION of v12dj_recent onto the latest data.
+    # SAME lineage as v12 — center-crop ALL cameras incl wrists (--resize-mode
+    # center_crop), leader-action lineage, driver joint order, baked packing prompt,
+    # >20s / completed / audit-not-bad filters, --trim-tails. Difference vs v12:
+    #   - LATEST data: recent CSV = 7915 eps (v12 was 7721); +194 genuinely new
+    #     episodes (created 2026-09-09 08:16Z -> 2026-09-10 08:04Z) AND the full
+    #     leader-action lag backlog cleared (all 758 previously-missing eps now have
+    #     action mcaps) -> v13 converts notably more than v12's 7287.
+    #   - WARM-START from the v12dj_recent 19999 checkpoint (NOT pi05_base): continue
+    #     training off the converged v12 weights on the newer/larger dataset.
+    # SERVING identical to v12: center-crop the wrists too (in addition to the top).
+    TrainConfig(
+        name="pi05_siemens_simple_d405_v13dj_recent_bs128",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=30),
+        data=LeRobotYamRormDataConfig(
+            repo_id="siemens_simple_d405_v13dj_recent",
+            default_prompt="Pack one transparent bag into the cardboard box and flatten the bag.",
+            base_config=DataConfig(prompt_from_task=True),
+            val_frac=10 / 7899,  # 7915 CSV eps -> 7899 converted (99.8%; lag fully cleared). v12 was 7287 -> +612 eps (194 new + ~418 recovered lag)
+            val_seed=0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        # Warm-start (continuation) from the v12dj_recent final checkpoint on NFS.
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/nfs_exp/karim/siemens_tmp_ckpts/pi05_siemens_simple_d405_v12dj_recent_bs128/siemens_simple_d405_v12dj_recent_20k_20260910/19999/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=20_000),
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        val_interval=1_000,
+        project_name="siemens-industrial-packing",
+    ),
     #
     # RABC / AWR weighted YAM tshirt folding configs.
     #

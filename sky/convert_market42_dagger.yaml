@@ -1,0 +1,78 @@
+# Market42 DAgger conversion in the cloud (2026-09-11): stages raw episodes from
+# S3 (uploaded from NFS — the dataengine uploads were stuck "pending", so
+# s3://xdof-internal-research/siemens/datasets/dagger_raw/ is the canonical raw
+# mirror), regenerates the review manifests deterministically with
+# build_market42_review.py (same episode-level batch policy, groups, and val
+# split as the local round-1 run), converts BOTH image-mode variants in
+# parallel (--workers), and uploads the exports.
+#
+# NOTE: round 1 (2026-09-11) was converted locally and uploaded to the same
+# OUT_CC/OUT_TC keys — only launch this against those keys to REPLACE a failed
+# local export, or override OUT_CC/OUT_TC (e.g. round2 names) for new data.
+#
+# Launch: uv run sky jobs launch sky/convert_market42_dagger.yaml -n market42-dagger-convert -d --yes
+
+name: market42-dagger-convert
+
+workdir: /home/karim/openpi
+
+resources:
+  infra: aws/us-west-2
+  cpus: 64+
+  memory: 128+
+  disk_size: 100
+
+num_nodes: 1
+
+envs:
+  RAW_S3: s3://xdof-internal-research/siemens/datasets/dagger_raw
+  OUT_CC: s3://xdof-internal-research/siemens/datasets/market42_dagger_round1_cc
+  OUT_TC: s3://xdof-internal-research/siemens/datasets/market42_dagger_round1_tc
+  ASSUMED_RAMP_S: "1.5"
+  REVIEWER: karim
+  WORKERS: "24"
+
+setup: |
+  echo "[SETUP] Setting up openpi for Market42 DAgger conversion"
+  conda deactivate 2>/dev/null; conda deactivate 2>/dev/null; true
+  if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
+  export DEBIAN_FRONTEND=noninteractive
+  $SUDO apt-get update && $SUDO apt-get install -y git curl pkg-config awscli ffmpeg
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  source $HOME/.local/bin/env 2>/dev/null || true
+  uv venv --python 3.11
+  source .venv/bin/activate
+  GIT_LFS_SKIP_SMUDGE=1 uv sync
+  GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+  uv pip install -r scripts/requirements-dagger.txt
+  echo "[SETUP] Complete"
+
+run: |
+  set -eo pipefail
+  conda deactivate 2>/dev/null; conda deactivate 2>/dev/null; true
+  source .venv/bin/activate
+
+  echo "[1/4] Staging raw episodes from $RAW_S3"
+  aws s3 sync "$RAW_S3" "$HOME/dagger_raw" --only-show-errors
+
+  echo "[2/4] Regenerating review manifests (deterministic policy/groups/splits)"
+  for v in cc tc; do
+    if [ "$v" = cc ]; then modes="center_crop,center_crop,center_crop"; else modes="center_crop,pad,pad"; fi
+    python scripts/yam_data/build_market42_review.py \
+      --collection 20260910="$HOME/dagger_raw/20260910" \
+      --collection 20260911="$HOME/dagger_raw/20260911/20260911" \
+      --collection 20260911_ug="$HOME/dagger_raw/20260911/20260911_updated_gain" \
+      --modes "$modes" --assumed-ramp-s "$ASSUMED_RAMP_S" --reviewer "$REVIEWER" \
+      --out "$HOME/review_$v.json"
+  done
+
+  echo "[3/4] Converting both variants ($WORKERS workers each)"
+  python scripts/yam_data/convert_market42_dagger.py \
+    --review-manifest "$HOME/review_cc.json" --output "$HOME/round1_cc" --workers "$WORKERS"
+  python scripts/yam_data/convert_market42_dagger.py \
+    --review-manifest "$HOME/review_tc.json" --output "$HOME/round1_tc" --workers "$WORKERS"
+
+  echo "[4/4] Uploading exports"
+  aws s3 sync "$HOME/round1_cc" "$OUT_CC" --only-show-errors
+  aws s3 sync "$HOME/round1_tc" "$OUT_TC" --only-show-errors
+  echo "[OK] Market42 DAgger exports uploaded: $OUT_CC , $OUT_TC"

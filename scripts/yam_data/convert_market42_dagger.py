@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import dataclasses
 import logging
+import multiprocessing
 from pathlib import Path
 
 import av
@@ -347,7 +348,7 @@ def convert_episode(entry: dict, out: Path, prompt: str, modes: dict, options: O
     }
 
 
-def convert_manifest(review_path: Path, output: Path) -> dict:
+def convert_manifest(review_path: Path, output: Path, workers: int = 1) -> dict:
     review = read_json(review_path)
     prompt = review["prompt"]
     modes = review["image_modes"]
@@ -375,10 +376,21 @@ def convert_manifest(review_path: Path, output: Path) -> dict:
         groups[entry["group"]] = entry["split"]
     output.mkdir(parents=True, exist_ok=False)
     write_json(output / "review.json", review)
-    episodes = []
-    for entry in review["episodes"]:
-        logger.info("Converting %s", entry["path"])
-        episodes.append(convert_episode(entry, output, prompt, modes, options))
+    entries = review["episodes"]
+    if workers <= 1:
+        episodes = []
+        for entry in entries:
+            logger.info("Converting %s", entry["path"])
+            episodes.append(convert_episode(entry, output, prompt, modes, options))
+    else:
+        # Episodes are independent (distinct output dirs), so fan out across
+        # processes. Manifest order stays review order; fail-closed behavior is
+        # preserved — any worker exception aborts before manifest.json exists.
+        logger.info("Converting %d episodes with %d workers", len(entries), workers)
+        with multiprocessing.get_context("spawn").Pool(min(workers, len(entries))) as pool:
+            episodes = pool.starmap(
+                convert_episode, [(entry, output, prompt, modes, options) for entry in entries]
+            )
     manifest = {
         "format": FORMAT,
         "fps": 30,
@@ -410,9 +422,13 @@ def main():
     parser.add_argument(
         "--output", type=Path, required=True, help="New directory; existing output is never overwritten"
     )
+    parser.add_argument(
+        "--workers", type=int, default=8,
+        help="Episode-level process parallelism (each worker uses ~2 cores); 1 = sequential",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    convert_manifest(args.review_manifest.resolve(), args.output.resolve())
+    convert_manifest(args.review_manifest.resolve(), args.output.resolve(), workers=args.workers)
 
 
 if __name__ == "__main__":

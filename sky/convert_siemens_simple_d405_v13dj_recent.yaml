@@ -1,0 +1,102 @@
+# simple-D405 v13dj_recent (2026-09-11): SAME lineage as v12dj_recent (wrist-crop
+# experiment) but on the LATEST data. --resize-mode center_crop -> all three views
+# (top + both wrists) center-cropped, no letterbox bars, so the gripper resolves
+# the transparent bag. Episodes created after 2026-09-01 19:50 PDT (= 02:50Z Sep 2).
+# Driver joint order (--no-flip-joints -> straight-through serving, NO per-arm flip)
+# + explicit prompt via --task-override. Same filters as v11/v12: >20s, completed,
+# audit not bad. Leader-action lineage (actions from action-*.mcap).
+# --trim-tails cuts the operator stop-button tail. See scripts/yam_data/tail_trim.py.
+#
+# vs v12dj_recent: +194 genuinely new episodes (created 2026-09-09 08:16Z ->
+# 2026-09-10 08:04Z) AND the full leader-action lag backlog has cleared (all 758
+# previously-missing episodes now have action mcaps on de-prod), so v13 recent CSV
+# = 7915 eps (v12 was 7721) and should convert notably more than v12's 7287.
+# Model TRAINING warm-starts from the v12dj_recent 19999 checkpoint (not pi05_base).
+#
+# Launch:  uv run sky jobs launch sky/convert_siemens_simple_d405_v13dj_recent.yaml -n siemens-simple-d405-v13dj-recent-convert -d --yes
+
+name: siemens-simple-d405-v13dj-recent-convert
+
+workdir: /home/karim/openpi
+
+resources:
+  infra: aws/us-west-2
+  cpus: 128+
+  memory: 384+
+  disk_size: 400
+
+num_nodes: 1
+
+envs:
+  REPO_NAME: siemens_simple_d405_v13dj_recent
+  CONFIG_NAME: pi05_siemens_simple_d405_v13dj_recent_bs128
+  S3_DATASET_PATH: s3://xdof-internal-research/siemens/datasets/siemens_simple_d405_v13dj_recent
+  EPISODE_CSV: job_episodes_simple_d405_v13dj_recent.csv
+  MIN_EPISODES: "6500"
+
+setup: |
+  echo "[SETUP] Setting up openpi for dataset conversion"
+  conda deactivate 2>/dev/null; conda deactivate 2>/dev/null; true
+  if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
+  export DEBIAN_FRONTEND=noninteractive
+  $SUDO apt-get update && $SUDO apt-get install -y git curl pkg-config software-properties-common awscli
+  if $SUDO add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg7; then
+    $SUDO apt-get update
+  else
+    echo "[SETUP] FFmpeg 7 PPA unavailable; falling back to distro FFmpeg packages"
+  fi
+  $SUDO apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavdevice-dev libavutil-dev libavfilter-dev libswscale-dev libswresample-dev
+  $SUDO ldconfig || true
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  source $HOME/.local/bin/env 2>/dev/null || true
+  uv venv --python 3.11
+  source .venv/bin/activate
+  GIT_LFS_SKIP_SMUDGE=1 uv sync
+  GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+  uv pip install mcap mcap-protobuf-support
+  echo "[SETUP] Complete"
+
+run: |
+  set -eo pipefail
+  conda deactivate 2>/dev/null; conda deactivate 2>/dev/null; true
+  source .venv/bin/activate
+
+  echo "[1/5] Converting raw MCAP episodes -> LeRobot v2.1 (duration filter >20s, tail trim, center-crop ALL cams)"
+  python scripts/yam_data/convert_xdof_mcap_job.py \
+    --episode-csv "$EPISODE_CSV" \
+    --repo-name "$REPO_NAME" \
+    --min-duration-s 20 \
+    --trim-tails \
+    --no-flip-joints \
+    --resize-mode center_crop \
+    --task-override "Pack one transparent bag into the cardboard box and flatten the bag." \
+    --max-workers 112
+
+  echo "[2/5] Migrating v2.1 -> v3.0 (single data file: avoids the 0.4.5 rollover bug)"
+  python -m lerobot.datasets.v30.convert_dataset_v21_to_v30 \
+    --repo-id "$REPO_NAME" \
+    --root "$HOME/.cache/huggingface/lerobot/$REPO_NAME" \
+    --data-file-size-in-mb 100000 \
+    --push-to-hub false
+  rm -rf "$HOME/.cache/huggingface/lerobot/${REPO_NAME}_old"
+
+  echo "[3/5] Sanity-loading the converted dataset"
+  python - <<'PYEOF'
+  import os
+  from lerobot.datasets.lerobot_dataset import LeRobotDataset
+  repo = os.environ["REPO_NAME"]
+  ds = LeRobotDataset(repo)
+  print(f"frames={ds.num_frames} episodes={ds.num_episodes} fps={ds.fps}")
+  assert ds.num_episodes > int(os.environ["MIN_EPISODES"]), (ds.num_episodes, os.environ["MIN_EPISODES"])
+  to_idx = ds.meta.episodes["dataset_to_index"][-1]
+  assert to_idx == ds.num_frames == len(ds.hf_dataset), (to_idx, ds.num_frames, len(ds.hf_dataset))
+  print("episode boundary check OK")
+  PYEOF
+
+  echo "[4/5] Uploading dataset to $S3_DATASET_PATH"
+  aws s3 sync "$HOME/.cache/huggingface/lerobot/$REPO_NAME" "$S3_DATASET_PATH" --only-show-errors
+
+  echo "[5/5] Computing openpi norm stats (50k frames) + upload"
+  python scripts/compute_norm_stats.py --config-name "$CONFIG_NAME" --max-frames 50000
+  aws s3 cp "assets/$CONFIG_NAME/$REPO_NAME/norm_stats.json" "$S3_DATASET_PATH/norm_stats/$CONFIG_NAME/norm_stats.json"
+  echo "[OK] Dataset build complete: $S3_DATASET_PATH"

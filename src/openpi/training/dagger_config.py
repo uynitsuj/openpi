@@ -40,6 +40,11 @@ class TrainingPlan:
     # Sirius-style: exclude the last N action chunks of policy segments that
     # end in a takeover (only meaningful when the rollout weight is > 0).
     pre_intervention_exclude_chunks: int = 0
+    # Old-dataset video decoder. "pyav" is portable (no CUDA-linked TorchCodec
+    # needed — right for offline preflight boxes) but decodes the AV1 videos in
+    # slow software; production training should use "torchcodec" (the prod
+    # siemens default), which is ~5-10x faster per sample and keeps the GPUs fed.
+    old_video_backend: str = "pyav"
     num_train_steps: int = 20_000
     batch_size: int = 128
     num_workers: int = 8
@@ -273,7 +278,7 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
             default_prompt=prompt,
             base_config=config_lib.DataConfig(
                 local_dataset_root=str(old_root),
-                video_backend="pyav",
+                video_backend=plan.old_video_backend,
                 prompt_from_task=True,
                 full_action_chunks=True,
                 episodes=old_episodes,

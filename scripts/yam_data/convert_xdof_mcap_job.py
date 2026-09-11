@@ -70,6 +70,10 @@ RAW_FILES = [
 ] + [
     f for pair in RAW_VIDEO_FOR_KEY.values() for f in pair
 ]
+# State-only inputs (no video): exactly what build_state_and_actions + detect_trim
+# read, so --shortest-frac can compute each episode's trimmed length and preselect
+# the shortest fraction WITHOUT decoding/encoding any video.
+MEASURE_FILES = ["timestamp.npy", "left.mcap", "right.mcap", "action-left.mcap", "action-right.mcap"]
 
 # FOV harmonization: the ZED-X top camera (HFOV 105.6 x VFOV 78.9) is far more zoomed-out
 # than the D405 top camera. Crop ZED top frames to the D405 reference FOV (measured on
@@ -148,10 +152,11 @@ class Config:
     # Force-include these task ids even if below min_duration_s (manual QA rescue of
     # valid-but-short demos). Path to a CSV with an `id` column.
     keep_ids_csv: str | None = None
-    # After conversion + trim, keep only the shortest this-fraction of episodes by
-    # TRIMMED length (e.g. 0.25 = shortest quartile). Selection is crop-independent
-    # (trim uses joint state, not images), so two runs differing only in resize_mode
-    # select the identical episode set.
+    # Keep only the shortest this-fraction of episodes by TRIMMED length (e.g. 0.25 =
+    # shortest quartile). A cheap state-only measure pass computes each episode's
+    # trimmed length first (no video decode/encode), then only the selected episodes
+    # are transcoded. Selection is crop-independent (trim uses joint state, not
+    # images), so two runs differing only in resize_mode select the identical set.
     shortest_frac: float | None = None
 
     @property
@@ -317,6 +322,41 @@ def transcode_camera(
     return written
 
 
+def measure_episode(ep_idx: int, nfs_path: str, cfg: Config) -> dict | None:
+    """Cheaply compute an episode's TRIMMED length from state alone — no video
+    decode/encode — for --shortest-frac preselection. Downloads only the small state
+    mcaps + timestamp.npy and mirrors process_episode's length logic exactly (same
+    n_use = len(state)-1, same detect_trim), so the measured length equals what the
+    full pass would produce. Returns {"idx", "length"} or None if unusable."""
+    ep_name = Path(nfs_path).name
+    raw_dir = cfg.raw_cache_dir / f"measure_{ep_name}"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        s3_src = S3_RAW_BUCKET + nfs_path
+        cmd = ["aws", "s3", "sync", s3_src, str(raw_dir), "--size-only", "--only-show-errors", "--exclude", "*"]
+        for f in MEASURE_FILES:
+            cmd += ["--include", f]
+        subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+        if any(not (raw_dir / f).exists() for f in MEASURE_FILES):
+            return None
+        state, _actions = build_state_and_actions(raw_dir, flip_joints=cfg.flip_joints)
+        n_use = len(state) - 1
+        if n_use < cfg.fps:
+            return None
+        state = state[:n_use]
+        if cfg.trim_tails:
+            park = PARK_POSE_SIMPLE_D405 if cfg.flip_joints else flip_arm_order(PARK_POSE_SIMPLE_D405)
+            trim, _flag = detect_trim(state, park, buffer_s=cfg.trim_buffer_s)
+            if trim is not None:
+                n_use = trim
+        return {"idx": ep_idx, "length": n_use}
+    except Exception:
+        return None
+    finally:
+        if not cfg.keep_raw:
+            shutil.rmtree(raw_dir, ignore_errors=True)
+
+
 def process_episode(ep_idx: int, nfs_path: str, cfg: Config, base_dir: Path) -> dict | None:
     ep_name = Path(nfs_path).name
     raw_dir = cfg.raw_cache_dir / ep_name
@@ -447,6 +487,35 @@ def main(cfg: Config):
         + (f" (+{n_rescued} short kept via keep-list)" if n_rescued else "")
     )
 
+    if cfg.shortest_frac is not None and 0.0 < cfg.shortest_frac < 1.0:
+        # Preselect the shortest fraction by TRIMMED length via a cheap state-only pass
+        # (no video), so only the kept episodes get transcoded.
+        print(f"[measure] computing trimmed lengths from state only (no video) for {len(df)} episodes...")
+        lengths: dict[int, int] = {}
+        with ProcessPoolExecutor(max_workers=cfg.max_workers) as pool:
+            futures = {
+                pool.submit(measure_episode, idx, row.nfs_path, cfg): idx
+                for idx, row in enumerate(df.itertuples())
+            }
+            for i, fut in enumerate(as_completed(futures)):
+                r = fut.result()
+                if r is not None:
+                    lengths[r["idx"]] = r["length"]
+                if (i + 1) % 200 == 0:
+                    print(f"  measured {i + 1}/{len(futures)} ({len(lengths)} ok)")
+        if not lengths:
+            raise RuntimeError("shortest_frac: measure pass produced no lengths")
+        ranked = sorted(lengths, key=lambda i: (lengths[i], i))
+        k = max(1, round(len(lengths) * cfg.shortest_frac))
+        keep = sorted(ranked[:k])
+        cutoff = lengths[ranked[k - 1]]
+        df = df.iloc[keep].reset_index(drop=True)
+        print(
+            f"[measure] selected shortest {len(df)} of {len(lengths)} by trimmed length "
+            f"(cutoff {cutoff} frames = {cutoff / cfg.fps:.1f}s); skipped video encode for "
+            f"{len(lengths) - len(df)} episodes"
+        )
+
     base_dir = cfg.output_dir / cfg.repo_name
     if base_dir.exists():
         raise FileExistsError(f"{base_dir} already exists; remove it first")
@@ -475,27 +544,6 @@ def main(cfg: Config):
             else "tail trim: enabled but no episode qualified"
         )
     print(f"converted {len(ok_indices)}/{len(df)} episodes; renumbering...")
-
-    if cfg.shortest_frac is not None and 0.0 < cfg.shortest_frac < 1.0:
-        # Keep only the shortest fraction by TRIMMED length. Delete the dropped
-        # episodes' already-written files so the renumber loop leaves no orphans
-        # (kept episodes always renumber to new_idx <= old_idx, so writing over the
-        # compacted range never clobbers an unread kept file).
-        ranked = sorted(ok_indices, key=lambda i: results[i]["length"])
-        k = max(1, round(len(ranked) * cfg.shortest_frac))
-        keep = set(ranked[:k])
-        dropped = [i for i in ok_indices if i not in keep]
-        for old_idx in dropped:
-            oc = old_idx // cfg.chunk_size
-            (base_dir / "data" / f"chunk-{oc:03d}" / f"episode_{old_idx:06d}.parquet").unlink(missing_ok=True)
-            for cam_key in CAMERA_KEYS:
-                (base_dir / "videos" / f"chunk-{oc:03d}" / cam_key / f"episode_{old_idx:06d}.mp4").unlink(missing_ok=True)
-        cutoff = results[ranked[k - 1]]["length"]
-        ok_indices = sorted(keep)
-        print(
-            f"shortest_frac={cfg.shortest_frac}: kept {len(ok_indices)} shortest of {len(ranked)} "
-            f"by trimmed length (cutoff {cutoff} frames = {cutoff / cfg.fps:.1f}s); dropped {len(dropped)}"
-        )
 
     # Renumber to a contiguous 0..K-1 (failures leave holes) and fix global `index` offsets.
     tasks: dict[str, int] = {}

@@ -19,9 +19,13 @@ from openpi.training.dagger_dataset import read_json
 class TrainingPlan:
     initial_checkpoint: str
     old_dataset_root: str
-    old_split_manifest: str
     dagger_root: str
     exp_name: str
+    # Optional for zero-holdout runs (no DAgger val split): every old episode
+    # trains and the per-episode identity/group bookkeeping is skipped, since
+    # there is no offline validation left for it to protect. Runs with a
+    # holdout must provide it (leakage checks need real identities).
+    old_split_manifest: str | None = None
     old_repo_id: str = "siemens_simple_d405_v12dj_recent"
     base_config: str = "pi05_siemens_simple_d405_v12dj_recent_bs128"
     asset_id: str = "siemens_simple_d405_v12dj_recent"
@@ -39,7 +43,7 @@ class TrainingPlan:
 def load_plan(path: Path) -> TrainingPlan:
     raw = read_json(path)
     for key in ("initial_checkpoint", "old_dataset_root", "old_split_manifest", "dagger_root", "checkpoint_base_dir"):
-        if key in raw:
+        if raw.get(key):
             raw[key] = str((path.parent / raw[key]).resolve())
     if "weights" in raw:
         raw["weights"] = tuple(raw["weights"])
@@ -107,33 +111,53 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
     old_info = read_json(old_root / "meta" / "info.json")
     if old_info["fps"] != 30:
         raise ValueError("Expected 30 Hz old dataset")
-    splits = read_json(Path(plan.old_split_manifest))
-    if splits.get("repo_id") != plan.old_repo_id or splits.get("image_modes") != dataset_manifest["image_modes"]:
-        raise ValueError("Old split manifest must attest the same repo and image preprocessing")
-    if splits.get("action_order") != "driver" or splits.get("action_source") != "leader_joint_targets":
-        raise ValueError("Old split manifest must attest v12 driver-order leader-target lineage")
-    rows = splits["episodes"]
-    indices = [row["episode_index"] for row in rows]
-    if len(indices) != old_info["total_episodes"] or set(indices) != set(range(old_info["total_episodes"])):
-        raise ValueError("Old split manifest must cover every dataset episode exactly once")
-    identities, groups = set(), {}
-    partitions = {"train": [], "val": []}
-    for row in rows:
-        if row["split"] not in partitions or not row["id"] or not row["group"] or row["id"] in identities:
-            raise ValueError("Invalid old episode identity/group/split")
-        identities.add(row["id"])
-        group = row["group"]
-        if group in groups and groups[group] != row["split"]:
-            raise ValueError(f"Old dataset group leaks across splits: {group}")
-        groups[group] = row["split"]
-        partitions[row["split"]].append(row["episode_index"])
-    for row in dataset_manifest["episodes"]:
-        if row["id"] in identities:
-            raise ValueError(f"Episode appears in both original and DAgger data: {row['id']}")
-        if row["group"] in groups and groups[row["group"]] != row["split"]:
-            raise ValueError(f"Collection group leaks between old/new splits: {row['group']}")
-    if not all(partitions.values()):
-        raise ValueError("Old train and validation partitions must both be nonempty")
+    if plan.old_split_manifest is None:
+        # Zero-holdout runs only: with no offline validation anywhere, there is
+        # no split for identity/group bookkeeping to protect. Every old episode
+        # trains; lineage rests on the pinned, audited v12 base config.
+        if has_new_val:
+            raise ValueError(
+                "This plan has held-out DAgger data; runs with a validation split require "
+                "old_split_manifest so leakage checks use real episode identities"
+            )
+        old_episodes = old_val_episodes = None
+        old_split_sha = None
+        old_data_policy = (
+            "zero-holdout: all old episodes train; no per-episode split manifest — "
+            "lineage attested by the pinned audited v12 base config"
+        )
+    else:
+        splits = read_json(Path(plan.old_split_manifest))
+        if splits.get("repo_id") != plan.old_repo_id or splits.get("image_modes") != dataset_manifest["image_modes"]:
+            raise ValueError("Old split manifest must attest the same repo and image preprocessing")
+        if splits.get("action_order") != "driver" or splits.get("action_source") != "leader_joint_targets":
+            raise ValueError("Old split manifest must attest v12 driver-order leader-target lineage")
+        rows = splits["episodes"]
+        indices = [row["episode_index"] for row in rows]
+        if len(indices) != old_info["total_episodes"] or set(indices) != set(range(old_info["total_episodes"])):
+            raise ValueError("Old split manifest must cover every dataset episode exactly once")
+        identities, groups = set(), {}
+        partitions = {"train": [], "val": []}
+        for row in rows:
+            if row["split"] not in partitions or not row["id"] or not row["group"] or row["id"] in identities:
+                raise ValueError("Invalid old episode identity/group/split")
+            identities.add(row["id"])
+            group = row["group"]
+            if group in groups and groups[group] != row["split"]:
+                raise ValueError(f"Old dataset group leaks across splits: {group}")
+            groups[group] = row["split"]
+            partitions[row["split"]].append(row["episode_index"])
+        for row in dataset_manifest["episodes"]:
+            if row["id"] in identities:
+                raise ValueError(f"Episode appears in both original and DAgger data: {row['id']}")
+            if row["group"] in groups and groups[row["group"]] != row["split"]:
+                raise ValueError(f"Collection group leaks between old/new splits: {row['group']}")
+        if not all(partitions.values()):
+            raise ValueError("Old train and validation partitions must both be nonempty")
+        old_episodes = tuple(sorted(partitions["train"]))
+        old_val_episodes = tuple(sorted(partitions["val"]))
+        old_split_sha = file_hash(Path(plan.old_split_manifest))
+        old_data_policy = "per-episode split manifest (train/val partitions with group-leakage checks)"
     # Controller-gain provenance: recorded per-episode by the converter (None →
     # "unrecorded" predates the gravity_comp_profile field). Serving must match
     # the collection tuning — the FAR bair_daggered_checkpoints kp_scale
@@ -162,7 +186,8 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
         "mixture_order": ["old", "new_teleop", "new_policy"],
         "source_mixture_commit": "ced6d2c3375cba76c8e055ea85a3b3cb1a747873",
         "dagger_manifest_sha256": file_hash(Path(plan.dagger_root) / "manifest.json"),
-        "old_split_manifest_sha256": file_hash(Path(plan.old_split_manifest)),
+        "old_split_manifest_sha256": old_split_sha,
+        "old_data_policy": old_data_policy,
         "old_info_sha256": file_hash(old_root / "meta" / "info.json"),
         "norm_stats_sha256": file_hash(stats_file),
         "image_modes": dataset_manifest["image_modes"],
@@ -184,8 +209,8 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
                 video_backend="pyav",
                 prompt_from_task=True,
                 full_action_chunks=True,
-                episodes=tuple(sorted(partitions["train"])),
-                val_episodes=tuple(sorted(partitions["val"])),
+                episodes=old_episodes,
+                val_episodes=old_val_episodes,
                 training_provenance=provenance,
             ),
         )

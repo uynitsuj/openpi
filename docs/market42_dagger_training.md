@@ -503,9 +503,19 @@ normalization for this continuation recipe.
 Weights are ordered old / new teleop / new policy. `[0.8, 0.1, 0.1]` is the
 ABC-inspired default; `[1, 0, 0]` and `[0.8, 0.2, 0]` support controlled baseline
 experiments. Zero-weight new sources are disabled. Every enabled source must
-have eligible **train and validation** chunks; an empty source is an error,
-not a reason to silently redistribute its weight. The old source remains positive
-and primary so saved serving assets retain the original identity.
+have eligible **train** chunks — and validation chunks when a holdout exists;
+an empty source is an error, not a reason to silently redistribute its weight.
+The old source remains positive and primary so saved serving assets retain the
+original identity.
+
+`old_split_manifest` is required only when the DAgger export has a validation
+split: per-episode identity/group bookkeeping exists to keep held-out data
+honest, and zero-holdout runs (the 2026-09-11 default) have nothing for it to
+protect. Omitting it trains on **every** old episode, records
+`old_data_policy` in provenance, and rests the lineage attestation on the
+pinned audited v12 base config. (The v12 `source_manifest.csv` needed to build
+real per-episode identities was lost with its conversion VM — re-derive it
+from the job CSV with length cross-checks if a holdout run is ever needed.)
 
 ### Validate first, then explicitly train
 

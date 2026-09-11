@@ -311,11 +311,11 @@ def plan(export, tmp_path):
         },
     )
     return TrainingPlan(
-        str(initial),
-        str(old),
-        str(splits),
-        str(export),
-        "test_dagger",
+        initial_checkpoint=str(initial),
+        old_dataset_root=str(old),
+        old_split_manifest=str(splits),
+        dagger_root=str(export),
+        exp_name="test_dagger",
         batch_size=2,
         fsdp_devices=1,
         num_workers=0,

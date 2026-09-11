@@ -500,13 +500,25 @@ semantics, and **the selected checkpoint's 32D padded normalization**. All
 components must use identical stats and normalization mode. Do not recompute
 normalization for this continuation recipe.
 
-Weights are ordered old / new teleop / new policy. `[0.8, 0.1, 0.1]` is the
-ABC-inspired default; `[1, 0, 0]` and `[0.8, 0.2, 0]` support controlled baseline
-experiments. Zero-weight new sources are disabled. Every enabled source must
-have eligible **train** chunks — and validation chunks when a holdout exists;
-an empty source is an error, not a reason to silently redistribute its weight.
+Weights are ordered old / new teleop / new policy. The default is
+`[0.8, 0.2, 0.0]` (2026-09-11 decision: no autonomous-rollout training); the
+ABC-inspired `[0.8, 0.1, 0.1]` remains a plan-level override for experiment
+arm C. Zero-weight new sources are disabled. Every enabled source must have
+eligible **train** chunks — and validation chunks when a holdout exists; an
+empty source is an error, not a reason to silently redistribute its weight.
 The old source remains positive and primary so saved serving assets retain the
 original identity.
+
+`extra_dagger_roots` mixes additional exports into the same intervention /
+rollout sources: each authority's weight splits across roots in proportion to
+their eligible train chunks, so sampling stays uniform over the union, and
+duplicate episode IDs across roots are rejected. Exports delivered without
+review (e.g. the us05 success-only export) get the batch policy applied **in
+place** with [`apply_batch_review.py`](../scripts/yam_data/apply_batch_review.py)
+— it rewrites the `reviewed` masks over recorded authority segments for
+operator-marked successes (aborting on any failure episode), recomputes
+chunks/checksums/review intervals coherently, and records an `in_place_edits`
+audit entry in the manifest; no video is re-decoded.
 
 `old_split_manifest` is required only when the DAgger export has a validation
 split: per-episode identity/group bookkeeping exists to keep held-out data

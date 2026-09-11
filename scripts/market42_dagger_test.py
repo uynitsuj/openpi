@@ -326,7 +326,8 @@ def plan(export, tmp_path):
 def test_plan_continues_v12_and_shares_assets(plan):
     config = build_config(plan)
     assert config.weight_loader.params_path == str(Path(plan.initial_checkpoint) / "params")
-    assert config.data.weights == (0.8, 0.1, 0.1)
+    # Default weights drop the autonomous-rollout source (2026-09-11 policy).
+    assert config.data.weights == (0.8, 0.2)
     assert config.data.require_shared_normalization
     assert config.data.components[0].base_config.episodes == (0,)
     assert config.data.components[0].base_config.val_episodes == (1,)
@@ -460,7 +461,14 @@ def test_full_cpu_training_and_serving_smoke(plan, tmp_path, monkeypatch):
 
     old_root = tmp_path / "actual_lerobot"
     make_old_lerobot(old_root)
-    plan = dataclasses.replace(plan, old_dataset_root=str(old_root), checkpoint_base_dir=str(tmp_path / "checkpoints"))
+    # ABC-style weights keep the policy source enabled so the smoke covers all
+    # three source kinds even though the production default drops rollouts.
+    plan = dataclasses.replace(
+        plan,
+        old_dataset_root=str(old_root),
+        checkpoint_base_dir=str(tmp_path / "checkpoints"),
+        weights=(0.8, 0.1, 0.1),
+    )
     monkeypatch.setattr(config_lib._tokenizer, "PaligemmaTokenizer", FixtureTokenizer)
     original_vision = pi0._siglip.Module
     monkeypatch.setattr(pi0._siglip, "Module", lambda **kwargs: original_vision(**{**kwargs, "variant": "mu/14"}))

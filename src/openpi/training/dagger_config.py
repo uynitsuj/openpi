@@ -26,10 +26,17 @@ class TrainingPlan:
     # there is no offline validation left for it to protect. Runs with a
     # holdout must provide it (leakage checks need real identities).
     old_split_manifest: str | None = None
+    # Additional DAgger exports mixed into the same intervention/rollout
+    # sources as dagger_root; each authority's weight splits across roots in
+    # proportion to their eligible train chunks (uniform over the union).
+    extra_dagger_roots: tuple[str, ...] = ()
     old_repo_id: str = "siemens_simple_d405_v12dj_recent"
     base_config: str = "pi05_siemens_simple_d405_v12dj_recent_bs128"
     asset_id: str = "siemens_simple_d405_v12dj_recent"
-    weights: tuple[float, ...] = (0.8, 0.1, 0.1)
+    # [old teleop demos, DAgger interventions, DAgger autonomous rollouts].
+    # 2026-09-11 decision: no autonomous-rollout training (0.0); the
+    # ABC-inspired [0.8, 0.1, 0.1] remains a plan-level override.
+    weights: tuple[float, ...] = (0.8, 0.2, 0.0)
     num_train_steps: int = 20_000
     batch_size: int = 128
     num_workers: int = 8
@@ -45,6 +52,8 @@ def load_plan(path: Path) -> TrainingPlan:
     for key in ("initial_checkpoint", "old_dataset_root", "old_split_manifest", "dagger_root", "checkpoint_base_dir"):
         if raw.get(key):
             raw[key] = str((path.parent / raw[key]).resolve())
+    if raw.get("extra_dagger_roots"):
+        raw["extra_dagger_roots"] = tuple(str((path.parent / root).resolve()) for root in raw["extra_dagger_roots"])
     if "weights" in raw:
         raw["weights"] = tuple(raw["weights"])
     return TrainingPlan(**raw)
@@ -65,7 +74,7 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
         raise ValueError("This initial DAgger recipe supports the audited v12 config; add other lineages explicitly")
     initial = Path(plan.initial_checkpoint)
     destination = (Path(plan.checkpoint_base_dir) / base.name / plan.exp_name).resolve()
-    for source in (initial, Path(plan.old_dataset_root), Path(plan.dagger_root)):
+    for source in (initial, Path(plan.old_dataset_root), Path(plan.dagger_root), *map(Path, plan.extra_dagger_roots)):
         if destination.is_relative_to(source.resolve()) or source.resolve().is_relative_to(destination):
             raise ValueError("Checkpoint output must not overlap input data or the initial checkpoint")
     if not (initial / "params").is_dir():
@@ -89,24 +98,38 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
             raise ValueError(f"Inconsistent normalization dimensions: {key}")
         if np.any(stats[key].std < 0) or np.any(stats[key].q99 < stats[key].q01):
             raise ValueError(f"Invalid normalization ordering: {key}")
-    dataset_manifest = read_json(Path(plan.dagger_root) / "manifest.json")
+    dagger_roots = [plan.dagger_root, *plan.extra_dagger_roots]
+    if len({str(Path(root).resolve()) for root in dagger_roots}) != len(dagger_roots):
+        raise ValueError("Duplicate dagger roots")
+    dagger_manifests = {root: read_json(Path(root) / "manifest.json") for root in dagger_roots}
+    dataset_manifest = dagger_manifests[plan.dagger_root]
+    # An episode present in two exports would train twice under one identity.
+    dagger_ids: dict[str, str] = {}
+    for root, manifest in dagger_manifests.items():
+        for row in manifest["episodes"]:
+            if row["id"] in dagger_ids:
+                raise ValueError(f"Episode {row['id']} appears in both {dagger_ids[row['id']]} and {root}")
+            dagger_ids[row["id"]] = root
     # Zero-holdout exports (2026-09-11 decision: the corrections corpus is too
     # small to spare) have no val episodes; disable the offline validation loop
     # entirely — evaluation is physical rollouts. Any val presence keeps the
     # base config's cadence.
-    has_new_val = any(row["split"] == "val" for row in dataset_manifest["episodes"])
+    has_new_val = any(
+        row["split"] == "val" for manifest in dagger_manifests.values() for row in manifest["episodes"]
+    )
     if not has_new_val:
         logging.warning(
             "DAgger export has no validation split — offline val loop disabled (val_interval=0); "
             "rely on physical evaluation"
         )
-    if dataset_manifest.get("image_resize") != "pil_bilinear_224":
-        raise ValueError("DAgger export must match v12 PIL BILINEAR resize; reconvert it")
-    if dataset_manifest["image_modes"] != dict.fromkeys(CAMERAS, "center_crop"):
-        raise ValueError("v12 DAgger requires all three cameras center-cropped")
     prompt = base.data.default_prompt
-    if dataset_manifest["prompt"] != prompt:
-        raise ValueError("DAgger prompt differs from the v12 training prompt")
+    for root, manifest in dagger_manifests.items():
+        if manifest.get("image_resize") != "pil_bilinear_224":
+            raise ValueError(f"DAgger export must match v12 PIL BILINEAR resize; reconvert {root}")
+        if manifest["image_modes"] != dict.fromkeys(CAMERAS, "center_crop"):
+            raise ValueError(f"v12 DAgger requires all three cameras center-cropped: {root}")
+        if manifest["prompt"] != prompt:
+            raise ValueError(f"DAgger prompt differs from the v12 training prompt: {root}")
     old_root = Path(plan.old_dataset_root)
     old_info = read_json(old_root / "meta" / "info.json")
     if old_info["fps"] != 30:
@@ -147,11 +170,12 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
                 raise ValueError(f"Old dataset group leaks across splits: {group}")
             groups[group] = row["split"]
             partitions[row["split"]].append(row["episode_index"])
-        for row in dataset_manifest["episodes"]:
-            if row["id"] in identities:
-                raise ValueError(f"Episode appears in both original and DAgger data: {row['id']}")
-            if row["group"] in groups and groups[row["group"]] != row["split"]:
-                raise ValueError(f"Collection group leaks between old/new splits: {row['group']}")
+        for manifest in dagger_manifests.values():
+            for row in manifest["episodes"]:
+                if row["id"] in identities:
+                    raise ValueError(f"Episode appears in both original and DAgger data: {row['id']}")
+                if row["group"] in groups and groups[row["group"]] != row["split"]:
+                    raise ValueError(f"Collection group leaks between old/new splits: {row['group']}")
         if not all(partitions.values()):
             raise ValueError("Old train and validation partitions must both be nonempty")
         old_episodes = tuple(sorted(partitions["train"]))
@@ -166,7 +190,8 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
     dagger_controller_profiles = sorted(
         {
             profile if profile is not None else "unrecorded"
-            for row in dataset_manifest["episodes"]
+            for manifest in dagger_manifests.values()
+            for row in manifest["episodes"]
             for profile in (row.get("controller_profiles") or {"yam": None}).values()
         }
     )
@@ -181,11 +206,36 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
         "old": "lab42 collection tuning (v8dj_recorded-equivalent per sampled audit, runbook §1)",
         "new_dagger": dagger_controller_profiles,
     }
+    # Each authority's plan weight splits across dagger roots in proportion to
+    # their eligible train chunks, so sampling is uniform over the union.
+    def authority_split(authority: str, weight: float) -> list[tuple[str, float]]:
+        counts = {
+            root: sum(row["chunks_h30"][authority] for row in manifest["episodes"] if row["split"] == "train")
+            for root, manifest in dagger_manifests.items()
+        }
+        total = sum(counts.values())
+        if total <= 0:
+            raise ValueError(f"No eligible train {authority} chunks in any dagger root")
+        shares = []
+        for root, count in counts.items():
+            if count == 0:
+                logging.warning("dagger root %s has no train %s chunks — omitted from that source", root, authority)
+                continue
+            shares.append((root, weight * (count / total)))
+        return shares
+
+    dagger_sources = {
+        f"market42_dagger_{authority}_{Path(root).name}": (root, authority, share)
+        for authority, weight in zip(("teleop", "policy"), plan.weights[1:], strict=True)
+        if weight > 0
+        for root, share in authority_split(authority, weight)
+    }
     provenance = {
         "plan": dataclasses.asdict(plan),
-        "mixture_order": ["old", "new_teleop", "new_policy"],
+        "mixture_order": ["old", *dagger_sources],
+        "component_weights": {"old": plan.weights[0], **{name: share for name, (_, _, share) in dagger_sources.items()}},
         "source_mixture_commit": "ced6d2c3375cba76c8e055ea85a3b3cb1a747873",
-        "dagger_manifest_sha256": file_hash(Path(plan.dagger_root) / "manifest.json"),
+        "dagger_manifest_sha256": {root: file_hash(Path(root) / "manifest.json") for root in dagger_roots},
         "old_split_manifest_sha256": old_split_sha,
         "old_data_policy": old_data_policy,
         "old_info_sha256": file_hash(old_root / "meta" / "info.json"),
@@ -215,21 +265,22 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
             ),
         )
     ]
-    components.extend(
-        config_lib.LeRobotYamDataConfig(
-            repo_id=f"market42_dagger_{authority}",
-            assets=shared_assets,
-            default_prompt=prompt,
-            base_config=config_lib.DataConfig(dagger_root=plan.dagger_root, dagger_authority=authority),
+    component_weights = [plan.weights[0]]
+    for name, (root, authority, share) in dagger_sources.items():
+        components.append(
+            config_lib.LeRobotYamDataConfig(
+                repo_id=name,
+                assets=shared_assets,
+                default_prompt=prompt,
+                base_config=config_lib.DataConfig(dagger_root=root, dagger_authority=authority),
+            )
         )
-        for authority, weight in zip(("teleop", "policy"), plan.weights[1:], strict=True)
-        if weight > 0
-    )
+        component_weights.append(share)
     # A virtual catalog at least as large as the training budget avoids repeatedly
     # traversing a small, fixed set of RNG-seeded mixture draws.
     mixture = config_lib.MixtureDataConfigFactory(
         components=tuple(components),
-        weights=tuple(w for w in plan.weights if w > 0),
+        weights=tuple(component_weights),
         require_shared_normalization=True,
         mixture_length=plan.num_train_steps * plan.batch_size,
     )

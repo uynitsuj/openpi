@@ -427,6 +427,36 @@ through the review manifest's `options`. Subscriber-driven async command logs,
 unknown ramp duration, missing producers, incomplete videos, and backwards
 timestamps fail closed. The loader never substitutes raw Gello joints.
 
+For recordings that predate the recorder's ramp/sync archiving, two explicit
+fail-open options exist (default closed, must be set together, archived in
+per-episode provenance): `allow_subscriber_driven` and `assumed_command_ramp_s`.
+The assumed ramp must be measured, not guessed — it replaces the recorded ramp
+in the per-segment exclusion window and is the only defense against async logs
+recording pre-ramp targets. For the 2026-09-10/11 collections, 288 recorded
+handoffs measured median settle 2 ms, p99 0.83 s, max 1.33 s; the round-1
+manifests use `assumed_command_ramp_s: 1.5` (exclusion 1.6 s with the guard).
+
+### Round-1 preparation (2026-09-11)
+
+[`build_market42_review.py`](../scripts/yam_data/build_market42_review.py)
+generated review manifests over the three collections (107/108 episodes; one
+0910 episode excluded for non-monotonic camera timestamps), encoding an
+**episode-level batch policy, not interval-level human scrubbing**: teleop
+segments approved for every completed episode, policy segments approved only
+for operator-marked successes (19 of 63 0910 episodes failed; their autonomous
+segments are excluded). Groups are per-collection hour blocks; val groups are
+deterministic and identical across both image-mode variants:
+
+- `/nfs_exp/karim/market42_dagger/review_round1_cc.json` → `round1_cc/`
+  (all three cameras center-cropped; v12 lineage)
+- `/nfs_exp/karim/market42_dagger/review_round1_tc.json` → `round1_tc/`
+  (top center-cropped, wrists padded; v11 lineage — the v12 continuation plan
+  intentionally rejects this export; add the v11 lineage to `dagger_config.py`
+  explicitly before training with it)
+
+Interval-level review of handoff-adjacent recovery quality remains recommended
+before a production run; regenerate the manifests after editing.
+
 ### Prepare the old-data split and training plan
 
 [old_splits.example.json](dagger/old_splits.example.json) illustrates the required

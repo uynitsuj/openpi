@@ -33,10 +33,27 @@ class Options:
     boundary_guard_s: float = 0.1
     command_tolerance_rad: float = 0.05
     gripper_tolerance: float = 0.05
+    # Explicit fail-open overrides for recordings that predate the recorder's
+    # ramp/sync archiving (default closed). Only set these together, and only
+    # after measuring real handoff traces: assumed_command_ramp_s must cover
+    # the worst observed post-switch settle time, because in subscriber-driven
+    # logs the recorded command during a ramp need not equal the relayed
+    # target. Both land in per-episode provenance via the options dict.
+    allow_subscriber_driven: bool = False
+    assumed_command_ramp_s: float = 0.0
 
     def __post_init__(self):
-        if any(not np.isfinite(value) or value <= 0 for value in dataclasses.asdict(self).values()):
+        overrides = ("allow_subscriber_driven", "assumed_command_ramp_s")
+        thresholds = {k: v for k, v in dataclasses.asdict(self).items() if k not in overrides}
+        if any(not np.isfinite(value) or value <= 0 for value in thresholds.values()):
             raise ValueError("All freshness, boundary, and agreement thresholds must be finite and positive")
+        if not np.isfinite(self.assumed_command_ramp_s) or self.assumed_command_ramp_s < 0:
+            raise ValueError("assumed_command_ramp_s must be finite and non-negative")
+        if self.allow_subscriber_driven and self.assumed_command_ramp_s <= 0:
+            raise ValueError(
+                "allow_subscriber_driven requires a measured assumed_command_ramp_s covering the "
+                "worst observed handoff settle time (async logs record pre-ramp targets)"
+            )
 
 
 def camera_seconds(values: np.ndarray) -> np.ndarray:
@@ -193,13 +210,20 @@ def convert_episode(entry: dict, out: Path, prompt: str, modes: dict, options: O
     for arm in arms:
         cfg = arm["config"]
         sync = any(link.get("target_node") == arm["name"] and link.get("sync_group") for link in session["links"])
-        if cfg.get("poll_freq") is None and not sync:
+        if cfg.get("poll_freq") is None and not sync and not options.allow_subscriber_driven:
             raise ValueError(
-                "Subscriber-driven command logs can contain pre-ramp targets; use fixed-rate/sync recordings"
+                "Subscriber-driven command logs can contain pre-ramp targets; use fixed-rate/sync "
+                "recordings, or set options.allow_subscriber_driven with a measured assumed_command_ramp_s"
             )
         ramp = cfg.get("command_ramp_duration_s")
         if ramp is None or not np.isfinite(ramp) or ramp <= 0:
-            raise ValueError("Unknown/velocity-limited ramp: cannot establish safe handoff exclusion window")
+            if options.assumed_command_ramp_s <= 0:
+                raise ValueError("Unknown/velocity-limited ramp: cannot establish safe handoff exclusion window")
+            logger.warning(
+                "%s: %s has no recorded ramp; applying measured assumed_command_ramp_s=%.2fs",
+                episode.name, arm["name"], options.assumed_command_ramp_s,
+            )
+            ramp = options.assumed_command_ramp_s
         ramp_s = max(ramp_s, ramp)
     streams, camera_ts = {}, {}
     source_files = {"session_meta.json", "metadata.json"}

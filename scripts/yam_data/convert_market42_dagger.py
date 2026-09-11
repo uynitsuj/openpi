@@ -185,6 +185,11 @@ def convert_episode(entry: dict, out: Path, prompt: str, modes: dict, options: O
     if len(arms) != 2:
         raise ValueError("Expected exactly two recorded YAM nodes")
     ramp_s = 0.0
+    # Recorded collection tuning, surfaced into the manifest so training
+    # provenance and serving can match controller profiles without digging
+    # through per-episode session metadata. None = recorded before the
+    # gravity_comp_profile field existed (unknown stays unknown).
+    controller_profiles = {arm["name"]: arm["config"].get("gravity_comp_profile") for arm in arms}
     for arm in arms:
         cfg = arm["config"]
         sync = any(link.get("target_node") == arm["name"] and link.get("sync_group") for link in session["links"])
@@ -303,6 +308,7 @@ def convert_episode(entry: dict, out: Path, prompt: str, modes: dict, options: O
         "directory": identifier,
         "split": entry["split"],
         "group": entry["group"],
+        "controller_profiles": controller_profiles,
         "frames": len(ticks),
         "valid_frames": int(valid.sum()),
         "reviewed_frames": int(reviewed.sum()),
@@ -355,6 +361,16 @@ def convert_manifest(review_path: Path, output: Path) -> dict:
         "prompt": prompt,
         "image_modes": modes,
         "image_resize": "pil_bilinear_224",
+        # Distinct recorded YAM gravity_comp_profile values across all episodes;
+        # "unrecorded" = collected before the profile field existed. More than
+        # one entry means mixed controller regimes (see runbook sections 1–2).
+        "controller_profiles": sorted(
+            {
+                profile if profile is not None else "unrecorded"
+                for episode in episodes
+                for profile in episode["controller_profiles"].values()
+            }
+        ),
         "review_sha256": file_hash(output / "review.json"),
         "episodes": episodes,
     }

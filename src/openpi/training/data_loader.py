@@ -903,6 +903,68 @@ def create_data_loader(
     )
 
 
+def build_mixture_component_datasets(
+    config: _config.TrainConfig,
+    *,
+    skip_norm_stats: bool = False,
+    validation: bool = False,
+) -> tuple[list[tuple[str, float, Dataset]], _config.DataConfig]:
+    """Build each mixture component's fully transformed dataset (train or val split).
+
+    Returns ``([(name, normalized_weight, dataset), ...], primary_data_config)``.
+    Names are the component repo_ids, suffixed with their position on collision,
+    so per-source metrics (e.g. ``val_loss/<name>``) are always distinguishable.
+    """
+    assert isinstance(config.data, _config.MixtureDataConfigFactory)
+    components = config.data.create_components(config.assets_dirs, config.model)
+
+    if config.data.require_shared_normalization and not skip_norm_stats:
+        primary = components[0][0]
+        for component, _ in components:
+            if component.norm_stats is None or primary.norm_stats is None:
+                raise ValueError("DAgger mixtures require shared checkpoint normalization stats")
+            if component.use_quantile_norm != primary.use_quantile_norm or component.norm_stats.keys() != primary.norm_stats.keys():
+                raise ValueError("Mixture normalization modes/keys differ")
+            for key, stats in primary.norm_stats.items():
+                for field_name in ("mean", "std", "q01", "q99"):
+                    if not np.array_equal(getattr(stats, field_name), getattr(component.norm_stats[key], field_name)):
+                        raise ValueError(f"Mixture normalization differs: {key}/{field_name}")
+
+    repo_ids = [data_config.repo_id for data_config, _ in components]
+    named = []
+    for position, (data_config, weight) in enumerate(components):
+        if validation:
+            if data_config.dagger_root:
+                data_config = dataclasses.replace(data_config, dagger_split="val")  # noqa: PLW2901
+            elif data_config.val_episodes:
+                data_config = dataclasses.replace(data_config, episodes=data_config.val_episodes)  # noqa: PLW2901
+            else:
+                raise ValueError(f"Mixture component {data_config.repo_id} has no validation split")
+        if data_config.rlds_data_dir is not None:
+            raise NotImplementedError(
+                "RLDS components are not supported in a mixture — use DataConfig.datasets "
+                "for RLDS-level dataset mixing instead."
+            )
+        # Match the single-dataset path: when the train loop doesn't consume
+        # sample_weights, don't let the RABC subset filter drop samples.
+        if not getattr(config, "rabc_enabled", False) and getattr(
+            data_config, "reject_zero_weighted_samples", False
+        ):
+            data_config = dataclasses.replace(data_config, reject_zero_weighted_samples=False)  # noqa: PLW2901
+        dataset = build_torch_dataset(
+            data_config, config.model, config.model.action_horizon, skip_norm_stats=skip_norm_stats
+        )
+        name = str(data_config.repo_id)
+        if repo_ids.count(data_config.repo_id) > 1:
+            name = f"{name}#{position}"
+        logging.info(
+            f"[mixture] {name}: weight={weight:.4f} samples={len(dataset):,} data_config: {data_config}"
+        )
+        named.append((name, weight, dataset))
+
+    return named, components[0][0]
+
+
 def create_mixture_torch_data_loader(
     config: _config.TrainConfig,
     *,
@@ -921,60 +983,17 @@ def create_mixture_torch_data_loader(
     draw picks a component by its sampling probability. The returned loader
     reports the primary (first) component's DataConfig via ``data_config()``.
     """
-    assert isinstance(config.data, _config.MixtureDataConfigFactory)
-    components = config.data.create_components(config.assets_dirs, config.model)
-
-    if config.data.require_shared_normalization and not skip_norm_stats:
-        primary = components[0][0]
-        for component, _ in components:
-            if component.norm_stats is None or primary.norm_stats is None:
-                raise ValueError("DAgger mixtures require shared checkpoint normalization stats")
-            if component.use_quantile_norm != primary.use_quantile_norm or component.norm_stats.keys() != primary.norm_stats.keys():
-                raise ValueError("Mixture normalization modes/keys differ")
-            for key, stats in primary.norm_stats.items():
-                for field_name in ("mean", "std", "q01", "q99"):
-                    if not np.array_equal(getattr(stats, field_name), getattr(component.norm_stats[key], field_name)):
-                        raise ValueError(f"Mixture normalization differs: {key}/{field_name}")
-
-    datasets = []
-    weights = []
-    for data_config, weight in components:
-        if validation:
-            if data_config.dagger_root:
-                data_config = dataclasses.replace(data_config, dagger_split="val")
-            elif data_config.val_episodes:
-                data_config = dataclasses.replace(data_config, episodes=data_config.val_episodes)
-            else:
-                raise ValueError(f"Mixture component {data_config.repo_id} has no validation split")
-        if data_config.rlds_data_dir is not None:
-            raise NotImplementedError(
-                "RLDS components are not supported in a mixture — use DataConfig.datasets "
-                "for RLDS-level dataset mixing instead."
-            )
-        # Match the single-dataset path: when the train loop doesn't consume
-        # sample_weights, don't let the RABC subset filter drop samples.
-        if not getattr(config, "rabc_enabled", False) and getattr(
-            data_config, "reject_zero_weighted_samples", False
-        ):
-            data_config = dataclasses.replace(data_config, reject_zero_weighted_samples=False)  # noqa: PLW2901
-        dataset = build_torch_dataset(
-            data_config, config.model, config.model.action_horizon, skip_norm_stats=skip_norm_stats
-        )
-        logging.info(
-            f"[mixture] weight={weight:.4f} samples={len(dataset):,} data_config: {data_config}"
-        )
-        datasets.append(dataset)
-        weights.append(weight)
+    named, primary_config = build_mixture_component_datasets(
+        config, skip_norm_stats=skip_norm_stats, validation=validation
+    )
 
     mixture = WeightedMixtureDataset(
-        datasets,
-        weights,
+        [dataset for _, _, dataset in named],
+        [weight for _, weight, _ in named],
         length=(config.data.mixture_length or None),
         seed=config.seed + int(validation),
     )
-    logging.info(f"[mixture] virtual length={len(mixture):,} over {len(datasets)} components")
-
-    primary_config = components[0][0]
+    logging.info(f"[mixture] virtual length={len(mixture):,} over {len(named)} components")
     return _wrap_torch_dataset(
         mixture,
         primary_config,

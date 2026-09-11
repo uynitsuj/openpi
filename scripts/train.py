@@ -5,7 +5,7 @@ import functools
 import logging
 import math
 import platform
-from typing import Any
+from typing import Any, NamedTuple
 
 import etils.epath as epath
 import flax.nnx as nnx
@@ -228,27 +228,54 @@ def val_step(
     return {"val_loss": jnp.mean(chunked_loss)}
 
 
+class ValSet(NamedTuple):
+    """A named validation source: `weight` sets its share of the aggregate val_loss."""
+
+    name: str
+    weight: float
+    batches: list[tuple[_model.Observation, _model.Actions]]
+
+
+def _evenly_spaced_batches(dataset, num_batches: int, batch_size: int):
+    """Fixed, deterministic val batches: indices evenly spaced over the dataset
+    so the same frames are evaluated every pass and every run."""
+    indices = np.linspace(0, len(dataset) - 1, num_batches * batch_size).astype(int)
+    batches = []
+    for b in range(num_batches):
+        items = [dataset[int(i)] for i in indices[b * batch_size : (b + 1) * batch_size]]
+        collated = jax.tree.map(lambda *xs: np.stack(xs), *items)
+        batches.append((_model.Observation.from_dict(collated), collated["actions"]))
+    return batches
+
+
 def build_val_batches(
     config: _config.TrainConfig,
-) -> list[tuple[_model.Observation, _model.Actions]] | None:
-    """Pre-build a fixed, deterministic set of val batches (host memory).
+) -> list[ValSet] | None:
+    """Pre-build fixed, deterministic val batches (host memory), one ValSet per source.
 
-    Two val sources: abc-layout datasets have a val/ split on disk
+    Val sources: abc-layout datasets have a val/ split on disk
     (export_abc_layout_job.py reserves 8 episodes); LeRobot datasets get one via
-    the data config's val_episodes (val_frac/val_seed on LeRobotYamRormDataConfig).
-    Indices are evenly spaced over the split so the same frames are evaluated
-    every pass and every run. Returns None (with a warning) when no val data is
-    usable — training proceeds without validation.
+    the data config's val_episodes (val_frac/val_seed on LeRobotYamRormDataConfig);
+    mixture configs get one ValSet per component (its own val split), each with
+    num_val_batches deterministic batches, so a weak minority source is visible
+    instead of hidden inside an aggregate mixture loss. Returns None (with a
+    warning) when no val data is usable — training proceeds without validation.
     """
     from lerobot.utils.constants import HF_LEROBOT_HOME  # noqa: PLC0415
 
     from openpi.training.abc_layout_dataset import AbcLayoutDataset  # noqa: PLC0415
 
     if isinstance(config.data, _config.MixtureDataConfigFactory):
-        loader = _data_loader.create_mixture_torch_data_loader(
-            config, validation=True, num_batches=config.num_val_batches,
-        )
-        return [jax.device_get(batch) for batch in loader]
+        named = _data_loader.build_mixture_component_datasets(config, validation=True)[0]
+        val_sets = []
+        for name, weight, dataset in named:
+            batches = _evenly_spaced_batches(dataset, config.num_val_batches, config.batch_size)
+            logging.info(
+                "validation[%s]: %d batches of %d prepared (weight %.4f, %d samples)",
+                name, len(batches), config.batch_size, weight, len(dataset),
+            )
+            val_sets.append(ValSet(name, weight, batches))
+        return val_sets
 
     data_config = config.data.create(config.assets_dirs, config.model)
     if getattr(data_config, "abc_layout", False):
@@ -288,15 +315,9 @@ def build_val_batches(
             config.name,
         )
         return None
-    n_needed = config.num_val_batches * config.batch_size
-    indices = np.linspace(0, len(dataset) - 1, n_needed).astype(int)
-    batches = []
-    for b in range(config.num_val_batches):
-        items = [dataset[int(i)] for i in indices[b * config.batch_size : (b + 1) * config.batch_size]]
-        collated = jax.tree.map(lambda *xs: np.stack(xs), *items)
-        batches.append((_model.Observation.from_dict(collated), collated["actions"]))
+    batches = _evenly_spaced_batches(dataset, config.num_val_batches, config.batch_size)
     logging.info("validation: %d batches of %d prepared from %s", len(batches), config.batch_size, val_src)
-    return batches
+    return [ValSet("val", 1.0, batches)]
 
 
 def compute_weighted_fac_float(
@@ -556,15 +577,29 @@ def main(config: _config.TrainConfig):
             wandb.log(reduced_info, step=step)
             infos = []
         if pval_step is not None and step % config.val_interval == 0:
+            per_source = {}
             with sharding.set_mesh(mesh):
-                v_losses = []
-                for vb_i, vb in enumerate(val_batches):
-                    vb_dev = jax.device_put(vb, data_sharding)
-                    v_info = pval_step(jax.random.fold_in(val_rng, vb_i), train_state, vb_dev)
-                    v_losses.append(float(jax.device_get(v_info["val_loss"])))
-            val_loss = float(np.mean(v_losses))
-            pbar.write(f"Step {step}: val_loss={val_loss:.4f} ({len(val_batches)} batches)")
-            wandb.log({"val_loss": val_loss}, step=step)
+                vb_i = 0
+                for vs in val_batches:
+                    v_losses = []
+                    for vb in vs.batches:
+                        vb_dev = jax.device_put(vb, data_sharding)
+                        v_info = pval_step(jax.random.fold_in(val_rng, vb_i), train_state, vb_dev)
+                        v_losses.append(float(jax.device_get(v_info["val_loss"])))
+                        vb_i += 1
+                    per_source[vs.name] = float(np.mean(v_losses))
+            # Aggregate = exact mixture-weighted sum of per-source means (rather
+            # than sampling sources stochastically into the val batches), so a
+            # weak minority source is visible in val_loss/<name> and cannot be
+            # silently absorbed by the majority source.
+            val_loss = float(sum(vs.weight * per_source[vs.name] for vs in val_batches))
+            n_vb = sum(len(vs.batches) for vs in val_batches)
+            detail = "  ".join(f"{name}={loss:.4f}" for name, loss in per_source.items())
+            pbar.write(f"Step {step}: val_loss={val_loss:.4f} ({n_vb} batches: {detail})")
+            log = {"val_loss": val_loss}
+            if len(val_batches) > 1:
+                log.update({f"val_loss/{name}": loss for name, loss in per_source.items()})
+            wandb.log(log, step=step)
         if os.environ.get('OPENPI_PROFILE_SYNTHETIC'):
             pass  # reuse the cached batch: measures the pure-compute ceiling
         else:

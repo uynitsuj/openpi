@@ -1,6 +1,7 @@
 """Explicit, reproducible Siemens DAgger continuation plans."""
 
 import dataclasses
+import logging
 from pathlib import Path
 import re
 
@@ -123,6 +124,29 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
             raise ValueError(f"Collection group leaks between old/new splits: {row['group']}")
     if not all(partitions.values()):
         raise ValueError("Old train and validation partitions must both be nonempty")
+    # Controller-gain provenance: recorded per-episode by the converter (None →
+    # "unrecorded" predates the gravity_comp_profile field). Serving must match
+    # the collection tuning — the FAR bair_daggered_checkpoints kp_scale
+    # mismatch is the documented failure mode (runbook §1–2). Mixed or
+    # unrecorded profiles are allowed (stratify, don't discard) but loud.
+    dagger_controller_profiles = sorted(
+        {
+            profile if profile is not None else "unrecorded"
+            for row in dataset_manifest["episodes"]
+            for profile in (row.get("controller_profiles") or {"yam": None}).values()
+        }
+    )
+    if dagger_controller_profiles != ["v8dj_recorded"]:
+        logging.warning(
+            "DAgger data controller profiles are %s, not the recommended ['v8dj_recorded'] — "
+            "verify serving gains match collection and stratify evaluation by profile "
+            "(docs/market42_dagger_training.md §1–2)",
+            dagger_controller_profiles,
+        )
+    controller_profiles = {
+        "old": "lab42 collection tuning (v8dj_recorded-equivalent per sampled audit, runbook §1)",
+        "new_dagger": dagger_controller_profiles,
+    }
     provenance = {
         "plan": dataclasses.asdict(plan),
         "mixture_order": ["old", "new_teleop", "new_policy"],
@@ -133,6 +157,7 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
         "norm_stats_sha256": file_hash(stats_file),
         "image_modes": dataset_manifest["image_modes"],
         "prompt": prompt,
+        "controller_profiles": controller_profiles,
         "action_source": "old_leader_targets_new_verified_follower_commands",
         "chunk_selection": "reviewed_valid_full_horizon_single_authority_segment",
         "optimizer_policy": "initialize from checkpoint weights with a fresh optimizer; --resume is same-run only",
@@ -175,6 +200,9 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
     return dataclasses.replace(
         base,
         data=mixture,
+        # Surfaced to the policy server so serving stacks can check the station's
+        # active controller profile against the collection tuning before running.
+        policy_metadata={**(base.policy_metadata or {}), "controller_profiles": controller_profiles},
         exp_name=plan.exp_name,
         batch_size=plan.batch_size,
         num_train_steps=plan.num_train_steps,

@@ -71,6 +71,29 @@ limits, gripper behavior, and command timing can still differ. Archive effective
 runtime values and model/config hashes, not just the preset name. Do not copy
 another station's motor zeros, gripper calibration, or safety limits.
 
+### Audit of collected DAgger data (2026-09-11)
+
+The corrections collected so far under `/nfs_exp/yiming/data/` were **not**
+recorded with `v8dj_recorded`, per each episode's recorded `station_config`:
+
+| Collection | Episodes kept | Lab42 commit | Recorded profile |
+| --- | ---: | --- | --- |
+| `20260910/` | 63 | `818ad01` (dirty) | field absent — predates `gravity_comp_profile`; factory behavior |
+| `20260911/20260911/` | 31 | `39c739c` (dirty) | `market42_default` (both YAMs) |
+| `20260911/20260911_updated_gain/` | 14 | `656c57e` (dirty) | `market42_default` (both YAMs) |
+
+The i2rt submodule is `47fee5e7d` in all three (the revision audited above), so
+`market42_default` resolves to the factory gravity model: arm `kp/kd` match
+`v8dj_recorded` numerically, but gravity factors and idle damping differ.
+The `updated_gain` rename is **not** visible in the recorded config or
+submodules — every collection ran a dirty Lab42 tree, so the actual change must
+be confirmed with the collector before treating the two 0911 groups as distinct
+gain regimes. Assign these collections distinct review-manifest groups per
+profile, and note that numeric effective gains are not archived in these
+episodes (only the profile name, and for 20260910 not even that).
+`cleanup_manifest.json` at `/nfs_exp/yiming/data/20260911/` documents the
+kept/dropped sets; the on-disk directories are already deduplicated.
+
 ### Does passive-Gello IK change the gravity compensation during intervention?
 
 No. In the inspected
@@ -453,10 +476,22 @@ round or changed weights/budget, choose a new `exp_name` and initialize from the
 previous round's selected checkpoint. Existing experiment directories are never
 automatically overwritten.
 
-Validation loss is currently the fixed weighted held-out mixture, not separate
-per-controller success metrics. Keep source/profile-stratified physical and
-offline evaluation as a release gate; mixture loss can hide a weak minority
-source. This implementation does not launch a robot trial or upload datasets.
+Validation now evaluates each mixture source separately on its own fixed,
+deterministic held-out batches: `val_loss/<source>` per component, with the
+aggregate `val_loss` computed as the exact mixture-weighted sum of per-source
+means, so a weak minority source (e.g. 10%-weight interventions) is visible
+rather than absorbed. These are still imitation losses, not per-controller
+success metrics; keep source/profile-stratified physical and offline evaluation
+as a release gate. This implementation does not launch a robot trial or upload
+datasets.
+
+The converter also records each episode's YAM `gravity_comp_profile` into the
+export manifest (`controller_profiles`; `null`/"unrecorded" when the recording
+predates the field). The training plan carries the summary into
+`assets/dagger_training.json` and into the checkpoint's `policy_metadata`, and
+warns when profiles are mixed or not `v8dj_recorded`. Market42-side enforcement
+(comparing the serving station's active profile against the checkpoint's
+`policy_metadata` before running) is still to be implemented in Lab42.
 
 ### Branch integration and test scope
 

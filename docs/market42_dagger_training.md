@@ -86,13 +86,29 @@ The i2rt submodule is `47fee5e7d` in all three (the revision audited above), so
 `market42_default` resolves to the factory gravity model: arm `kp/kd` match
 `v8dj_recorded` numerically, but gravity factors and idle damping differ.
 The `updated_gain` rename is **not** visible in the recorded config or
-submodules — every collection ran a dirty Lab42 tree, so the actual change must
-be confirmed with the collector before treating the two 0911 groups as distinct
-gain regimes. Assign these collections distinct review-manifest groups per
-profile, and note that numeric effective gains are not archived in these
-episodes (only the profile name, and for 20260910 not even that).
-`cleanup_manifest.json` at `/nfs_exp/yiming/data/20260911/` documents the
-kept/dropped sets; the on-disk directories are already deduplicated.
+submodules — every collection ran a dirty Lab42 tree. Numeric effective gains
+are not archived in these episodes (only the profile name, and for 20260910
+not even that). `cleanup_manifest.json` at `/nfs_exp/yiming/data/20260911/`
+documents the kept/dropped sets; the on-disk directories are already
+deduplicated.
+
+**Empirical check (2026-09-11).** The collector's recollection was that the
+0911 "normal" batch ran `robots_realtime_dagger` gains and `updated_gain` ran
+`v8dj_recorded`. The recorded follower dynamics contradict this: over 8–10
+episodes per group, per arm, both the median tracking error |command − state|
+and the quasi-static (|vel| < 0.03 rad/s) signed residual are statistically
+identical between the two 0911 groups on every joint (e.g. right j4 residual
++22.5 ± 6.9 vs +20.2 ± 9.9 mrad; left j4 +11.3 vs +11.2). The wrist-kp gap
+between those two presets (40/15/15 vs 10/10/10) would scale the quasi-static
+wrist residual ~2.5–4x; no shift of any size is present, nor any
+gravity-model shift on j2–j4. Consistent with the recorded
+`market42_default` on both — at the recorded revisions `hardware.py` applies
+profile kp/gravity overrides only when the profile is not `market42_default` —
+the intended gain update evidently did **not** take effect on the follower
+controllers (or touched only a non-follower component, e.g. leader-side feel).
+Treat both 0911 groups as one factory-gain regime in review manifests unless
+station-side evidence emerges; do not label either batch `v8dj_recorded` or
+`robots_realtime_dagger`.
 
 ### Does passive-Gello IK change the gravity compensation during intervention?
 

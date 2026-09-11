@@ -48,6 +48,11 @@ class TrainingPlan:
     num_train_steps: int = 20_000
     batch_size: int = 128
     num_workers: int = 8
+    # None = inherit the base config's checkpoint cadence (5k). Set both to
+    # e.g. 1000 for frequent, retained checkpoints during active robot-testing
+    # rounds (each save is ~44GB and blocks training for a few minutes).
+    save_interval: int | None = None
+    keep_period: int | None = None
     fsdp_devices: int = 2
     seed: int = 0
     checkpoint_base_dir: str = "./checkpoints"
@@ -327,6 +332,8 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
         checkpoint_base_dir=plan.checkpoint_base_dir,
         wandb_enabled=plan.wandb_enabled,
         val_interval=(base.val_interval if has_new_val else 0),
+        save_interval=(plan.save_interval if plan.save_interval is not None else base.save_interval),
+        keep_period=(plan.keep_period if plan.keep_period is not None else base.keep_period),
         weight_loader=weight_loaders.CheckpointWeightLoader(str(initial / "params")),
         lr_schedule=dataclasses.replace(
             base.lr_schedule,

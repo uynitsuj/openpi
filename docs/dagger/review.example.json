@@ -1,0 +1,21 @@
+{
+  "prompt": "Pack one transparent bag into the cardboard box and flatten the bag.",
+  "image_modes": {"top": "center_crop", "left": "center_crop", "right": "center_crop"},
+  "episodes": [
+    {
+      "path": "/data/raw/episode_REPLACE_TRAIN.npy.mp4",
+      "group": "REPLACE_collection_session_train",
+      "split": "train",
+      "review": [
+        {"start_s": 0, "end_s": 10, "authority": "policy", "approved": false, "reviewer": "", "reason": "REPLACE after reviewing the actual interval"},
+        {"start_s": 10, "end_s": 20, "authority": "teleop", "approved": false, "reviewer": "", "reason": "REPLACE after reviewing the actual interval"}
+      ]
+    },
+    {
+      "path": "/data/raw/episode_REPLACE_VAL.npy.mp4",
+      "group": "REPLACE_collection_session_val",
+      "split": "val",
+      "review": []
+    }
+  ]
+}

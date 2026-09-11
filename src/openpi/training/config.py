@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import math
 import pathlib
 from typing import Any, Protocol, TypeAlias, List, Literal
 
@@ -123,6 +124,15 @@ class DataConfig:
     episodes: tuple[int, ...] | None = None
     # Held-out validation episodes. Used by val dataloader if set.
     val_episodes: tuple[int, ...] | None = None
+
+    # Explicit local roots keep offline DAgger preflight from downloading data.
+    local_dataset_root: str | None = None
+    video_backend: str | None = None
+    full_action_chunks: bool = False
+    dagger_root: str | None = None
+    dagger_authority: str = "teleop"
+    dagger_split: str = "train"
+    training_provenance: dict[str, Any] | None = None
 
     # If True, the data loader filters out samples whose RABC weight is 0 so
     # every batch has fully positive weights. ``reject_zero_weighted_mode``
@@ -269,6 +279,75 @@ class SimpleDataConfig(DataConfigFactory):
             data_transforms=self.data_transforms(model_config),
             model_transforms=self.model_transforms(model_config),
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class MixtureDataConfigFactory(DataConfigFactory):
+    """Weighted mixture over multiple datasets (abc-style MixtureDataset).
+
+    Each component is a full DataConfigFactory — its own repo_id, transforms,
+    episode filters, and norm stats — paired with a sampling weight. At train
+    time every sample is drawn by first picking a component with probability
+    proportional to its weight, then sampling uniformly within that component
+    (see data_loader.WeightedMixtureDataset). Small components are revisited
+    more often rather than exhausted, so the mixture ratio holds in expectation
+    regardless of relative dataset sizes.
+
+    Norm stats: every component loads its own stats keyed by its asset_id. If
+    the components are the same robot/embodiment, point them at one shared
+    asset via ``assets=AssetsConfig(asset_id=...)`` (or compute mixture-level
+    stats with scripts/compute_norm_stats.py, which samples with these same
+    weights and writes to the primary component's asset_id) so all components
+    are normalized identically.
+
+    ``create()`` returns the *primary* (first) component's DataConfig; that is
+    what gets saved into checkpoints (norm stats, prompt) and returned by
+    DataLoader.data_config(), so order components accordingly.
+    """
+
+    # Unused: every component carries its own repo_id. Pinned + suppressed so
+    # tyro doesn't require --data.repo-id for mixture configs.
+    repo_id: tyro.conf.Suppress[str] = "mixture"
+
+    # One DataConfigFactory per dataset, in priority order (first = primary).
+    # Suppressed from the CLI (nested factories aren't flag-expressible);
+    # define components in the config, override weights from the CLI.
+    components: tyro.conf.Suppress[Sequence[DataConfigFactory]] = ()
+    # Sampling probability per component (same order). Normalized internally;
+    # must be positive, e.g. (0.8, 0.2) draws 80% of samples from components[0].
+    weights: Sequence[float] = ()
+    # Virtual epoch length of the mixture. 0 → sum of component lengths.
+    mixture_length: int = 0
+    require_shared_normalization: bool = False
+
+    def _validate(self) -> None:
+        if not self.components:
+            raise ValueError("MixtureDataConfigFactory requires at least one component.")
+        if len(self.components) != len(self.weights):
+            raise ValueError(
+                f"Got {len(self.components)} components but {len(self.weights)} weights."
+            )
+        weights = [float(w) for w in self.weights]
+        if any(not math.isfinite(w) or w <= 0 for w in weights):
+            raise ValueError(f"Mixture weights must be positive and finite, got {weights}.")
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        self._validate()
+        return self.components[0].create(assets_dirs, model_config)
+
+    def create_components(
+        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
+    ) -> list[tuple[DataConfig, float]]:
+        """Create every component's DataConfig, paired with its normalized weight."""
+        self._validate()
+        scale = max(self.weights)
+        scaled = [float(weight) / scale for weight in self.weights]
+        total = sum(scaled)
+        return [
+            (component.create(assets_dirs, model_config), float(weight) / total)
+            for component, weight in zip(self.components, scaled, strict=True)
+        ]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4556,6 +4635,48 @@ _CONFIGS = [
         save_interval=5_000,
         keep_period=5_000,
         rabc_enabled=True,
+    ),
+    #
+    # Weighted dataset mixtures (see MixtureDataConfigFactory / WeightedMixtureDataset).
+    #
+    # Data-pipeline debug config: exercises the mixture path end-to-end on fake data.
+    TrainConfig(
+        name="debug_mixture",
+        exp_name="debug",
+        data=MixtureDataConfigFactory(
+            components=(FakeDataConfig(), FakeDataConfig()),
+            weights=(0.75, 0.25),
+        ),
+        batch_size=8,
+        num_train_steps=10,
+        wandb_enabled=False,
+    ),
+    # Example: 80/20 mixture of two YAM datasets. Copy this and swap in your
+    # own repo_ids/weights. The first component is the primary: its norm stats
+    # and prompt are saved into checkpoints. Run compute_norm_stats.py on this
+    # config to compute mixture-weighted stats under the primary asset_id, and
+    # point both components' AssetsConfig at that asset_id so every component
+    # normalizes identically.
+    TrainConfig(
+        name="pi0_yam_mixture_example",
+        model=pi0_config.Pi0Config(),
+        data=MixtureDataConfigFactory(
+            components=(
+                LeRobotYamDataConfig(
+                    repo_id="uynitsuj/yam_bimanual_load_dishes_absolute",
+                    default_prompt="Load dishes onto tabletop dishrack",
+                    base_config=DataConfig(prompt_from_task=True),
+                ),
+                LeRobotYamDataConfig(
+                    repo_id="industrial_packing_yam",
+                    default_prompt="industrial packing",
+                    base_config=DataConfig(prompt_from_task=True),
+                ),
+            ),
+            weights=(0.8, 0.2),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

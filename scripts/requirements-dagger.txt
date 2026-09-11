@@ -1,0 +1,5 @@
+# Extra offline conversion dependencies, on top of the locked OpenPI environment.
+# uv run --with-requirements scripts/requirements-dagger.txt ...
+mcap==1.4.0
+mcap-protobuf-support==0.5.4
+av==15.1.0

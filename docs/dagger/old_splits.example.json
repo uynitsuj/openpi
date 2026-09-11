@@ -1,0 +1,10 @@
+{
+  "repo_id": "siemens_simple_d405_v12dj_recent",
+  "image_modes": {"top": "center_crop", "left": "center_crop", "right": "center_crop"},
+  "action_order": "driver",
+  "action_source": "leader_joint_targets",
+  "episodes": [
+    {"episode_index": 0, "id": "REPLACE_original_episode_0", "group": "REPLACE_original_session_train", "split": "train"},
+    {"episode_index": 1, "id": "REPLACE_original_episode_1", "group": "REPLACE_original_session_val", "split": "val"}
+  ]
+}

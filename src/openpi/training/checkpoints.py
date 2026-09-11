@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as futures
 import dataclasses
+import json
 import logging
 import subprocess
 from typing import Protocol
@@ -88,6 +89,10 @@ def save_state(
     def save_assets(directory: epath.Path):
         # Save the normalization stats.
         data_config = data_loader.data_config()
+        if data_config.training_provenance is not None:
+            (directory / "dagger_training.json").write_text(
+                json.dumps(data_config.training_provenance, indent=2, allow_nan=False) + "\n"
+            )
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
             _normalize.save(directory / data_config.asset_id, norm_stats)

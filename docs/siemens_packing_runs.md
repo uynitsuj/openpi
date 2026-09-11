@@ -1,5 +1,10 @@
 # Siemens industrial packing — run ledger
 
+For new Market42 corrective-training rounds, see
+[DAgger training guidance](market42_dagger_training.md), including action-source
+validation, recorded controller tuning, and the distinction between ABC's paper
+recipe and its released code.
+
 ## simple-D405 line (2026-09-01/02) — DataEngine job 01a046a8-5ed0-7ea1-9064-f173a747688f
 
 All-D405 (sz_44) "simple" variant of the packing task; plain LeRobot yam pipeline

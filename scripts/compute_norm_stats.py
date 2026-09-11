@@ -86,11 +86,56 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
+def create_mixture_torch_dataloader(
+    config: _config.TrainConfig,
+    max_frames: int | None = None,
+) -> tuple[_data_loader.Dataset, int]:
+    """Norm-stats loader over a weighted mixture. Samples components with the
+    same probabilities as training, so the stats match the distribution the
+    model actually sees. Stats are written to the primary component's asset_id
+    — point every component's AssetsConfig at that asset_id so they all
+    normalize identically."""
+    assert isinstance(config.data, _config.MixtureDataConfigFactory)
+    components = config.data.create_components(config.assets_dirs, config.model)
+    datasets = []
+    for data_config, _ in components:
+        if data_config.repo_id is None:
+            raise ValueError("Every mixture component must have a repo_id")
+        dataset = _data_loader.create_torch_dataset(data_config, config.model.action_horizon, config.model)
+        datasets.append(
+            _data_loader.TransformedDataset(
+                dataset,
+                [
+                    *data_config.repack_transforms.inputs,
+                    *data_config.data_transforms.inputs,
+                    RemoveStrings(),
+                ],
+            )
+        )
+    dataset = _data_loader.WeightedMixtureDataset(datasets, [w for _, w in components], seed=config.seed)
+    # Each mixture index is an independent weighted draw, so a sequential
+    # prefix is already an unbiased sample — no shuffle needed for max_frames.
+    if max_frames is not None and max_frames < len(dataset):
+        num_batches = max_frames // config.batch_size
+    else:
+        num_batches = len(dataset) // config.batch_size
+    data_loader = _data_loader.TorchDataLoader(
+        dataset,
+        local_batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        shuffle=False,
+        num_batches=num_batches,
+    )
+    return data_loader, num_batches
+
+
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    if data_config.rlds_data_dir is not None:
+    if isinstance(config.data, _config.MixtureDataConfigFactory):
+        data_loader, num_batches = create_mixture_torch_dataloader(config, max_frames)
+    elif data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
             data_config, config.model.action_horizon, config.batch_size, max_frames
         )
@@ -108,7 +153,9 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    # asset_id is where _load_norm_stats reads from (it defaults to repo_id);
+    # for mixtures this is the primary component's asset_id.
+    output_path = config.assets_dirs / (data_config.asset_id or data_config.repo_id)
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

@@ -244,6 +244,12 @@ def build_val_batches(
 
     from openpi.training.abc_layout_dataset import AbcLayoutDataset  # noqa: PLC0415
 
+    if isinstance(config.data, _config.MixtureDataConfigFactory):
+        loader = _data_loader.create_mixture_torch_data_loader(
+            config, validation=True, num_batches=config.num_val_batches,
+        )
+        return [jax.device_get(batch) for batch in loader]
+
     data_config = config.data.create(config.assets_dirs, config.model)
     if getattr(data_config, "abc_layout", False):
         val_root = HF_LEROBOT_HOME / data_config.repo_id / "val"

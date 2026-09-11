@@ -1,0 +1,16 @@
+{
+  "initial_checkpoint": "/data/checkpoints/pi05_siemens_simple_d405_v12dj_recent_bs128/REPLACE_RUN/19999",
+  "old_dataset_root": "/data/datasets/siemens_simple_d405_v12dj_recent",
+  "old_split_manifest": "/data/old_splits.json",
+  "dagger_root": "/data/market42_dagger_round1",
+  "exp_name": "siemens_v12_dagger_round1_80_10_10",
+  "weights": [0.8, 0.1, 0.1],
+  "num_train_steps": 20000,
+  "batch_size": 128,
+  "num_workers": 8,
+  "fsdp_devices": 2,
+  "seed": 0,
+  "checkpoint_base_dir": "/data/checkpoints",
+  "learning_rate": 0.00001,
+  "wandb_enabled": false
+}

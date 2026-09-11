@@ -24,6 +24,8 @@ import torch
 
 import openpi.models.model as _model
 import openpi.training.config as _config
+from openpi.training.dagger_dataset import DaggerDataset
+from openpi.training.dagger_dataset import full_chunk_starts
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
@@ -127,6 +129,64 @@ class RejectionSamplingTransformedDataset(Dataset[T_co]):
         return self._n
 
 
+class WeightedMixtureDataset(Dataset[T_co]):
+    """Weighted mixture over map-style datasets (abc-style MixtureDataset).
+
+    Each ``__getitem__(index)`` treats the index purely as an RNG seed: pick a
+    component with probability proportional to its weight, then draw a uniform
+    random sample within that component. Shuffling over ``range(len(self))``
+    therefore yields an i.i.d. weighted stream — the mixture ratio holds
+    exactly in expectation regardless of relative component sizes (small
+    components are resampled more often rather than exhausted).
+
+    Deterministic: (seed, index) always maps to the same underlying sample, so
+    runs are reproducible and epochs re-visit the same virtual catalog.
+    """
+
+    def __init__(
+        self,
+        datasets: Sequence[Dataset],
+        weights: Sequence[float],
+        *,
+        length: int | None = None,
+        seed: int = 0,
+    ):
+        if not datasets:
+            raise ValueError("WeightedMixtureDataset requires at least one dataset.")
+        if len(datasets) != len(weights):
+            raise ValueError(f"Got {len(datasets)} datasets but {len(weights)} weights.")
+        w = np.asarray(weights, dtype=np.float64)
+        if np.any(~np.isfinite(w)) or np.any(w <= 0):
+            raise ValueError(f"Mixture weights must be positive and finite, got {weights}.")
+        self._datasets = list(datasets)
+        self._sizes = [len(d) for d in self._datasets]
+        if any(s == 0 for s in self._sizes):
+            raise ValueError("All mixture components must be non-empty.")
+        w = w / w.max()  # Avoid overflow when individually finite weights have a huge sum.
+        self._weights = w / w.sum()
+        self._length = int(length) if length is not None else int(sum(self._sizes))
+        if self._length <= 0:
+            raise ValueError(f"Mixture length must be positive, got {self._length}.")
+        self._seed = seed
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        comp, inner = self.locate(index)
+        return self._datasets[comp][inner]
+
+    def locate(self, index: SupportsIndex) -> tuple[int, int]:
+        """Audit a virtual draw without decoding an image or applying transforms."""
+        idx = int(index)
+        if not 0 <= idx < self._length:
+            raise IndexError(f"Index {idx} out of range for mixture of length {self._length}.")
+        rng = np.random.default_rng([self._seed, idx])
+        comp = int(rng.choice(len(self._datasets), p=self._weights))
+        inner = int(rng.integers(0, self._sizes[comp]))
+        return comp, inner
+
+    def __len__(self) -> int:
+        return self._length
+
+
 class IterableTransformedDataset(IterableDataset[T_co]):
     def __init__(
         self,
@@ -202,6 +262,12 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
+    if data_config.dagger_root is not None:
+        return DaggerDataset(
+            data_config.dagger_root, authority=data_config.dagger_authority,
+            split=data_config.dagger_split, horizon=action_horizon,
+        )
+
     if data_config.abc_layout:
         # ABC training layout (MCAP export): abc's random-access loader instead of
         # LeRobotDataset. The dataset emits "prompt" directly (episode task_name),
@@ -215,7 +281,8 @@ def create_torch_dataset(
             HF_LEROBOT_HOME / repo_id, action_horizon=action_horizon, station_types=station_types
         )
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    root_kwargs = {"root": pathlib.Path(data_config.local_dataset_root)} if data_config.local_dataset_root else {}
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, **root_kwargs)
     delta_ts = [t / dataset_meta.fps for t in range(action_horizon)]
     delta_timestamps = {key: delta_ts for key in data_config.action_sequence_keys}
     # Extra keys (e.g., repromo_signed_magnitude) get a possibly-longer
@@ -229,12 +296,33 @@ def create_torch_dataset(
     for key in data_config.extra_horizon_keys:
         delta_timestamps[key] = delta_ts_extra
     episodes = list(data_config.episodes) if data_config.episodes is not None else None
-    dataset = lerobot_dataset.LeRobotDataset(
+    video_kwargs = {"video_backend": data_config.video_backend} if data_config.video_backend else {}
+    dataset_class = lerobot_dataset.LeRobotDataset
+    if data_config.video_backend == "pyav":
+        from openpi.training.lerobot_pyav import PyAvLeRobotDataset  # noqa: PLC0415
+
+        dataset_class = PyAvLeRobotDataset
+    dataset = dataset_class(
         data_config.repo_id,
         delta_timestamps=delta_timestamps,
         tolerance_s=0.04,  # 40ms tolerance for slight FPS mismatch (e.g., 29.58 vs 30)
         episodes=episodes,
+        **root_kwargs,
+        **video_kwargs,
     )
+
+    if data_config.full_action_chunks:
+        episode_ids = np.asarray(dataset.hf_dataset["episode_index"])
+        frames = np.asarray(dataset.hf_dataset["frame_index"])
+        timestamps = np.asarray(dataset.hf_dataset["timestamp"])
+        valid = np.isfinite(timestamps)
+        valid[1:] &= (np.diff(episode_ids) != 0) | (
+            (np.diff(frames) == 1) & np.isclose(np.diff(timestamps), 1 / dataset_meta.fps, atol=1e-4, rtol=0)
+        )
+        indices = full_chunk_starts(valid, episode_ids, action_horizon)
+        if not len(indices):
+            raise ValueError(f"No complete action chunks in {repo_id}")
+        dataset = torch.utils.data.Subset(dataset, indices)
 
     if data_config.prompt_from_task:
         # v3 lerobot returns tasks as a pandas DataFrame (task as index, task_index as column);
@@ -767,6 +855,16 @@ def create_data_loader(
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
     """
+    if isinstance(config.data, _config.MixtureDataConfigFactory):
+        return create_mixture_torch_data_loader(
+            config,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            skip_norm_stats=skip_norm_stats,
+            framework=framework,
+        )
+
     data_config = config.data.create(config.assets_dirs, config.model)
     # When RABC is disabled at the train-loop level (loss doesn't multiply by
     # sample_weights), skip the subset filter too — vanilla BC should see
@@ -805,6 +903,91 @@ def create_data_loader(
     )
 
 
+def create_mixture_torch_data_loader(
+    config: _config.TrainConfig,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    skip_norm_stats: bool = False,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    framework: str = "jax",
+    validation: bool = False,
+) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    """Create a data loader over a weighted mixture of datasets.
+
+    Each component of the MixtureDataConfigFactory is built into its own fully
+    transformed dataset (own repack/data/model transforms, norm stats, episode
+    filters, RABC subset), then combined with WeightedMixtureDataset so every
+    draw picks a component by its sampling probability. The returned loader
+    reports the primary (first) component's DataConfig via ``data_config()``.
+    """
+    assert isinstance(config.data, _config.MixtureDataConfigFactory)
+    components = config.data.create_components(config.assets_dirs, config.model)
+
+    if config.data.require_shared_normalization and not skip_norm_stats:
+        primary = components[0][0]
+        for component, _ in components:
+            if component.norm_stats is None or primary.norm_stats is None:
+                raise ValueError("DAgger mixtures require shared checkpoint normalization stats")
+            if component.use_quantile_norm != primary.use_quantile_norm or component.norm_stats.keys() != primary.norm_stats.keys():
+                raise ValueError("Mixture normalization modes/keys differ")
+            for key, stats in primary.norm_stats.items():
+                for field_name in ("mean", "std", "q01", "q99"):
+                    if not np.array_equal(getattr(stats, field_name), getattr(component.norm_stats[key], field_name)):
+                        raise ValueError(f"Mixture normalization differs: {key}/{field_name}")
+
+    datasets = []
+    weights = []
+    for data_config, weight in components:
+        if validation:
+            if data_config.dagger_root:
+                data_config = dataclasses.replace(data_config, dagger_split="val")
+            elif data_config.val_episodes:
+                data_config = dataclasses.replace(data_config, episodes=data_config.val_episodes)
+            else:
+                raise ValueError(f"Mixture component {data_config.repo_id} has no validation split")
+        if data_config.rlds_data_dir is not None:
+            raise NotImplementedError(
+                "RLDS components are not supported in a mixture — use DataConfig.datasets "
+                "for RLDS-level dataset mixing instead."
+            )
+        # Match the single-dataset path: when the train loop doesn't consume
+        # sample_weights, don't let the RABC subset filter drop samples.
+        if not getattr(config, "rabc_enabled", False) and getattr(
+            data_config, "reject_zero_weighted_samples", False
+        ):
+            data_config = dataclasses.replace(data_config, reject_zero_weighted_samples=False)  # noqa: PLW2901
+        dataset = build_torch_dataset(
+            data_config, config.model, config.model.action_horizon, skip_norm_stats=skip_norm_stats
+        )
+        logging.info(
+            f"[mixture] weight={weight:.4f} samples={len(dataset):,} data_config: {data_config}"
+        )
+        datasets.append(dataset)
+        weights.append(weight)
+
+    mixture = WeightedMixtureDataset(
+        datasets,
+        weights,
+        length=(config.data.mixture_length or None),
+        seed=config.seed + int(validation),
+    )
+    logging.info(f"[mixture] virtual length={len(mixture):,} over {len(datasets)} components")
+
+    primary_config = components[0][0]
+    return _wrap_torch_dataset(
+        mixture,
+        primary_config,
+        config.batch_size,
+        sharding=sharding,
+        shuffle=shuffle,
+        num_batches=num_batches,
+        num_workers=config.num_workers,
+        seed=config.seed,
+        framework=framework,
+    )
+
+
 def create_torch_data_loader(
     data_config: _config.DataConfig,
     model_config: _model.BaseModelConfig,
@@ -836,6 +1019,28 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
+    dataset = build_torch_dataset(data_config, model_config, action_horizon, skip_norm_stats=skip_norm_stats)
+    return _wrap_torch_dataset(
+        dataset,
+        data_config,
+        batch_size,
+        sharding=sharding,
+        shuffle=shuffle,
+        num_batches=num_batches,
+        num_workers=num_workers,
+        seed=seed,
+        framework=framework,
+    )
+
+
+def build_torch_dataset(
+    data_config: _config.DataConfig,
+    model_config: _model.BaseModelConfig,
+    action_horizon: int,
+    *,
+    skip_norm_stats: bool = False,
+) -> Dataset:
+    """Create + transform a single torch dataset, applying the RABC subset filter when configured."""
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
@@ -883,6 +1088,22 @@ def create_torch_data_loader(
                 f"[rabc_subset] training over {len(dataset):,} valid samples"
             )
 
+    return dataset
+
+
+def _wrap_torch_dataset(
+    dataset: Dataset,
+    data_config: _config.DataConfig,
+    batch_size: int,
+    *,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    num_workers: int = 0,
+    seed: int = 0,
+    framework: str = "jax",
+) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    """Wrap a built dataset in the sampler + TorchDataLoader + DataLoaderImpl stack."""
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
     # For JAX, divide by process count

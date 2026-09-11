@@ -80,6 +80,12 @@ run: |
     --push-to-hub false
   rm -rf "$HOME/.cache/huggingface/lerobot/${REPO_NAME}_old"
 
+  # Provenance guarantee: the v3.0 migration rebuilds meta/ and drops the manifest;
+  # restore the parent-dir survivor copy INTO the migrated dataset so the S3 sync
+  # ships it. Hard-fails (set -e) if the converter didn't write it.
+  cp "$HOME/.cache/huggingface/lerobot/${REPO_NAME}_source_manifest.csv" \
+     "$HOME/.cache/huggingface/lerobot/$REPO_NAME/meta/source_manifest.csv"
+
   echo "[3/5] Sanity-loading the converted dataset"
   python - <<'PYEOF'
   import os
@@ -91,6 +97,11 @@ run: |
   to_idx = ds.meta.episodes["dataset_to_index"][-1]
   assert to_idx == ds.num_frames == len(ds.hf_dataset), (to_idx, ds.num_frames, len(ds.hf_dataset))
   print("episode boundary check OK")
+  import csv
+  mp = os.path.expanduser(f"~/.cache/huggingface/lerobot/{repo}/meta/source_manifest.csv")
+  n_manifest = sum(1 for _ in csv.DictReader(open(mp)))
+  assert n_manifest == ds.num_episodes, f"source_manifest rows {n_manifest} != episodes {ds.num_episodes}"
+  print(f"source manifest OK ({n_manifest} rows)")
   PYEOF
 
   echo "[4/5] Uploading dataset to $S3_DATASET_PATH"

@@ -5,6 +5,7 @@ import dataclasses
 import importlib
 import json
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,6 @@ from openpi.training import data_loader
 from openpi.training.dagger_config import build_config
 from openpi.training.dagger_config import load_plan
 from openpi.training.dagger_dataset import read_json
-from openpi.training.dagger_dataset import write_json
 
 train = importlib.import_module("scripts.train" if __package__ else "train")
 
@@ -107,7 +107,12 @@ def main():
         validate_resume(config, resume=args.resume)
     report = preflight(config)
     if args.report:
-        write_json(args.report, report)
+        # Reports are diagnostics, not export artifacts: overwrite atomically
+        # rather than fail-closed (a stale report from an interrupted run must
+        # not crash a preflight that has already passed every check).
+        tmp = args.report.with_suffix(args.report.suffix + ".tmp")
+        tmp.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+        os.replace(tmp, args.report)
     logging.info("DAgger preflight passed: %s", json.dumps(report))
     if args.train:
         train.main(dataclasses.replace(config, resume=args.resume))

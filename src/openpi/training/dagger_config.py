@@ -72,20 +72,21 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
     if len(plan.weights) != 3 or any(not np.isfinite(w) or w < 0 for w in plan.weights) or plan.weights[0] <= 0:
         raise ValueError("Expected nonnegative weights for old / new teleop / new policy, with positive old weight")
     base = config_lib.get_config(plan.base_config)
-    # Explicit allowlist of old-dataset lineages: all are center-crop-all-cams,
-    # driver-order leader-target descendants of the audited v12 recipe. The
-    # v13 entries support the 2026-09-11 old-dataset ablation.
-    allowed_base_configs = (
-        "pi05_siemens_simple_d405_v12dj_recent_bs128",
-        "pi05_siemens_simple_d405_v13dj_recent_bs128",
-        "pi05_siemens_simple_d405_v13short25cc_bs128",
+    # The continuation checkpoint lineage is v12 (the policy family that
+    # generated the DAgger data); its config supplies the model, prompt, and
+    # normalization assets. The OLD DATASET is ablatable across an explicit
+    # allowlist of center-crop-all-cams, driver-order leader-target v12
+    # descendants (2026-09-11 ablation: v13dj_recent, v13short25cc) — all
+    # normalized with the checkpoint's v12 stats, never their own.
+    if plan.base_config != "pi05_siemens_simple_d405_v12dj_recent_bs128":
+        raise ValueError("This DAgger recipe continues the audited v12 checkpoint lineage; add others explicitly")
+    allowed_old_repos = (
+        "siemens_simple_d405_v12dj_recent",
+        "siemens_simple_d405_v13dj_recent",
+        "siemens_simple_d405_v13short25cc",
     )
-    if plan.base_config not in allowed_base_configs:
-        raise ValueError(f"DAgger recipe supports {allowed_base_configs}; add other lineages explicitly")
-    if base.data.repo_id != plan.old_repo_id:
-        raise ValueError(
-            f"Plan old_repo_id {plan.old_repo_id!r} does not match base config dataset {base.data.repo_id!r}"
-        )
+    if plan.old_repo_id not in allowed_old_repos:
+        raise ValueError(f"Old dataset must be one of the attested cc lineages {allowed_old_repos}")
     if plan.pre_intervention_exclude_chunks < 0:
         raise ValueError("pre_intervention_exclude_chunks must be non-negative")
     initial = Path(plan.initial_checkpoint)

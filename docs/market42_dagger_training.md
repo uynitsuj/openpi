@@ -524,13 +524,13 @@ segments that run to episode end are untouched. Note the proportional
 multi-root weight split uses manifest chunk counts, which do not account for
 this filter (an acceptable approximation).
 
-The old-dataset lineage is ablatable across an explicit allowlist —
-`pi05_siemens_simple_d405_{v12dj_recent,v13dj_recent,v13short25cc}_bs128`, all
-center-crop-all-cams driver-order leader-target descendants of the audited v12
-recipe; the plan's `old_repo_id` must match the base config's dataset. The
-2026-09-11 plan matrix (2 mixtures × 3 lineages) lives at
-`/nfs_exp/karim/market42_dagger/plans/`; the short25cc pair awaits its 20k
-checkpoint (training was at step 5000 when written). Exports delivered without
+The initial checkpoint is always the v12 20k lineage (the policy family that
+generated the DAgger data), and every component is normalized with that
+checkpoint's v12 stats. The OLD DATASET is ablatable across an explicit
+allowlist — `siemens_simple_d405_{v12dj_recent,v13dj_recent,v13short25cc}` —
+all center-crop-all-cams driver-order leader-target v12 descendants. The
+2026-09-11 plan matrix (2 mixtures × 3 old-data arms, all from the v12 20k
+checkpoint) lives at `/nfs_exp/karim/market42_dagger/plans/`. Exports delivered without
 review (e.g. the us05 success-only export) get the batch policy applied **in
 place** with [`apply_batch_review.py`](../scripts/yam_data/apply_batch_review.py)
 — it rewrites the `reviewed` masks over recorded authority segments for

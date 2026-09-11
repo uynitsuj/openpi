@@ -439,13 +439,21 @@ manifests use `assumed_command_ramp_s: 1.5` (exclusion 1.6 s with the guard).
 ### Round-1 preparation (2026-09-11)
 
 [`build_market42_review.py`](../scripts/yam_data/build_market42_review.py)
-generated review manifests over the three collections (107/108 episodes; one
-0910 episode excluded for non-monotonic camera timestamps), encoding an
-**episode-level batch policy, not interval-level human scrubbing**: teleop
-segments approved for every completed episode, policy segments approved only
-for operator-marked successes (19 of 63 0910 episodes failed; their autonomous
-segments are excluded). Groups are per-collection hour blocks; val groups are
-deterministic and identical across both image-mode variants:
+generated review manifests over the three collections (88 episodes converted:
+one 0910 episode excluded for non-monotonic camera timestamps, and the 19
+operator-marked failures excluded entirely — decided 2026-09-11; the
+`--failed-episodes teleop_only` flag preserves the ABC/HG-DAgger-style
+alternative of retaining failures' correction segments, worth revisiting as an
+experiment arm since those corrections were ~19% of teleop chunks). The policy
+is **episode-level batch review, not interval-level human scrubbing**: teleop
+approved for successes, policy segments likewise successes-only. Groups are
+per-collection hour blocks; val groups are deterministic and identical across
+both image-mode variants. Eligible 30-action chunks: train 47,834 teleop +
+1,722 policy; val 20,390 teleop + 868 policy (identical across variants;
+data.npz bit-identical cc vs tc). Policy chunks are thin relative to approved
+policy time because bursty policy command publishing trips the 50 ms freshness
+gate and each of the 288 handoffs excludes 1.6 s — a future round could
+consider a segment-aware freshness bound, evidence first.
 
 - `/nfs_exp/karim/market42_dagger/review_round1_cc.json` → `round1_cc/`
   (all three cameras center-cropped; v12 lineage)

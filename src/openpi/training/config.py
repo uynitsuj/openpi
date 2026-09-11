@@ -2808,7 +2808,7 @@ _CONFIGS = [
             repo_id="siemens_simple_d405_v13short25ccf",
             default_prompt="Pack one transparent bag into the cardboard box and flatten the bag.",
             base_config=DataConfig(prompt_from_task=True),
-            val_frac=10 / 1986,  # PROVISIONAL: ~1986 eps (shortest 25%); refine to converted count post-conversion
+            val_frac=10 / 1981,  # converted count (fast preselect path; 99% same set as non-f variants)
             val_seed=0,
         ),
         batch_size=128,
@@ -2829,7 +2829,7 @@ _CONFIGS = [
             repo_id="siemens_simple_d405_v13short25tcf",
             default_prompt="Pack one transparent bag into the cardboard box and flatten the bag.",
             base_config=DataConfig(prompt_from_task=True),
-            val_frac=10 / 1986,  # PROVISIONAL: ~1986 eps (shortest 25%); refine to converted count post-conversion
+            val_frac=10 / 1980,  # converted count (fast preselect path; 99% same set as non-f variants)
             val_seed=0,
         ),
         batch_size=128,

@@ -196,6 +196,20 @@ def test_full_chunks_exclude_internal_gaps_and_same_authority_reentry():
     assert not len(full_chunk_starts(np.ones(29, bool), np.ones(29), 30))
 
 
+def test_pre_intervention_tail_masks_only_policy_before_takeover():
+    from openpi.training.dagger_dataset import pre_intervention_tail
+
+    # policy(0) -> teleop(1) -> policy(2, runs to end) with an unknown gap.
+    segment = np.array([0] * 10 + [1] * 8 + [-1] * 3 + [2] * 10)
+    authority = np.array([1] * 10 + [2] * 8 + [0] * 3 + [1] * 10)
+    tail = pre_intervention_tail(segment, authority, 4)
+    assert tail[6:10].all() and not tail[:6].any()  # last 4 frames of policy seg 0
+    assert not tail[10:].any()  # teleop and end-of-episode policy untouched
+    # A tail longer than the segment masks the whole segment, nothing else.
+    assert pre_intervention_tail(segment, authority, 99)[:10].all()
+    assert not pre_intervention_tail(segment, authority, 0).any()
+
+
 @pytest.mark.parametrize("scale", [1, 1000, 1e6, 1e9])
 def test_timestamp_units(scale):
     ts = EPOCH + np.arange(5) / 30

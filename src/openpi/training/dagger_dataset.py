@@ -45,6 +45,26 @@ def full_chunk_starts(valid: np.ndarray, segment: np.ndarray, horizon: int) -> n
     return starts[keep]
 
 
+def pre_intervention_tail(segment: np.ndarray, authority: np.ndarray, tail_frames: int) -> np.ndarray:
+    """Frames in the last `tail_frames` of any policy segment that is
+    immediately followed by a teleop segment — Sirius-style: the autonomous
+    actions right before a takeover are the likeliest cause of the
+    intervention and should not become training targets. Policy segments with
+    no following intervention (e.g. running to episode end) are untouched.
+    """
+    if tail_frames <= 0:
+        return np.zeros(len(segment), dtype=bool)
+    mask = np.zeros(len(segment), dtype=bool)
+    ids = sorted({int(s) for s in np.unique(segment) if s >= 0})
+    first_authority = {seg_id: int(authority[segment == seg_id][0]) for seg_id in ids}
+    for seg_id in ids:
+        followed_by_teleop = first_authority.get(seg_id + 1) == AUTHORITY["teleop"]
+        if first_authority[seg_id] == AUTHORITY["policy"] and followed_by_teleop:
+            indices = np.nonzero(segment == seg_id)[0]
+            mask[indices[-tail_frames:]] = True
+    return mask
+
+
 def decode_frame(path: Path, frame_index: int) -> np.ndarray:
     """Seek a validated CFR export; decode from its preceding keyframe."""
     with av.open(str(path)) as container:
@@ -64,14 +84,29 @@ def decode_frame(path: Path, frame_index: int) -> np.ndarray:
 class DaggerDataset:
     """One reviewed authority/split, uniformly indexed by eligible chunk start."""
 
-    def __init__(self, root: str | Path, *, authority: str, split: str, horizon: int):
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        authority: str,
+        split: str,
+        horizon: int,
+        pre_intervention_exclude_chunks: int = 0,
+    ):
         self.root = Path(root)
         self.manifest = read_json(self.root / "manifest.json")
         if self.manifest.get("format") != FORMAT or self.manifest.get("fps") != 30:
             raise ValueError("Unsupported DAgger export; reconvert with convert_market42_dagger.py")
         if authority not in AUTHORITY or split not in ("train", "val"):
             raise ValueError("Expected policy/teleop authority and train/val split")
+        if pre_intervention_exclude_chunks < 0:
+            raise ValueError("pre_intervention_exclude_chunks must be non-negative")
         self.authority, self.split, self.horizon = authority, split, horizon
+        # Sirius-style: drop the last N action chunks of policy segments that
+        # end in a takeover (only meaningful for the policy authority).
+        self.pre_intervention_tail_frames = (
+            pre_intervention_exclude_chunks * horizon if authority == "policy" else 0
+        )
         self.episodes = []
         self.starts = []
         self.arrays = []
@@ -120,6 +155,10 @@ class DaggerDataset:
             if not np.allclose(np.diff(data["timestamps"]), 1 / 30, atol=1e-6, rtol=0):
                 raise ValueError("Non-contiguous 30 Hz export timeline")
             valid = data["valid"] & data["reviewed"] & (data["authority"] == AUTHORITY[authority])
+            if self.pre_intervention_tail_frames:
+                valid &= ~pre_intervention_tail(
+                    data["segment"], data["authority"], self.pre_intervention_tail_frames
+                )
             starts = full_chunk_starts(valid, data["segment"], horizon)
             if len(starts):
                 self.episodes.append({**episode, "path": directory})

@@ -132,6 +132,10 @@ class DataConfig:
     dagger_root: str | None = None
     dagger_authority: str = "teleop"
     dagger_split: str = "train"
+    # Sirius-style: exclude the last N action chunks of policy segments that
+    # end in a takeover (the autonomous failure that likely caused the
+    # intervention). Only affects dagger_authority="policy"; 0 disables.
+    dagger_pre_intervention_exclude_chunks: int = 0
     training_provenance: dict[str, Any] | None = None
 
     # If True, the data loader filters out samples whose RABC weight is 0 so

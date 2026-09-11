@@ -37,6 +37,9 @@ class TrainingPlan:
     # 2026-09-11 decision: no autonomous-rollout training (0.0); the
     # ABC-inspired [0.8, 0.1, 0.1] remains a plan-level override.
     weights: tuple[float, ...] = (0.8, 0.2, 0.0)
+    # Sirius-style: exclude the last N action chunks of policy segments that
+    # end in a takeover (only meaningful when the rollout weight is > 0).
+    pre_intervention_exclude_chunks: int = 0
     num_train_steps: int = 20_000
     batch_size: int = 128
     num_workers: int = 8
@@ -69,9 +72,22 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
     if len(plan.weights) != 3 or any(not np.isfinite(w) or w < 0 for w in plan.weights) or plan.weights[0] <= 0:
         raise ValueError("Expected nonnegative weights for old / new teleop / new policy, with positive old weight")
     base = config_lib.get_config(plan.base_config)
-    # This recipe deliberately preserves the verified v12 camera/action lineage.
-    if plan.base_config != "pi05_siemens_simple_d405_v12dj_recent_bs128":
-        raise ValueError("This initial DAgger recipe supports the audited v12 config; add other lineages explicitly")
+    # Explicit allowlist of old-dataset lineages: all are center-crop-all-cams,
+    # driver-order leader-target descendants of the audited v12 recipe. The
+    # v13 entries support the 2026-09-11 old-dataset ablation.
+    allowed_base_configs = (
+        "pi05_siemens_simple_d405_v12dj_recent_bs128",
+        "pi05_siemens_simple_d405_v13dj_recent_bs128",
+        "pi05_siemens_simple_d405_v13short25cc_bs128",
+    )
+    if plan.base_config not in allowed_base_configs:
+        raise ValueError(f"DAgger recipe supports {allowed_base_configs}; add other lineages explicitly")
+    if base.data.repo_id != plan.old_repo_id:
+        raise ValueError(
+            f"Plan old_repo_id {plan.old_repo_id!r} does not match base config dataset {base.data.repo_id!r}"
+        )
+    if plan.pre_intervention_exclude_chunks < 0:
+        raise ValueError("pre_intervention_exclude_chunks must be non-negative")
     initial = Path(plan.initial_checkpoint)
     destination = (Path(plan.checkpoint_base_dir) / base.name / plan.exp_name).resolve()
     for source in (initial, Path(plan.old_dataset_root), Path(plan.dagger_root), *map(Path, plan.extra_dagger_roots)):
@@ -272,7 +288,13 @@ def build_config(plan: TrainingPlan) -> config_lib.TrainConfig:
                 repo_id=name,
                 assets=shared_assets,
                 default_prompt=prompt,
-                base_config=config_lib.DataConfig(dagger_root=root, dagger_authority=authority),
+                base_config=config_lib.DataConfig(
+                    dagger_root=root,
+                    dagger_authority=authority,
+                    # Sirius-style pre-takeover exclusion; DaggerDataset only
+                    # applies it to the policy authority.
+                    dagger_pre_intervention_exclude_chunks=plan.pre_intervention_exclude_chunks,
+                ),
             )
         )
         component_weights.append(share)

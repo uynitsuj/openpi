@@ -512,7 +512,25 @@ original identity.
 `extra_dagger_roots` mixes additional exports into the same intervention /
 rollout sources: each authority's weight splits across roots in proportion to
 their eligible train chunks, so sampling stays uniform over the union, and
-duplicate episode IDs across roots are rejected. Exports delivered without
+duplicate episode IDs across roots are rejected.
+
+`pre_intervention_exclude_chunks` (Sirius-style, plan-level) drops the last N
+action chunks of every policy segment that ends in a takeover — the autonomous
+actions that most likely caused the operator to intervene — from the rollout
+source's eligible chunks. It is a loader-time filter, not a data edit: the
+`reviewed` masks keep meaning human review, and the same exports serve plans
+with and without it. Only meaningful when the rollout weight is > 0; policy
+segments that run to episode end are untouched. Note the proportional
+multi-root weight split uses manifest chunk counts, which do not account for
+this filter (an acceptable approximation).
+
+The old-dataset lineage is ablatable across an explicit allowlist —
+`pi05_siemens_simple_d405_{v12dj_recent,v13dj_recent,v13short25cc}_bs128`, all
+center-crop-all-cams driver-order leader-target descendants of the audited v12
+recipe; the plan's `old_repo_id` must match the base config's dataset. The
+2026-09-11 plan matrix (2 mixtures × 3 lineages) lives at
+`/nfs_exp/karim/market42_dagger/plans/`; the short25cc pair awaits its 20k
+checkpoint (training was at step 5000 when written). Exports delivered without
 review (e.g. the us05 success-only export) get the batch policy applied **in
 place** with [`apply_batch_review.py`](../scripts/yam_data/apply_batch_review.py)
 — it rewrites the `reviewed` masks over recorded authority segments for

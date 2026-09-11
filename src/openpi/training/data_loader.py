@@ -266,6 +266,7 @@ def create_torch_dataset(
         return DaggerDataset(
             data_config.dagger_root, authority=data_config.dagger_authority,
             split=data_config.dagger_split, horizon=action_horizon,
+            pre_intervention_exclude_chunks=data_config.dagger_pre_intervention_exclude_chunks,
         )
 
     if data_config.abc_layout:

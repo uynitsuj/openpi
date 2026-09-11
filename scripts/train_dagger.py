@@ -37,10 +37,26 @@ def validate_resume(config, *, resume: bool) -> None:
         raise ValueError("DAgger plan/data/normalization changed; use a new experiment, not --resume")
 
 
-def preflight(config) -> dict:
-    """Decode samples from every source/split before allocating model weights."""
+def preflight(config, mode: str = "full") -> dict:
+    """Validate data/config before allocating model weights.
+
+    full: build every source/split, decode three samples each, audit 10k
+      sampler draws, and exercise a real mixture batch (+ validation batch).
+      Exhaustive but slow — the old-dataset construction and a full-batch
+      decode dominate (an hour-plus on CPU for the 7k-episode datasets).
+    fast: everything cheap that catches real corruption — plan/lineage/manifest
+      validation (build_config already ran), DAgger export checksum + mask
+      verification (their loaders hash every artifact on construction), and
+      one decoded sample per DAgger source. The old LeRobot dataset is NOT
+      pre-built (training constructs it minutes later and fails loudly there),
+      and no full mixture batch is decoded (step 1 of training is that check).
+    skip: build_config validation only.
+    """
+    if mode == "skip":
+        logging.warning("preflight: skipped (plan/lineage validation from build_config only)")
+        return {"mode": "skip", "initial_weights": dataclasses.asdict(config.weight_loader)}
     components = config.data.create_components(config.assets_dirs, config.model)
-    report = {"components": [], "initial_weights": dataclasses.asdict(config.weight_loader)}
+    report = {"mode": mode, "components": [], "initial_weights": dataclasses.asdict(config.weight_loader)}
     # val_interval == 0 means a zero-holdout run: no val split exists to decode
     # or count, and the training loop never builds a validation loader.
     splits = ("train", "val") if config.val_interval > 0 else ("train",)
@@ -56,10 +72,19 @@ def preflight(config) -> dict:
                     if current.dagger_root
                     else dataclasses.replace(current, episodes=current.val_episodes)
                 )
+            if mode == "fast" and current.dagger_root is None:
+                report["components"].append(
+                    {"source": source, "repo": current.repo_id, "split": split, "chunks": None,
+                     "note": "fast mode: old dataset validated at training start"}
+                )
+                if split == "train":
+                    train_sizes.append(None)
+                continue
             dataset = data_loader.build_torch_dataset(current, config.model, config.model.action_horizon)
             if split == "train":
                 train_sizes.append(len(dataset))
-            for index in sorted({0, len(dataset) // 2, len(dataset) - 1}):
+            probe = {0} if mode == "fast" else {0, len(dataset) // 2, len(dataset) - 1}
+            for index in sorted(probe):
                 sample = dataset[index]
                 if sample["actions"].shape != (config.model.action_horizon, config.model.action_dim):
                     raise ValueError("Incorrect transformed action shape")
@@ -68,27 +93,28 @@ def preflight(config) -> dict:
             report["components"].append(
                 {"source": source, "repo": current.repo_id, "split": split, "chunks": len(dataset), "weight": weight}
             )
-    catalog = data_loader.WeightedMixtureDataset(
-        [range(size) for size in train_sizes],
-        [weight for _, weight in components],
-        length=config.data.mixture_length or None,
-        seed=config.seed,
-    )
-    draws = [catalog.locate(index) for index in range(min(10_000, len(catalog)))]
-    report["sampling_audit"] = {
-        "kind": "first virtual catalog indices, not training-order counters",
-        "draws": len(draws),
-        "source_draws": np.bincount([source for source, _ in draws], minlength=len(components)).tolist(),
-        "unique_source_chunks": [
-            len({inner for source, inner in draws if source == i}) for i in range(len(components))
-        ],
-    }
-    # Exercise the actual mixture path, including its shared-normalization gate.
-    loader = data_loader.create_data_loader(config, num_batches=1)
-    next(iter(loader))
-    if config.val_interval > 0:
-        validation = data_loader.create_mixture_torch_data_loader(config, validation=True, num_batches=1)
-        next(iter(validation))
+    if mode == "full":
+        catalog = data_loader.WeightedMixtureDataset(
+            [range(size) for size in train_sizes],
+            [weight for _, weight in components],
+            length=config.data.mixture_length or None,
+            seed=config.seed,
+        )
+        draws = [catalog.locate(index) for index in range(min(10_000, len(catalog)))]
+        report["sampling_audit"] = {
+            "kind": "first virtual catalog indices, not training-order counters",
+            "draws": len(draws),
+            "source_draws": np.bincount([source for source, _ in draws], minlength=len(components)).tolist(),
+            "unique_source_chunks": [
+                len({inner for source, inner in draws if source == i}) for i in range(len(components))
+            ],
+        }
+        # Exercise the actual mixture path, including its shared-normalization gate.
+        loader = data_loader.create_data_loader(config, num_batches=1)
+        next(iter(loader))
+        if config.val_interval > 0:
+            validation = data_loader.create_mixture_torch_data_loader(config, validation=True, num_batches=1)
+            next(iter(validation))
     return report
 
 
@@ -98,6 +124,10 @@ def main():
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--resume", action="store_true", help="Resume this same experiment, not initialize a new round")
     parser.add_argument("--report", type=Path)
+    parser.add_argument(
+        "--preflight", choices=("full", "fast", "skip"), default=None,
+        help="Check depth before training (default: fast with --train, full standalone)",
+    )
     args = parser.parse_args()
     if args.resume and not args.train:
         parser.error("--resume requires --train")
@@ -105,7 +135,8 @@ def main():
     config = build_config(load_plan(args.plan.resolve()))
     if args.train:
         validate_resume(config, resume=args.resume)
-    report = preflight(config)
+    mode = args.preflight or ("fast" if args.train else "full")
+    report = preflight(config, mode=mode)
     if args.report:
         # Reports are diagnostics, not export artifacts: overwrite atomically
         # rather than fail-closed (a stale report from an interrupted run must

@@ -33,7 +33,18 @@ def validate_resume(config, *, resume: bool) -> None:
         raise ValueError("--resume requires a completed checkpoint from this DAgger run")
     saved = read_json(checkpoints[-1] / "assets" / "dagger_training.json")
     expected = config.data.components[0].base_config.training_provenance
-    if saved != json.loads(json.dumps(expected)):
+
+    def _comparable(provenance: dict) -> dict:
+        # Budget/cadence-only extensions are legitimate resumes (e.g. continue
+        # a finished 20k run to 60k with sparser checkpoints); data, weights,
+        # and normalization stay strict.
+        benign = ("num_train_steps", "save_interval", "keep_period", "num_workers")
+        clean = json.loads(json.dumps(provenance))
+        for key in benign:
+            clean.get("plan", {}).pop(key, None)
+        return clean
+
+    if _comparable(saved) != _comparable(json.loads(json.dumps(expected))):
         raise ValueError("DAgger plan/data/normalization changed; use a new experiment, not --resume")
 
 

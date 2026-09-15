@@ -6,6 +6,7 @@ import dataclasses
 import difflib
 import logging
 import math
+import os
 import pathlib
 from typing import Any, Protocol, TypeAlias, List, Literal
 
@@ -1578,6 +1579,17 @@ _WARPBC_TASKS = {
     "bottles": ("put_the_plastic_bottles_in_the_bin_d405_v021", "Put the plastic bottles in the bin", "gs://openpi-assets/checkpoints/pi0_base/params"),
     "tshirt":  ("tshirt_folding_d405_v010_20260420_gop10",      "Folding tshirt pile and stacking",   "s3://xdof-internal-research/model_ckpts/pi0_yam_tshirt_no_rabc/sky_yam_tshirt_rorm_weighted_20260415_000110/39999/params"),
 }
+
+# Portable location for the two masks produced by icrrt's
+# scripts/curate_top_fraction.py. Lambda sessions can mount/copy the sidecars
+# anywhere and set this before invoking Python; the default matches the
+# release-LeRobot runbook and the completed 2026-09-10 training runs.
+_LOAD_PLATES_E12F_SIDECAR_ROOT = pathlib.Path(
+    os.environ.get(
+        "OPENPI_LOAD_PLATES_E12F_SIDECAR_ROOT",
+        "/home/ubuntu/karim/sidecars/real_load_plates_lerobot_v1/e12f_top50",
+    )
+)
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
@@ -4794,6 +4806,83 @@ _CONFIGS = [
             rabc_use_final_action_condition=True,
             rabc_threshold=1.00,
             rabc_clip_max=1.0,
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        rabc_enabled=True,
+    ),
+    # ── Real ABC load-plates E12F curation study ────────────────────────
+    # All three arms use the same 1,335-episode release-MCAP dataset after
+    # conversion to LeRobot v3, pi0 base initialization, 15k optimizer steps,
+    # and global batch 128. The curated arms join binary keep decisions at the
+    # action chunk's anchor frame. curate_top_fraction.py writes
+    # e12f_drop_score as 0=keep / 1=drop, so the SCIZOR-compatible <=0.5 gate
+    # reproduces each mask exactly without an action-horizon offset.
+    #
+    # fsdp_devices=2 is the batch-128 recipe used for these checkpoints: with
+    # eight 80GB A100s it creates four data-parallel groups of two-way FSDP
+    # replicas while sharding the global batch across all eight devices.
+    TrainConfig(
+        name="pi0_load_plates_e12f_vanilla_bc_bs128_15k",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotYamDataConfig(
+            repo_id="abc130k_real_load_plates_lerobot_v1",
+            default_prompt="Load the plates into the dish rack",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        rabc_enabled=False,
+    ),
+    TrainConfig(
+        name="pi0_load_plates_e12f_top50_chunks_bs128_15k",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotScizorSidecarDataConfig(
+            repo_id="abc130k_real_load_plates_lerobot_v1",
+            default_prompt="Load the plates into the dish rack",
+            base_config=DataConfig(prompt_from_task=True),
+            scizor_sidecar_path=str(
+                _LOAD_PLATES_E12F_SIDECAR_ROOT / "top50_action_chunks" / "frame_signals.parquet"
+            ),
+            scizor_score_column="e12f_drop_score",
+            scizor_eps_s=0.5,
+            scizor_weight_mode="binary",
+        ),
+        batch_size=128,
+        fsdp_devices=2,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=15_000),
+        num_train_steps=15_000,
+        save_interval=5_000,
+        keep_period=5_000,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_load_plates_e12f_top50_episodes_bs128_15k",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotScizorSidecarDataConfig(
+            repo_id="abc130k_real_load_plates_lerobot_v1",
+            default_prompt="Load the plates into the dish rack",
+            base_config=DataConfig(prompt_from_task=True),
+            scizor_sidecar_path=str(
+                _LOAD_PLATES_E12F_SIDECAR_ROOT / "top50_episodes" / "frame_signals.parquet"
+            ),
+            scizor_score_column="e12f_drop_score",
+            scizor_eps_s=0.5,
+            scizor_weight_mode="binary",
         ),
         batch_size=128,
         fsdp_devices=2,

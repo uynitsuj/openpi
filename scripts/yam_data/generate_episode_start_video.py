@@ -22,6 +22,9 @@ import tyro
 class Config:
     dataset_root: Path
     output_fps: int = 2
+    compact_count: int = 60
+    sample_seed: int = 0
+    compact_only: bool = False
 
 
 class PackedV30FrameLoader:
@@ -99,21 +102,45 @@ def main(config: Config) -> None:
 
     first_camera = abc_converter.EPISODE_START_CAMERA_ORDER[0]
     resize_size = int(info["features"][first_camera]["shape"][0])
+    manifest_rows = manifest.to_dict("records")
     loader = PackedV30FrameLoader(root, episodes)
     try:
-        overview = abc_converter.write_episode_start_video(
+        if not config.compact_only:
+            info["episode_start_video"] = abc_converter.write_episode_start_video(
+                root,
+                manifest_rows,
+                resize_size=resize_size,
+                video_fps=config.output_fps,
+                frame_loader=loader,
+            )
+        sampled_rows = abc_converter.sample_episode_start_rows(
+            manifest_rows,
+            count=config.compact_count,
+            seed=config.sample_seed,
+        )
+        info["episode_start_compact_video"] = abc_converter.write_episode_start_video(
             root,
-            manifest.to_dict("records"),
+            sampled_rows,
             resize_size=resize_size,
             video_fps=config.output_fps,
             frame_loader=loader,
+            video_name=abc_converter.EPISODE_START_COMPACT_VIDEO_NAME,
+            index_name=abc_converter.EPISODE_START_COMPACT_INDEX_NAME,
+            additional_metadata={
+                "sampling": "random_without_replacement",
+                "sample_seed": config.sample_seed,
+                "requested_sample_count": config.compact_count,
+                "source_episode_count": len(manifest_rows),
+            },
         )
     finally:
         loader.close()
-    info["episode_start_video"] = overview
     info_path.write_text(json.dumps(info, indent=2) + "\n")
-    print(f"wrote {root / 'meta' / abc_converter.EPISODE_START_VIDEO_NAME}", flush=True)
-    print(f"wrote {root / 'meta' / abc_converter.EPISODE_START_INDEX_NAME}", flush=True)
+    if not config.compact_only:
+        print(f"wrote {root / 'meta' / abc_converter.EPISODE_START_VIDEO_NAME}", flush=True)
+        print(f"wrote {root / 'meta' / abc_converter.EPISODE_START_INDEX_NAME}", flush=True)
+    print(f"wrote {root / 'meta' / abc_converter.EPISODE_START_COMPACT_VIDEO_NAME}", flush=True)
+    print(f"wrote {root / 'meta' / abc_converter.EPISODE_START_COMPACT_INDEX_NAME}", flush=True)
 
 
 if __name__ == "__main__":

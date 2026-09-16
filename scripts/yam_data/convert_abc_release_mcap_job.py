@@ -74,6 +74,14 @@ TOP_TOPIC_CANDIDATES = ("/top-left-camera", "/top-right-camera", "/top-camera")
 JOINT_FLIP_ORDER = np.asarray([5, 4, 3, 2, 1, 0, 6, 12, 11, 10, 9, 8, 7, 13], dtype=np.int64)
 EPISODE_START_VIDEO_NAME = "episode_start_frames.mp4"
 EPISODE_START_INDEX_NAME = "episode_start_frames.json"
+EPISODE_START_COMPACT_VIDEO_NAME = "episode_start_frames_compact.mp4"
+EPISODE_START_COMPACT_INDEX_NAME = "episode_start_frames_compact.json"
+EPISODE_START_ARTIFACT_NAMES = (
+    EPISODE_START_VIDEO_NAME,
+    EPISODE_START_INDEX_NAME,
+    EPISODE_START_COMPACT_VIDEO_NAME,
+    EPISODE_START_COMPACT_INDEX_NAME,
+)
 EPISODE_START_CAMERA_ORDER = [
     "top_camera-images-rgb",
     "left_camera-images-rgb",
@@ -104,6 +112,9 @@ class Config:
     # The converter always writes one three-camera first-frame overview frame
     # per episode. At 2 fps, 1,335 episodes take about 11 minutes to review.
     episode_start_video_fps: int = 2
+    # Also emit a deterministic 30-second random sample by default.
+    episode_start_compact_count: int = 60
+    episode_start_sample_seed: int = 0
 
     @property
     def camera_resize_modes(self) -> dict[str, str]:
@@ -371,6 +382,7 @@ def _episode_start_canvas(
     camera_frames: dict[str, np.ndarray],
     *,
     episode_index: int,
+    video_frame_index: int,
     episode_count: int,
     source_episode_id: str,
     size: int,
@@ -381,7 +393,7 @@ def _episode_start_canvas(
     draw = ImageDraw.Draw(canvas)
     draw.text(
         (6, 3),
-        f"episode {episode_index:04d}/{episode_count - 1:04d}  {source_episode_id}",
+        f"episode {episode_index:04d}  overview {video_frame_index + 1:04d}/{episode_count:04d}  {source_episode_id}",
         fill=(255, 255, 255),
     )
     panel_labels = ("TOP", "LEFT WRIST", "RIGHT WRIST")
@@ -402,15 +414,18 @@ def write_episode_start_video(
     resize_size: int,
     video_fps: int,
     frame_loader: Callable[[int], dict[str, np.ndarray]],
+    video_name: str = EPISODE_START_VIDEO_NAME,
+    index_name: str = EPISODE_START_INDEX_NAME,
+    additional_metadata: dict | None = None,
 ) -> dict:
     """Write one labeled three-camera first-frame overview frame per episode."""
     if video_fps <= 0:
         raise ValueError("video_fps must be positive")
     meta = root / "meta"
     meta.mkdir(parents=True, exist_ok=True)
-    output_path = meta / EPISODE_START_VIDEO_NAME
-    temp_path = meta / f".{EPISODE_START_VIDEO_NAME}.tmp.mp4"
-    index_path = meta / EPISODE_START_INDEX_NAME
+    output_path = meta / video_name
+    temp_path = meta / f".{video_name}.tmp.mp4"
+    index_path = meta / index_name
     frame_index = []
 
     output = av.open(str(temp_path), "w", format="mp4")
@@ -429,6 +444,7 @@ def write_episode_start_video(
             canvas = _episode_start_canvas(
                 camera_frames,
                 episode_index=episode_index,
+                video_frame_index=video_frame_index,
                 episode_count=episode_count,
                 source_episode_id=str(row["source_episode_id"]),
                 size=resize_size,
@@ -456,8 +472,8 @@ def write_episode_start_video(
 
     metadata = {
         "schema_version": 1,
-        "video_path": f"meta/{EPISODE_START_VIDEO_NAME}",
-        "index_path": f"meta/{EPISODE_START_INDEX_NAME}",
+        "video_path": f"meta/{video_name}",
+        "index_path": f"meta/{index_name}",
         "frame_rate": video_fps,
         "seconds_per_episode": 1 / video_fps,
         "frame_count": len(frame_index),
@@ -469,8 +485,19 @@ def write_episode_start_video(
         },
         "frames": frame_index,
     }
+    if additional_metadata is not None:
+        metadata.update(additional_metadata)
     index_path.write_text(json.dumps(metadata, indent=2) + "\n")
     return {key: value for key, value in metadata.items() if key != "frames"}
+
+
+def sample_episode_start_rows(manifest_rows: list[dict], *, count: int, seed: int) -> list[dict]:
+    """Sample episode rows without replacement in deterministic random order."""
+    if count <= 0:
+        raise ValueError("episode_start_compact_count must be positive")
+    sample_count = min(count, len(manifest_rows))
+    indices = np.random.default_rng(seed).choice(len(manifest_rows), size=sample_count, replace=False)
+    return [manifest_rows[int(index)] for index in indices]
 
 
 def write_episode_start_video_v21(
@@ -495,6 +522,44 @@ def write_episode_start_video_v21(
         resize_size=config.resize_size,
         video_fps=config.episode_start_video_fps,
         frame_loader=load_episode_frames,
+    )
+
+
+def write_compact_episode_start_video_v21(
+    root: Path,
+    manifest_rows: list[dict],
+    config: Config,
+) -> dict:
+    """Write the deterministic random compact overview from v2.1 videos."""
+    sampled_rows = sample_episode_start_rows(
+        manifest_rows,
+        count=config.episode_start_compact_count,
+        seed=config.episode_start_sample_seed,
+    )
+
+    def load_episode_frames(episode_index: int) -> dict[str, np.ndarray]:
+        chunk = episode_index // config.chunk_size
+        return {
+            camera_key: _first_video_frame(
+                root / "videos" / f"chunk-{chunk:03d}" / camera_key / f"episode_{episode_index:06d}.mp4"
+            )
+            for camera_key in EPISODE_START_CAMERA_ORDER
+        }
+
+    return write_episode_start_video(
+        root,
+        sampled_rows,
+        resize_size=config.resize_size,
+        video_fps=config.episode_start_video_fps,
+        frame_loader=load_episode_frames,
+        video_name=EPISODE_START_COMPACT_VIDEO_NAME,
+        index_name=EPISODE_START_COMPACT_INDEX_NAME,
+        additional_metadata={
+            "sampling": "random_without_replacement",
+            "sample_seed": config.episode_start_sample_seed,
+            "requested_sample_count": config.episode_start_compact_count,
+            "source_episode_count": len(manifest_rows),
+        },
     )
 
 
@@ -698,6 +763,7 @@ def finalize_v21(root: Path, results: dict[int, dict], config: Config) -> tuple[
     manifest.to_csv(meta / "source_manifest.csv", index=False)
     manifest.to_csv(root.parent / f"{config.repo_name}_source_manifest.csv", index=False)
     episode_start_video = write_episode_start_video_v21(root, manifest_rows, config)
+    episode_start_compact_video = write_compact_episode_start_video_v21(root, manifest_rows, config)
     info = {
         "codebase_version": "v2.1",
         "robot_type": "yams",
@@ -719,6 +785,7 @@ def finalize_v21(root: Path, results: dict[int, dict], config: Config) -> tuple[
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
         "episode_start_video": episode_start_video,
+        "episode_start_compact_video": episode_start_compact_video,
         "features": _features(config),
     }
     (meta / "info.json").write_text(json.dumps(info, indent=2))
@@ -756,10 +823,13 @@ def migrate_to_v30(root: Path, config: Config, expected_episodes: int, expected_
 
     provenance = root.parent / f"{config.repo_name}_source_manifest.csv"
     info = json.loads((root / "meta" / "info.json").read_text())
-    episode_start_video = info["episode_start_video"]
+    episode_start_metadata = {
+        "episode_start_video": info["episode_start_video"],
+        "episode_start_compact_video": info["episode_start_compact_video"],
+    }
     with tempfile.TemporaryDirectory(prefix=f".{config.repo_name}_preserved_meta_", dir=root.parent) as temp_dir:
         preserve_dir = Path(temp_dir)
-        for filename in (EPISODE_START_VIDEO_NAME, EPISODE_START_INDEX_NAME):
+        for filename in EPISODE_START_ARTIFACT_NAMES:
             shutil.copy2(root / "meta" / filename, preserve_dir / filename)
         convert_dataset(
             repo_id=config.repo_name,
@@ -769,12 +839,12 @@ def migrate_to_v30(root: Path, config: Config, expected_episodes: int, expected_
             data_file_size_in_mb=config.v30_data_file_size_mb,
             video_file_size_in_mb=config.v30_video_file_size_mb,
         )
-        for filename in (EPISODE_START_VIDEO_NAME, EPISODE_START_INDEX_NAME):
+        for filename in EPISODE_START_ARTIFACT_NAMES:
             shutil.copy2(preserve_dir / filename, root / "meta" / filename)
     if provenance.exists():
         shutil.copy2(provenance, root / "meta" / "source_manifest.csv")
     migrated_info = json.loads((root / "meta" / "info.json").read_text())
-    migrated_info["episode_start_video"] = episode_start_video
+    migrated_info.update(episode_start_metadata)
     (root / "meta" / "info.json").write_text(json.dumps(migrated_info, indent=2) + "\n")
     validate_v30(root, expected_episodes, expected_frames)
 
@@ -811,6 +881,7 @@ def main(config: Config) -> None:
     episodes, frames = finalize_v21(root, results, config)
     print(f"wrote LeRobot v2.1: {episodes} episodes, {frames} frames -> {root}", flush=True)
     print(f"wrote episode-start overview -> {root / 'meta' / EPISODE_START_VIDEO_NAME}", flush=True)
+    print(f"wrote compact episode-start overview -> {root / 'meta' / EPISODE_START_COMPACT_VIDEO_NAME}", flush=True)
     if config.convert_to_v30:
         migrate_to_v30(root, config, episodes, frames)
         print(f"validated LeRobot v3.0: {episodes} episodes, {frames} frames -> {root}", flush=True)

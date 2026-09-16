@@ -57,12 +57,26 @@ three-camera first frame per episode at two episodes per second. The matching
 episode and source episode ID. Both files are preserved through v3 migration
 and should be uploaded with the dataset.
 
+It also writes `meta/episode_start_frames_compact.mp4`, an exactly 30-second
+overview of 60 episodes randomly sampled without replacement at the same two
+episodes per second. Sampling is deterministic by default (`seed=0`), and
+`meta/episode_start_frames_compact.json` records the seed and exact episode
+order so the sample is reproducible.
+
 For an older v3 conversion, backfill the same artifacts without rebuilding the
 dataset:
 
 ```bash
 .venv/bin/python scripts/yam_data/generate_episode_start_video.py \
   --dataset-root /path/to/abc130k_real_load_plates_lerobot_v1
+```
+
+To add only the compact artifact when the full overview already exists:
+
+```bash
+.venv/bin/python scripts/yam_data/generate_episode_start_video.py \
+  --dataset-root /path/to/abc130k_real_load_plates_lerobot_v1 \
+  --compact-only
 ```
 
 ```bash

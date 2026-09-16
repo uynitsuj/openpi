@@ -259,3 +259,21 @@ def test_writes_indexed_three_camera_episode_start_video(converter, tmp_path):
     assert int(np.argmax(centers[0])) == 0  # top is red
     assert int(np.argmax(centers[1])) == 1  # left wrist is green
     assert int(np.argmax(centers[2])) == 2  # right wrist is blue
+
+
+def test_compact_episode_sample_is_deterministic_and_without_replacement(converter):
+    manifest_rows = [{"episode_index": index} for index in range(100)]
+    first = converter.sample_episode_start_rows(manifest_rows, count=60, seed=7)
+    repeated = converter.sample_episode_start_rows(manifest_rows, count=60, seed=7)
+    different_seed = converter.sample_episode_start_rows(manifest_rows, count=60, seed=8)
+
+    first_indices = [row["episode_index"] for row in first]
+    assert first == repeated
+    assert first != different_seed
+    assert len(first_indices) == len(set(first_indices)) == 60
+    assert first_indices != sorted(first_indices)
+
+
+def test_compact_episode_sample_rejects_nonpositive_count(converter):
+    with pytest.raises(ValueError, match="must be positive"):
+        converter.sample_episode_start_rows([{"episode_index": 0}], count=0, seed=0)

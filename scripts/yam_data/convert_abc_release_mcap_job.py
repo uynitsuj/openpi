@@ -34,6 +34,7 @@ Example:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import as_completed
 import dataclasses
@@ -49,6 +50,7 @@ import av
 import numpy as np
 import pandas as pd
 from PIL import Image
+from PIL import ImageDraw
 import tyro
 
 CAMERA_KEYS = ["left_camera-images-rgb", "right_camera-images-rgb", "top_camera-images-rgb"]
@@ -70,6 +72,14 @@ WRIST_TOPICS = {
 }
 TOP_TOPIC_CANDIDATES = ("/top-left-camera", "/top-right-camera", "/top-camera")
 JOINT_FLIP_ORDER = np.asarray([5, 4, 3, 2, 1, 0, 6, 12, 11, 10, 9, 8, 7, 13], dtype=np.int64)
+EPISODE_START_VIDEO_NAME = "episode_start_frames.mp4"
+EPISODE_START_INDEX_NAME = "episode_start_frames.json"
+EPISODE_START_CAMERA_ORDER = [
+    "top_camera-images-rgb",
+    "left_camera-images-rgb",
+    "right_camera-images-rgb",
+]
+EPISODE_START_HEADER_HEIGHT = 40
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,6 +101,9 @@ class Config:
     # boundary bug that can double-count frames when a data file rolls over.
     v30_data_file_size_mb: int = 100_000
     v30_video_file_size_mb: int = 1_000
+    # The converter always writes one three-camera first-frame overview frame
+    # per episode. At 2 fps, 1,335 episodes take about 11 minutes to review.
+    episode_start_video_fps: int = 2
 
     @property
     def camera_resize_modes(self) -> dict[str, str]:
@@ -344,6 +357,147 @@ def _episode_stats(state: np.ndarray, actions: np.ndarray, frame: pd.DataFrame) 
     return stats
 
 
+def _first_video_frame(path: Path) -> np.ndarray:
+    """Decode the first RGB frame from a converted per-episode video."""
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        for frame in container.decode(stream):
+            return frame.to_ndarray(format="rgb24")
+    raise ValueError(f"video has no decodable frames: {path}")
+
+
+def _episode_start_canvas(
+    camera_frames: dict[str, np.ndarray],
+    *,
+    episode_index: int,
+    episode_count: int,
+    source_episode_id: str,
+    size: int,
+) -> np.ndarray:
+    """Lay out the exact converted first frames with a compact episode label."""
+    width = size * len(EPISODE_START_CAMERA_ORDER)
+    canvas = Image.new("RGB", (width, size + EPISODE_START_HEADER_HEIGHT), 0)
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        (6, 3),
+        f"episode {episode_index:04d}/{episode_count - 1:04d}  {source_episode_id}",
+        fill=(255, 255, 255),
+    )
+    panel_labels = ("TOP", "LEFT WRIST", "RIGHT WRIST")
+    for panel_index, (camera_key, panel_label) in enumerate(zip(EPISODE_START_CAMERA_ORDER, panel_labels, strict=True)):
+        image = Image.fromarray(camera_frames[camera_key]).convert("RGB")
+        if image.size != (size, size):
+            image = image.resize((size, size), resample=Image.BILINEAR)
+        x = panel_index * size
+        canvas.paste(image, (x, EPISODE_START_HEADER_HEIGHT))
+        draw.text((x + 6, 21), panel_label, fill=(190, 220, 255))
+    return np.asarray(canvas)
+
+
+def write_episode_start_video(
+    root: Path,
+    manifest_rows: list[dict],
+    *,
+    resize_size: int,
+    video_fps: int,
+    frame_loader: Callable[[int], dict[str, np.ndarray]],
+) -> dict:
+    """Write one labeled three-camera first-frame overview frame per episode."""
+    if video_fps <= 0:
+        raise ValueError("video_fps must be positive")
+    meta = root / "meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    output_path = meta / EPISODE_START_VIDEO_NAME
+    temp_path = meta / f".{EPISODE_START_VIDEO_NAME}.tmp.mp4"
+    index_path = meta / EPISODE_START_INDEX_NAME
+    frame_index = []
+
+    output = av.open(str(temp_path), "w", format="mp4")
+    stream = output.add_stream("h264", rate=video_fps)
+    stream.width = resize_size * len(EPISODE_START_CAMERA_ORDER)
+    stream.height = resize_size + EPISODE_START_HEADER_HEIGHT
+    stream.pix_fmt = "yuv420p"
+    # Every video frame represents a different episode. All-intra encoding
+    # makes frame-accurate seeking cheap in ordinary video players.
+    stream.options = {"crf": "20", "preset": "veryfast", "g": "1", "movflags": "+faststart"}
+    try:
+        episode_count = len(manifest_rows)
+        for video_frame_index, row in enumerate(manifest_rows):
+            episode_index = int(row["episode_index"])
+            camera_frames = frame_loader(episode_index)
+            canvas = _episode_start_canvas(
+                camera_frames,
+                episode_index=episode_index,
+                episode_count=episode_count,
+                source_episode_id=str(row["source_episode_id"]),
+                size=resize_size,
+            )
+            for packet in stream.encode(av.VideoFrame.from_ndarray(canvas, format="rgb24")):
+                output.mux(packet)
+            frame_index.append(
+                {
+                    "video_frame_index": video_frame_index,
+                    "episode_index": episode_index,
+                    "source_episode_id": str(row["source_episode_id"]),
+                    "source_split": str(row["source_split"]),
+                    "source_task": str(row["source_task"]),
+                    "top_topic": str(row["top_topic"]),
+                }
+            )
+        for packet in stream.encode(None):
+            output.mux(packet)
+    except Exception:
+        output.close()
+        temp_path.unlink(missing_ok=True)
+        raise
+    output.close()
+    temp_path.replace(output_path)
+
+    metadata = {
+        "schema_version": 1,
+        "video_path": f"meta/{EPISODE_START_VIDEO_NAME}",
+        "index_path": f"meta/{EPISODE_START_INDEX_NAME}",
+        "frame_rate": video_fps,
+        "seconds_per_episode": 1 / video_fps,
+        "frame_count": len(frame_index),
+        "camera_panel_order": EPISODE_START_CAMERA_ORDER,
+        "frame_layout": {
+            "panel_width": resize_size,
+            "panel_height": resize_size,
+            "header_height": EPISODE_START_HEADER_HEIGHT,
+        },
+        "frames": frame_index,
+    }
+    index_path.write_text(json.dumps(metadata, indent=2) + "\n")
+    return {key: value for key, value in metadata.items() if key != "frames"}
+
+
+def write_episode_start_video_v21(
+    root: Path,
+    manifest_rows: list[dict],
+    config: Config,
+) -> dict:
+    """Write the overview while videos are still episode-separated in v2.1."""
+
+    def load_episode_frames(episode_index: int) -> dict[str, np.ndarray]:
+        chunk = episode_index // config.chunk_size
+        return {
+            camera_key: _first_video_frame(
+                root / "videos" / f"chunk-{chunk:03d}" / camera_key / f"episode_{episode_index:06d}.mp4"
+            )
+            for camera_key in EPISODE_START_CAMERA_ORDER
+        }
+
+    return write_episode_start_video(
+        root,
+        manifest_rows,
+        resize_size=config.resize_size,
+        video_fps=config.episode_start_video_fps,
+        frame_loader=load_episode_frames,
+    )
+
+
 def _source_split(path: Path) -> str:
     for part in reversed(path.parts):
         if part in {"train", "val", "test"}:
@@ -543,6 +697,7 @@ def finalize_v21(root: Path, results: dict[int, dict], config: Config) -> tuple[
     manifest = pd.DataFrame(manifest_rows)
     manifest.to_csv(meta / "source_manifest.csv", index=False)
     manifest.to_csv(root.parent / f"{config.repo_name}_source_manifest.csv", index=False)
+    episode_start_video = write_episode_start_video_v21(root, manifest_rows, config)
     info = {
         "codebase_version": "v2.1",
         "robot_type": "yams",
@@ -563,6 +718,7 @@ def finalize_v21(root: Path, results: dict[int, dict], config: Config) -> tuple[
         "splits": {"train": f"0:{len(episodes)}"},
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+        "episode_start_video": episode_start_video,
         "features": _features(config),
     }
     (meta / "info.json").write_text(json.dumps(info, indent=2))
@@ -599,16 +755,27 @@ def migrate_to_v30(root: Path, config: Config, expected_episodes: int, expected_
     from lerobot.datasets.v30.convert_dataset_v21_to_v30 import convert_dataset
 
     provenance = root.parent / f"{config.repo_name}_source_manifest.csv"
-    convert_dataset(
-        repo_id=config.repo_name,
-        root=root,
-        push_to_hub=False,
-        force_conversion=True,
-        data_file_size_in_mb=config.v30_data_file_size_mb,
-        video_file_size_in_mb=config.v30_video_file_size_mb,
-    )
+    info = json.loads((root / "meta" / "info.json").read_text())
+    episode_start_video = info["episode_start_video"]
+    with tempfile.TemporaryDirectory(prefix=f".{config.repo_name}_preserved_meta_", dir=root.parent) as temp_dir:
+        preserve_dir = Path(temp_dir)
+        for filename in (EPISODE_START_VIDEO_NAME, EPISODE_START_INDEX_NAME):
+            shutil.copy2(root / "meta" / filename, preserve_dir / filename)
+        convert_dataset(
+            repo_id=config.repo_name,
+            root=root,
+            push_to_hub=False,
+            force_conversion=True,
+            data_file_size_in_mb=config.v30_data_file_size_mb,
+            video_file_size_in_mb=config.v30_video_file_size_mb,
+        )
+        for filename in (EPISODE_START_VIDEO_NAME, EPISODE_START_INDEX_NAME):
+            shutil.copy2(preserve_dir / filename, root / "meta" / filename)
     if provenance.exists():
         shutil.copy2(provenance, root / "meta" / "source_manifest.csv")
+    migrated_info = json.loads((root / "meta" / "info.json").read_text())
+    migrated_info["episode_start_video"] = episode_start_video
+    (root / "meta" / "info.json").write_text(json.dumps(migrated_info, indent=2) + "\n")
     validate_v30(root, expected_episodes, expected_frames)
 
 
@@ -643,6 +810,7 @@ def main(config: Config) -> None:
 
     episodes, frames = finalize_v21(root, results, config)
     print(f"wrote LeRobot v2.1: {episodes} episodes, {frames} frames -> {root}", flush=True)
+    print(f"wrote episode-start overview -> {root / 'meta' / EPISODE_START_VIDEO_NAME}", flush=True)
     if config.convert_to_v30:
         migrate_to_v30(root, config, episodes, frames)
         print(f"validated LeRobot v3.0: {episodes} episodes, {frames} frames -> {root}", flush=True)

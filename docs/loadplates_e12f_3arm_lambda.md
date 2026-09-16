@@ -51,6 +51,20 @@ v2.1; and runs the official local v2.1-to-v3.0 migration. It requires every
 state, commanded-action, and camera stream and skips an episode rather than
 silently substituting observed state for a missing action.
 
+Every conversion also writes `meta/episode_start_frames.mp4`: one labeled,
+three-camera first frame per episode at two episodes per second. The matching
+`meta/episode_start_frames.json` maps each video frame back to the converted
+episode and source episode ID. Both files are preserved through v3 migration
+and should be uploaded with the dataset.
+
+For an older v3 conversion, backfill the same artifacts without rebuilding the
+dataset:
+
+```bash
+.venv/bin/python scripts/yam_data/generate_episode_start_video.py \
+  --dataset-root /path/to/abc130k_real_load_plates_lerobot_v1
+```
+
 ```bash
 cd /home/ubuntu/karim/openpi
 .venv/bin/python scripts/yam_data/convert_abc_release_mcap_job.py \

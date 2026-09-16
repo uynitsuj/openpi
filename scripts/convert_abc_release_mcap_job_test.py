@@ -1,8 +1,10 @@
 """Regression tests for the official ABC release-MCAP LeRobot converter."""
 
 import importlib
+import json
 from pathlib import Path
 
+import av
 from google.protobuf import descriptor_pb2
 from google.protobuf import descriptor_pool
 from google.protobuf import message_factory
@@ -186,3 +188,74 @@ def test_failed_episode_cleanup_is_scoped(converter, tmp_path):
     converter.cleanup_episode_artifacts(tmp_path, target_index, chunk_size=1000)
     assert all(not path.exists() for path in targets)
     assert all(path.exists() for path in neighbors)
+
+
+def _write_solid_video(path, color, size):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with av.open(str(path), "w", format="mp4") as output:
+        stream = output.add_stream("h264", rate=30)
+        stream.width = stream.height = size
+        stream.pix_fmt = "yuv420p"
+        image = np.full((size, size, 3), color, dtype=np.uint8)
+        for _ in range(2):
+            for packet in stream.encode(av.VideoFrame.from_ndarray(image, format="rgb24")):
+                output.mux(packet)
+        for packet in stream.encode(None):
+            output.mux(packet)
+
+
+def test_writes_indexed_three_camera_episode_start_video(converter, tmp_path):
+    size = 32
+    colors = {
+        "top_camera-images-rgb": (230, 20, 20),
+        "left_camera-images-rgb": (20, 230, 20),
+        "right_camera-images-rgb": (20, 20, 230),
+    }
+    manifest_rows = []
+    for episode_index in range(2):
+        for camera_key, color in colors.items():
+            _write_solid_video(
+                tmp_path / "videos" / "chunk-000" / camera_key / f"episode_{episode_index:06d}.mp4",
+                tuple(min(255, channel + episode_index * 5) for channel in color),
+                size,
+            )
+        manifest_rows.append(
+            {
+                "episode_index": episode_index,
+                "source_episode_id": f"episode-source-{episode_index}",
+                "source_split": "train",
+                "source_task": "load the plates into the dish rack",
+                "top_topic": "/top-left-camera",
+            }
+        )
+
+    config = converter.Config(
+        input_root=tmp_path,
+        resize_size=size,
+        convert_to_v30=False,
+        episode_start_video_fps=2,
+    )
+    compact_metadata = converter.write_episode_start_video_v21(tmp_path, manifest_rows, config)
+
+    video_path = tmp_path / "meta" / converter.EPISODE_START_VIDEO_NAME
+    index_path = tmp_path / "meta" / converter.EPISODE_START_INDEX_NAME
+    assert video_path.is_file()
+    assert index_path.is_file()
+    metadata = json.loads(index_path.read_text())
+    assert compact_metadata["frame_count"] == metadata["frame_count"] == 2
+    assert metadata["frame_rate"] == 2
+    assert metadata["camera_panel_order"] == converter.EPISODE_START_CAMERA_ORDER
+    assert [frame["episode_index"] for frame in metadata["frames"]] == [0, 1]
+    assert [frame["source_episode_id"] for frame in metadata["frames"]] == [
+        "episode-source-0",
+        "episode-source-1",
+    ]
+
+    with av.open(str(video_path)) as container:
+        decoded = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+    assert len(decoded) == 2
+    assert decoded[0].shape == (size + converter.EPISODE_START_HEADER_HEIGHT, size * 3, 3)
+    centers = [decoded[0][converter.EPISODE_START_HEADER_HEIGHT + size // 2, size * i + size // 2] for i in range(3)]
+    assert int(np.argmax(centers[0])) == 0  # top is red
+    assert int(np.argmax(centers[1])) == 1  # left wrist is green
+    assert int(np.argmax(centers[2])) == 2  # right wrist is blue

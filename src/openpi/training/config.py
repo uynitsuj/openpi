@@ -16,7 +16,6 @@ import tyro
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
-import openpi.models.pi0_dpo as pi0_dpo
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
@@ -2586,27 +2585,6 @@ _CONFIGS = [
         num_train_steps=7_500,
         save_interval=2_500,
         keep_period=2_500,
-        rabc_enabled=False,
-    ),
-    TrainConfig(
-        name="pi05_bottles_obedience_demodpo",
-        # ORIGINAL DEMOS, hindsight label (pos) + counterfactual command (neg); DPO-on-condition loss; 25% command dropout
-        model=pi0_dpo.Pi0DpoConfig(pi05=True, action_dim=32, action_horizon=16, dpo_beta=5.0, dpo_lambda=1.0),
-        data=LeRobotYamRormDpoDataConfig(
-            repo_id="steer_lr_demodpo",
-            default_prompt="Put the plastic bottles in the bin",
-            base_config=DataConfig(prompt_from_task=True),
-            cmd_dropout=0.25,
-        ),
-        batch_size=64,
-        num_workers=8,
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/data/work/ckpt/14999/params"
-        ),
-        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=6_000),
-        num_train_steps=6_000,
-        save_interval=2_000,
-        keep_period=2_000,
         rabc_enabled=False,
     ),
     TrainConfig(

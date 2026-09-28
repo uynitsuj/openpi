@@ -2291,6 +2291,59 @@ _CONFIGS = [
         keep_period=10_000,
         rabc_enabled=False,
     ),
+    # ── H19 baseline arms (workstream D, 2026-09-08): binary drop-mask sidecar consumer for
+    #    sim bottles.  The sidecar path, threshold, and column are supplied per arm on the
+    #    command line (tyro overrides: --data.scizor-sidecar-path, --data.scizor-eps-s,
+    #    --data.scizor-score-column); every mask is 0 keep / 1 drop with eps 0.5.
+    #    Recipe otherwise identical to pi0_put_bottles_mjwarp_no_rabc / rabc_sss15.
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_h19base_sidecar",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotScizorSidecarDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            scizor_sidecar_path="",
+            scizor_eps_s=0.5,
+            scizor_weight_mode="binary",
+            scizor_score_column="h19_drop",
+        ),
+        batch_size=32,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=30_000),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        rabc_enabled=True,
+    ),
+    # H19, 2026-09-14. Identical to pi0_put_bottles_mjwarp_h19base_sidecar except for the
+    # optimisation schedule: batch 128 for 7,500 steps instead of batch 32 for 30,000. Both
+    # see 960,000 samples. Justin flagged that the paper tables used bs128 at 7.5k, which the
+    # Lego config pi0_newsim_01_lego_sort_h19base_gate_bs128 already matches and no bottles
+    # config did. Every comparison of an H19 bottles arm against the RELEASED anchor confounded
+    # the reimplementation with this schedule difference; this config separates them.
+    TrainConfig(
+        name="pi0_put_bottles_mjwarp_h19base_sidecar_bs128",
+        model=pi0_config.Pi0Config(action_horizon=30),
+        data=LeRobotScizorSidecarDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            scizor_sidecar_path="",
+            scizor_eps_s=0.5,
+            scizor_weight_mode="binary",
+            scizor_score_column="h19_drop",
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=7_500),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=True,
+    ),
     TrainConfig(
         name="pi0_put_bottles_mjwarp_no_rabc",
         model=pi0_config.Pi0Config(action_horizon=30),

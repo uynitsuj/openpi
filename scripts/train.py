@@ -267,7 +267,12 @@ def main(config: _config.TrainConfig):
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    # JAX_COMPILATION_CACHE_DIR overrides the home default (needed on boxes whose
+    # root disk is full; the per-fusion autotune cache is written under this dir).
+    jax.config.update(
+        "jax_compilation_cache_dir",
+        str(epath.Path(os.environ.get("JAX_COMPILATION_CACHE_DIR", "~/.cache/jax")).expanduser()),
+    )
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)

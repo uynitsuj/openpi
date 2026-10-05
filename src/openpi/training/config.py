@@ -1843,10 +1843,10 @@ _CONFIGS = [
         batch_size=128,
         num_workers=16,  # 3 video decodes per sample; 200-CPU box
         fsdp_devices=2,
-        num_train_steps=30_000,
-        # Checkpoints are large: save every 10k and keep each (use 20k for runs well past 30k steps).
-        save_interval=10_000,
-        keep_period=10_000,
+        num_train_steps=50_000,
+        # Checkpoints are large: save every 20k and keep each (20k, 40k, and the final 50k).
+        save_interval=20_000,
+        keep_period=20_000,
     ),
     TrainConfig(
         # Smoke test of the same pipeline: a few hundred steps, frequent logs, no wandb.

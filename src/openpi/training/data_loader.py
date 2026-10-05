@@ -308,6 +308,63 @@ def _rabc_cache_key(
     return hashlib.sha1(blob).hexdigest()[:16]
 
 
+def precompute_valid_frame_indices(
+    repo_id: str,
+    action_horizon: int,
+    column: str,
+    *,
+    episodes: tuple[int, ...] | None = None,
+) -> np.ndarray:
+    """Flat indices (into the episode-filtered LeRobot dataset, same ordering as
+    precompute_valid_indices: episodes sorted, frames in order) of samples t whose
+    chunk frames t..min(t+H, episode_end)-1 all have `column` == 1. Parquet-only, no
+    video decode; composes with torch Subset like the RABC gate."""
+    import pyarrow.parquet as _pq  # noqa: PLC0415
+
+    root = pathlib.Path(lerobot_dataset.HF_LEROBOT_HOME) / repo_id
+    files = sorted((root / "data").rglob("*.parquet"))
+    df = _pq.read_table(files, columns=["episode_index", "frame_index", column]).to_pandas()
+    all_eps = sorted(df["episode_index"].astype(int).unique().tolist())
+    ordered_eps = all_eps if episodes is None else sorted(int(e) for e in episodes)
+    missing = sorted(set(ordered_eps) - set(all_eps))
+    if missing:
+        raise ValueError(f"episodes not in dataset: {missing[:10]}")
+
+    keep: list[np.ndarray] = []
+    cursor = 0
+    n_bad_frames = 0
+    for ep in ordered_eps:
+        g = df[df["episode_index"] == ep].sort_values("frame_index")
+        bad = (np.asarray(g[column]).reshape(-1) == 0).astype(np.int64)
+        n = len(bad)
+        n_bad_frames += int(bad.sum())
+        csum = np.concatenate([[0], np.cumsum(bad)])
+        starts = np.arange(n)
+        ends = np.minimum(starts + action_horizon, n)
+        ok = (csum[ends] - csum[starts]) == 0
+        keep.append(cursor + starts[ok])
+        cursor += n
+    valid = np.concatenate(keep).astype(np.int64) if keep else np.zeros(0, np.int64)
+    logging.info(
+        f"[valid_frames] {repo_id} column={column} H={action_horizon}: {n_bad_frames} invalid frames -> "
+        f"{len(valid):,}/{cursor:,} sample starts kept ({cursor - len(valid)} dropped)"
+    )
+    return valid
+
+
+def apply_valid_frame_subset(
+    dataset: "Dataset", data_config: _config.DataConfig, action_horizon: int
+) -> "Dataset":
+    """Wrap `dataset` in a Subset over valid-frame starts if data_config.valid_frame_column is set."""
+    column = getattr(data_config, "valid_frame_column", None)
+    if not column or data_config.repo_id in (None, "fake"):
+        return dataset
+    valid = precompute_valid_frame_indices(data_config.repo_id, action_horizon, column, episodes=data_config.episodes)
+    if len(valid) != len(dataset) and valid.max(initial=-1) >= len(dataset):
+        raise RuntimeError(f"valid-frame indices exceed dataset length ({valid.max()} >= {len(dataset)})")
+    return torch.utils.data.Subset(typing.cast(torch.utils.data.Dataset, dataset), indices=valid)
+
+
 def precompute_valid_indices(
     repo_id: str,
     action_horizon: int,
@@ -776,6 +833,7 @@ def create_torch_data_loader(
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    rabc_subset_applied = False
 
     # RABC subset filtering: precompute the indices of samples whose weight > 0
     # offline (parquet-only, no video decode), then wrap in torch Subset so the
@@ -803,10 +861,16 @@ def create_torch_data_loader(
                     f"RABC precompute kept zero samples for {data_config.repo_id} — "
                     "check rabc thresholds (every sample is being gated out)."
                 )
+            if getattr(data_config, "valid_frame_column", None):
+                frame_valid = precompute_valid_frame_indices(
+                    data_config.repo_id, action_horizon, data_config.valid_frame_column, episodes=data_config.episodes
+                )
+                valid_indices = np.intersect1d(valid_indices, frame_valid).astype(np.int64)
             # Pass the numpy int64 array directly — torch.utils.data.Subset
             # accepts any sequence with __getitem__, and pickling a contiguous
             # numpy array to each spawn-worker is ~3× faster than a Python list
             # at multi-million-index scale.
+            rabc_subset_applied = True
             dataset = torch.utils.data.Subset(
                 typing.cast(torch.utils.data.Dataset, dataset),
                 indices=valid_indices,
@@ -814,6 +878,9 @@ def create_torch_data_loader(
             logging.info(
                 f"[rabc_subset] training over {len(dataset):,} valid samples"
             )
+
+    if not rabc_subset_applied:
+        dataset = apply_valid_frame_subset(dataset, data_config, action_horizon)
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size

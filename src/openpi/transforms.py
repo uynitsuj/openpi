@@ -799,6 +799,88 @@ class AbsoluteActions(DataTransformFn):
         return data
 
 
+# --- EgoMI bimanual inter-gripper transforms -------------------------------------
+# Ported from xdofai/openpi dev/justinyu/xmi_rby (src/openpi/transforms.py:251-363):
+# same math, written on numpy copies instead of in-place torch edits. Layout (20D or
+# 29D): [left rot6d(6), left pos(3), left grip(1), right rot6d(6), right pos(3),
+# right grip(1), (head rot6d(6), head pos(3))]. rot6d = first two ROWS of R.
+
+
+def _rot6d_pos_to_mat(rot6d: np.ndarray, pos: np.ndarray) -> np.ndarray:
+    from openpi.utils.matrix_utils import rot_6d_to_rot_mat  # noqa: PLC0415
+
+    T = np.eye(4)
+    T[:3, :3] = rot_6d_to_rot_mat(np.array(rot6d, dtype=np.float64, copy=True))[0]
+    T[:3, 3] = pos
+    return T
+
+
+def _mat_to_rot6d_pos(T: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    from openpi.utils.matrix_utils import rot_mat_to_rot_6d  # noqa: PLC0415
+
+    return rot_mat_to_rot_6d(T[None, :3, :3])[0], T[:3, 3].copy()
+
+
+@dataclasses.dataclass(frozen=True)
+class Bimanual_InterGripperProprio_DeltaActions(DataTransformFn):
+    """Training input: re-express the left-arm (and, for 29D, head) STATE pose in the
+    right gripper's frame; make masked ACTION dims relative to the chunk's first
+    action (a[k] - a[0]); optionally add N(0, 0.2 m) noise to the right-arm state z."""
+
+    mask: Sequence[bool] | None
+    action_dim: int  # 20 or 29 (the data layout, NOT the padded model action dim)
+    perturb_z: bool = True
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or self.mask is None:
+            return data
+        state = np.array(data["state"], dtype=np.float32, copy=True)
+        actions = np.array(data["actions"], dtype=np.float32, copy=True)
+
+        right_inv = np.linalg.inv(_rot6d_pos_to_mat(state[10:16], state[16:19]))
+        if self.action_dim == 29:
+            r6, p = _mat_to_rot6d_pos(right_inv @ _rot6d_pos_to_mat(state[20:26], state[26:29]))
+            state[20:26], state[26:29] = r6, p
+        r6, p = _mat_to_rot6d_pos(right_inv @ _rot6d_pos_to_mat(state[:6], state[6:9]))
+        state[:6], state[6:9] = r6, p
+        if self.perturb_z:
+            state[18] += np.random.randn() * 0.2
+
+        mask = np.asarray(self.mask)
+        dims = mask.shape[-1]
+        actions[..., :dims] -= np.expand_dims(np.where(mask, actions[0, :dims], 0), axis=-2)
+        data["state"], data["actions"] = state, actions
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class Bimanual_InterGripperProprio_AbsoluteActions(DataTransformFn):
+    """Inference output: inverse of the above. Map the left (and head) state back to
+    the world frame via the right gripper pose, then add the state to masked dims."""
+
+    mask: Sequence[bool] | None
+    action_dim: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data or self.mask is None:
+            return data
+        state = np.array(data["state"], dtype=np.float32, copy=True)
+        actions = np.array(data["actions"], dtype=np.float32, copy=True)
+
+        right = _rot6d_pos_to_mat(state[10:16], state[16:19])
+        r6, p = _mat_to_rot6d_pos(right @ _rot6d_pos_to_mat(state[:6], state[6:9]))
+        state[:6], state[6:9] = r6, p
+        if self.action_dim == 29:
+            r6, p = _mat_to_rot6d_pos(right @ _rot6d_pos_to_mat(state[20:26], state[26:29]))
+            state[20:26], state[26:29] = r6, p
+
+        mask = np.asarray(self.mask)
+        dims = mask.shape[-1]
+        actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+        data["actions"] = actions
+        return data
+
+
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer

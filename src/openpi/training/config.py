@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.xmi_rby_policy as xmi_rby_policy
+import openpi.policies.xmi_yam_policy as xmi_yam_policy
 import openpi.policies.yam_policy as yam_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -134,6 +135,13 @@ class DataConfig:
     # action chunk (e.g. velocity_aggregator='mean_lookahead' averages over
     # the trailing portion only). Default 0 = no lookahead.
     extra_horizon_lookahead_frames: int = 0
+
+    # Per-frame validity column (int 1/0) in the LeRobot parquet. If set, the
+    # loader trains only on sample indices t whose chunk frames t..t+H-1 (clipped
+    # to the episode end) are all valid, via the same parquet-only precompute +
+    # torch Subset path as the RABC gate (intersected with it when both apply).
+    # Written by passive-xmi-vis convert_to_lerobot.py as "frame_valid".
+    valid_frame_column: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -814,6 +822,80 @@ def _compute_sarm_reward_stats(
         f"μ={mu:.6f}, σ={sigma:.6f}, n={len(rewards)}"
     )
     return mu, sigma
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotXmiYamDataConfig(DataConfigFactory):
+    """EgoMI (XMI) recipe for bimanual YAM, ported from xdofai/openpi
+    dev/justinyu/xmi_rby LeRobotXmiRbyDataConfig (same transforms; RBY naming dropped).
+
+    Dataset: passive-xmi-vis convert_to_lerobot.py output (LeRobot v3.0). 29D state/
+    actions [left rot6d, pos, grip, right rot6d, pos, grip, head(top cam) rot6d, pos],
+    frame = right-arm base, actions[t] == state[t] (pose at the same step), gripper
+    0=open 1=closed, images 224x224 (top center-cropped, wrists padded).
+    """
+
+    default_prompt: str | None = None
+    retarget_mode: xmi_yam_policy.RetargetMode = "29D-intergripper-relative"
+    use_top_camera: bool = True
+    # Right-arm state z noise (N(0, 0.2 m)) in the intergripper transform, as in the reference.
+    perturb_z: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "left_camera-images-rgb": "left_camera-images-rgb",
+                        "right_camera-images-rgb": "right_camera-images-rgb",
+                        "top_camera-images-rgb": "top_camera-images-rgb",
+                        "state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        d = xmi_yam_policy.layout_dim(self.retarget_mode)
+        data_transforms = _transforms.Group(
+            inputs=[
+                xmi_yam_policy.XmiYamInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    retarget_mode=self.retarget_mode,
+                    use_top_camera=self.use_top_camera,
+                )
+            ],
+            outputs=[xmi_yam_policy.XmiYamOutputs(action_out_dim=d)],
+        )
+        # rot6d + pos as deltas, gripper absolute; 29D adds the head block (delta).
+        if d == 20:
+            delta_action_mask = _transforms.make_bool_mask(9, -1, 9, -1)
+        else:
+            delta_action_mask = _transforms.make_bool_mask(9, -1, 9, -1, 9)
+        if "intergripper" in self.retarget_mode:
+            data_transforms = data_transforms.push(
+                inputs=[
+                    _transforms.Bimanual_InterGripperProprio_DeltaActions(
+                        delta_action_mask, action_dim=d, perturb_z=self.perturb_z
+                    )
+                ],
+                outputs=[_transforms.Bimanual_InterGripperProprio_AbsoluteActions(delta_action_mask, action_dim=d)],
+            )
+        else:
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1738,6 +1820,56 @@ _CONFIGS = [
     #
     # Fine-tuning XMI RBY configs.
     #
+    # ---- EgoMI recipe on bimanual YAM (passive XMI, puma1 station, 2026-10-04) ----
+    # Recipe from xdofai/openpi dev/justinyu/xmi_rby pi0_xmi_rby (pi0, H=40,
+    # 29D-intergripper-relative, top camera on) with history_mode=single_tstep_state
+    # (keyframe history not ported). Init: general XMI pretrain. bs128 is meant to run
+    # with OPENPI_REMAT_POLICY=dots_with_no_batch_dims_saveable and
+    # XLA_PYTHON_CLIENT_MEM_FRACTION=0.93 on 8xA100-80GB (fsdp_devices=2), see
+    # docs/speedup/SPEEDUP_EXPLAINED.md.
+    TrainConfig(
+        name="pi0_xmi_yam_bottles_29d",
+        model=pi0_config.Pi0Config(action_horizon=40),
+        data=LeRobotXmiYamDataConfig(
+            repo_id="uynitsuj/passive_xmi_autolab_bimanual_yam_29d",
+            default_prompt="put the plastic bottles in the bin",
+            retarget_mode="29D-intergripper-relative",
+            use_top_camera=True,
+            base_config=DataConfig(prompt_from_task=True, valid_frame_column="frame_valid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_xmi_rby_pretrain_data_20250811_20250813_162402/71000/params"
+        ),
+        batch_size=128,
+        num_workers=16,  # 3 video decodes per sample; 200-CPU box
+        fsdp_devices=2,
+        num_train_steps=30_000,
+        save_interval=2_500,
+        keep_period=5_000,
+    ),
+    TrainConfig(
+        # Smoke test of the same pipeline: a few hundred steps, frequent logs, no wandb.
+        name="pi0_xmi_yam_bottles_29d_smoke",
+        model=pi0_config.Pi0Config(action_horizon=40),
+        data=LeRobotXmiYamDataConfig(
+            repo_id="uynitsuj/passive_xmi_autolab_bimanual_yam_29d",
+            default_prompt="put the plastic bottles in the bin",
+            retarget_mode="29D-intergripper-relative",
+            use_top_camera=True,
+            base_config=DataConfig(prompt_from_task=True, valid_frame_column="frame_valid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_xmi_rby_pretrain_data_20250811_20250813_162402/71000/params"
+        ),
+        batch_size=128,
+        num_workers=16,  # 3 video decodes per sample; 200-CPU box
+        fsdp_devices=2,
+        num_train_steps=300,
+        log_interval=10,
+        save_interval=300,
+        keep_period=None,
+        wandb_enabled=False,
+    ),
     TrainConfig(
         name="pi0_xmi_rby",
         model=pi0_config.Pi0Config(action_horizon=10),

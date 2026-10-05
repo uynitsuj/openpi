@@ -41,6 +41,8 @@ def create_torch_dataloader(
             RemoveStrings(),
         ],
     )
+    # Same valid-frame mask as training, so stats cover exactly the trained chunks.
+    dataset = _data_loader.apply_valid_frame_subset(dataset, data_config, action_horizon)
     if max_frames is not None and max_frames < len(dataset):
         num_batches = max_frames // batch_size
         shuffle = True

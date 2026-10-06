@@ -1872,6 +1872,52 @@ _CONFIGS = [
         wandb_enabled=False,
     ),
     TrainConfig(
+        # Same recipe as pi0_xmi_yam_bottles_29d, on the no-IK autolab dataset: arm poses are the
+        # raw XMI TCP targets, not the FK of the IK solution (passive-xmi-vis
+        # convert_to_lerobot.py --pose-source target).
+        name="pi0_xmi_yam_bottles_29d_noik",
+        model=pi0_config.Pi0Config(action_horizon=40),
+        data=LeRobotXmiYamDataConfig(
+            repo_id="uynitsuj/passive_xmi_autolab_bimanual_yam_29d_noik",
+            default_prompt="put the plastic bottles in the bin",
+            retarget_mode="29D-intergripper-relative",
+            use_top_camera=True,
+            base_config=DataConfig(prompt_from_task=True, valid_frame_column="frame_valid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_xmi_rby_pretrain_data_20250811_20250813_162402/71000/params"
+        ),
+        batch_size=128,
+        num_workers=16,
+        fsdp_devices=2,
+        num_train_steps=50_000,
+        save_interval=20_000,
+        keep_period=20_000,
+    ),
+    TrainConfig(
+        # Mid-training on the keystone-delivered passive-XMI bottles data (good-labeled, rest
+        # check passed), no-IK poses, same 29D frame and recipe as the autolab fine-tune.
+        # Built by passive-xmi-vis delivered_batch.py --no-ik + convert_delivered_to_lerobot.py.
+        name="pi0_xmi_yam_bottles_delivered_mid_29d_noik",
+        model=pi0_config.Pi0Config(action_horizon=40),
+        data=LeRobotXmiYamDataConfig(
+            repo_id="uynitsuj/passive_xmi_delivered_bottles_29d_noik",
+            default_prompt="put the plastic bottles in the bin",
+            retarget_mode="29D-intergripper-relative",
+            use_top_camera=True,
+            base_config=DataConfig(prompt_from_task=True, valid_frame_column="frame_valid"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "s3://xdof-internal-research/model_ckpts/pi0_xmi_rby/sky_xmi_rby_pretrain_data_20250811_20250813_162402/71000/params"
+        ),
+        batch_size=128,
+        num_workers=16,
+        fsdp_devices=2,
+        num_train_steps=80_000,
+        save_interval=20_000,
+        keep_period=20_000,
+    ),
+    TrainConfig(
         name="pi0_xmi_rby",
         model=pi0_config.Pi0Config(action_horizon=10),
         data=LeRobotXmiRbyDataConfig(

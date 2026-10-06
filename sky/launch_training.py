@@ -63,6 +63,7 @@ class SkyPilotTrainingConfig:
     save_interval: Optional[int] = None  # Override TrainConfig.save_interval to control checkpoint save frequency.
     keep_period: Optional[int] = None  # Override TrainConfig.keep_period (orbax keeps checkpoints at step%keep_period==0 forever).
     fsdp_devices: Optional[int] = None  # Override TrainConfig.fsdp_devices. Must divide the GPU count (e.g. set 1 for a single-GPU node).
+    extra_env: List[str] = field(default_factory=list)  # KEY=VALUE pairs exported on the worker, e.g. OPENPI_REMAT_POLICY=dots_with_no_batch_dims_saveable
 
 
 def main(cfg: SkyPilotTrainingConfig):
@@ -187,6 +188,11 @@ def main(cfg: SkyPilotTrainingConfig):
         keep_period_override=cfg.keep_period,
         fsdp_devices_override=cfg.fsdp_devices,
     )
+    for kv in cfg.extra_env:
+        key, sep, value = kv.partition("=")
+        if not sep or not key:
+            raise ValueError(f"--extra-env expects KEY=VALUE, got {kv!r}")
+        sky_config["envs"][key] = value
 
     config_file = None
     try:

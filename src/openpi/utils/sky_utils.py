@@ -451,7 +451,7 @@ def launch_training(config_file: Path, cluster_name: Optional[str] = None, manag
         print(f"[INFO] Launching cluster job with config: {config_file}")
         launch_cmd = f"sky launch '{config_file}' --retry-until-up --yes"
         if cluster_name:
-            launch_cmd += f" --cluster-name {cluster_name}"
+            launch_cmd += f" --cluster {cluster_name}"
 
     if not managed:
         run_command(launch_cmd)

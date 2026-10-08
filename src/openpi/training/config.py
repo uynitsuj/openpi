@@ -1919,6 +1919,31 @@ _CONFIGS = [
         keep_period=20_000,
     ),
     TrainConfig(
+        # pi0_xmi_yam_bottles_29d_noik_from_mid60k plus 23 simulated contact-replay episodes:
+        # 50 real + 23 sim train episodes (0:73); episodes 73:76 are the 3 held-out real
+        # episodes and are excluded here (training and norm stats). Same init, recipe and budget,
+        # so the comparison with from_mid60k isolates the sim data.
+        name="pi0_xmi_yam_bottles_29d_realsim_noik_from_mid60k",
+        model=pi0_config.Pi0Config(action_horizon=40),
+        data=LeRobotXmiYamDataConfig(
+            repo_id="uynitsuj/passive_xmi_autolab_real_sim_29d_noik_lowres32_v1",
+            default_prompt="put the plastic bottles in the bin",
+            retarget_mode="29D-intergripper-relative",
+            use_top_camera=True,
+            base_config=DataConfig(prompt_from_task=True, valid_frame_column="frame_valid", episodes=tuple(range(73))),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "s3://xdof-internal-research/model_ckpts/pi0_xmi_yam_bottles_delivered_mid_29d_noik/"
+            "sky_xmi_yam_delivered_mid_29d_noik_80k_20261005/60000/params"
+        ),
+        batch_size=128,
+        num_workers=16,
+        fsdp_devices=2,
+        num_train_steps=40_000,
+        save_interval=20_000,
+        keep_period=20_000,
+    ),
+    TrainConfig(
         # Mid-training on the keystone-delivered passive-XMI bottles data (good-labeled, rest
         # check passed), no-IK poses, same 29D frame and recipe as the autolab fine-tune.
         # Built by passive-xmi-vis delivered_batch.py --no-ik + convert_delivered_to_lerobot.py.

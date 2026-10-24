@@ -629,7 +629,8 @@ def main(config: _config.TrainConfig):
             observation = dataclasses.replace(observation, sample_weights=bc_weight_jax)
             batch = (observation, actions)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+        if ((step % config.save_interval == 0 and step > start_step)
+                or step + 1 in config.checkpoint_steps or step == config.num_train_steps - 1):
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step, config.s3_checkpoint_path)
 
     logging.info("Waiting for checkpoint manager to finish")

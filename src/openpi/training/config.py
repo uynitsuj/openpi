@@ -1508,6 +1508,7 @@ class TrainConfig:
     num_val_batches: int = 8
     # How often (in steps) to save checkpoints.
     save_interval: int = 10000
+    checkpoint_steps: tuple[int, ...] = ()
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 10000
 

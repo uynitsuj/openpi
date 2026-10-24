@@ -1,4 +1,5 @@
 import dataclasses
+import math
 from typing import TYPE_CHECKING
 
 import flax.nnx as nnx
@@ -32,9 +33,22 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Match ABC's exclusive prefix bound: 8 samples lengths 0 through 7.
+    max_action_prefix: int = 0
+    prefix_conditioning_prob: float = 1.0
+    prefix_noise_scale: float = 0.0
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
+        if not 0 <= self.max_action_prefix <= self.action_horizon:
+            raise ValueError("max_action_prefix must be between zero and action_horizon")
+        if self.max_action_prefix and not self.pi05:
+            raise ValueError("Clean-prefix training is implemented for pi0.5")
+        if not 0 <= self.prefix_conditioning_prob <= 1:
+            raise ValueError("prefix_conditioning_prob must be in [0, 1]")
+        if not math.isfinite(self.prefix_noise_scale) or self.prefix_noise_scale < 0:
+            raise ValueError("prefix_noise_scale must be finite and non-negative")
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:

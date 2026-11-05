@@ -80,8 +80,22 @@ class Policy(BasePolicy):
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
 
+    def set_ode_carry(self, carry) -> None:
+        """ODE head: route sample calls through the per-world carried reference (ode_policy.ODECarry)."""
+        self._ode_carry = carry
+        self._sample_actions = carry
+
+    @override
+    def reset(self) -> None:
+        carry = getattr(self, "_ode_carry", None)
+        if carry is not None:
+            carry.reset()
+
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        # ODE head: a client may mark the first observation of an episode with obs["reset"] = True.
+        if isinstance(obs, dict) and obs.pop("reset", False):
+            self.reset()
         # Pluck RTC fields off before transformations — they're model-side guidance
         # hints, not observations that need _input_transform's scaling / resizing.
         # Both are forwarded straight to sample_actions via sample_kwargs below.

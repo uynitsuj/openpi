@@ -116,6 +116,14 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # ODE action head (openpi.models.pi0_ode). Normalised reference to integrate the chunk from (the last
+    # executed / demonstrated action before the chunk; the measured state at an episode start), the per-dimension
+    # slope of the normalisation (to express the start perturbation in raw units), and which chunk steps lie
+    # inside the episode. All None for the other models.
+    ode_start: at.Float[ArrayT, "*b s"] | None = None
+    ode_unit_scale: at.Float[ArrayT, "*b s"] | None = None
+    action_valid_mask: at.Bool[ArrayT, "*b ah"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -138,6 +146,9 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            ode_start=data.get("ode_start"),
+            ode_unit_scale=data.get("ode_unit_scale"),
+            action_valid_mask=data.get("action_valid_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -241,6 +252,9 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        ode_start=observation.ode_start,
+        ode_unit_scale=observation.ode_unit_scale,
+        action_valid_mask=observation.action_valid_mask,
     )
 
 

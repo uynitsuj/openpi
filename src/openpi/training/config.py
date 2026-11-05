@@ -16,10 +16,12 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi0_ode as pi0_ode
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.ode_policy as ode_policy
 import openpi.policies.xmi_rby_policy as xmi_rby_policy
 import openpi.policies.yam_policy as yam_policy
 import openpi.shared.download as _download
@@ -27,6 +29,7 @@ import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
+import openpi.training.ode_weight_loader as ode_weight_loader
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
@@ -134,6 +137,11 @@ class DataConfig:
     # action chunk (e.g. velocity_aggregator='mean_lookahead' averages over
     # the trailing portion only). Default 0 = no lookahead.
     extra_horizon_lookahead_frames: int = 0
+
+    # ODE action head (openpi.models.pi0_ode): the loader fetches one extra action row before the chunk
+    # (offsets -1..H-1; ODESplitPrevAction turns it into the integration start), and Normalize is followed by
+    # ODENormalizeStart (start in action units + d normalised / d raw). Set by the LeRobot*ODEDataConfig factories.
+    ode_head: bool = False
 
 
 class GroupFactory(Protocol):
@@ -1288,6 +1296,51 @@ class LeRobotScizorSidecarDataConfig(LeRobotYamRormDataConfig):
         )
 
 
+def _ode_data_config(data_config: DataConfig, model_config: _model.BaseModelConfig) -> DataConfig:
+    """Turn a YAM data config into its ODE-head version (openpi.models.pi0_ode / openpi.policies.ode_policy).
+
+    Same frames, images, prompt, episode split, sidecar gating and norm stats; additionally the loader fetches the
+    action row before the chunk (ode_head), the repack keeps LeRobot's `actions_is_pad`, and ODESplitPrevAction
+    (raw units, right before YamInputs) turns row -1 into the integration start and masks padded chunk steps.
+    """
+    if not isinstance(model_config, pi0_ode.Pi0ODEConfig):
+        raise ValueError(f"ODE data configs need a Pi0ODEConfig model, got {type(model_config).__name__}")
+    repack = []
+    for t in data_config.repack_transforms.inputs:
+        if isinstance(t, _transforms.RepackTransform) and "actions" in t.structure:
+            t = _transforms.RepackTransform({**t.structure, "actions_is_pad": "actions_is_pad"})
+        repack.append(t)
+    inputs = list(data_config.data_transforms.inputs)
+    robot = [i for i, t in enumerate(inputs) if isinstance(t, yam_policy.YamInputs)]
+    if len(robot) != 1:
+        raise ValueError("ODE data config expects exactly one YamInputs transform")
+    inputs.insert(robot[0], ode_policy.ODESplitPrevAction(action_horizon=model_config.action_horizon))
+    return dataclasses.replace(
+        data_config,
+        ode_head=True,
+        repack_transforms=_transforms.Group(inputs=repack, outputs=data_config.repack_transforms.outputs),
+        data_transforms=_transforms.Group(inputs=inputs, outputs=data_config.data_transforms.outputs),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotScizorSidecarODEDataConfig(LeRobotScizorSidecarDataConfig):
+    """LeRobotScizorSidecarDataConfig (sidecar mask, subset pre-filtering) for the ODE head. Training only."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        return _ode_data_config(super().create(assets_dirs, model_config), model_config)
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotYamODEDataConfig(LeRobotYamDataConfig):
+    """LeRobotYamDataConfig for the ODE head: serving (same YamInputs / model transforms as training)."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        return _ode_data_config(super().create(assets_dirs, model_config), model_config)
+
+
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
@@ -2362,6 +2415,63 @@ _CONFIGS = [
         save_interval=10_000,
         keep_period=10_000,
         rabc_enabled=False,
+    ),
+    # ── ODE action head on pi0 (github.com/NTUMARS/ODE-POLICY vla-pi05, ported to pi0; openpi.models.pi0_ode).
+    # Same data / mask / batch / steps / FSDP as pi0_put_bottles_mjwarp_h19base_sidecar_bs128 (the A/B baseline);
+    # only the action head changes: pi0's flow-matching action expert is replaced by one learned query token read
+    # out of the PaliGemma VLM + a FiLM-MLP vector field integrated with RK4 over the 30-step chunk, from the last
+    # executed reference. LR schedule = the paper's pi05 recipe (100 warmup, cosine 5e-5 -> 5e-6; their run length
+    # was 7,120 updates, ours 7,500); AdamW / clip 1.0 / EMA 0.99 as the pi0 baseline.
+    TrainConfig(
+        name="pi0_ode_put_bottles_h19base_sidecar_bs128",
+        model=pi0_ode.Pi0ODEConfig(action_horizon=30),
+        data=LeRobotScizorSidecarODEDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            scizor_sidecar_path="",
+            scizor_eps_s=0.5,
+            scizor_weight_mode="binary",
+            scizor_score_column="h19_drop",
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=ode_weight_loader.Pi0ODEWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=100, peak_lr=5e-5, decay_steps=7_500, decay_lr=5e-6),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=True,
+    ),
+    # Serving config for the ODE arm (the sidecar data config refuses to build without a mask, exactly why the pi0
+    # arms are served with pi0_put_bottles_mjwarp_no_rabc). Same model and inference transforms as training.
+    TrainConfig(
+        name="pi0_ode_put_bottles_infer",
+        model=pi0_ode.Pi0ODEConfig(action_horizon=30),
+        data=LeRobotYamODEDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=ode_weight_loader.Pi0ODEWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=7_500,
+    ),
+    # CPU / single-GPU plumbing check: tiny Gemma ("dummy"), fake data, no pretrained weights.
+    TrainConfig(
+        name="debug_pi0_ode",
+        model=pi0_ode.Pi0ODEConfig(paligemma_variant="dummy", action_horizon=30),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_workers=0,
+        num_train_steps=10,
+        log_interval=1,
+        save_interval=10,
+        keep_period=None,
+        ema_decay=None,
+        wandb_enabled=False,
+        checkpoint_base_dir="./checkpoints",
     ),
     # ── WARP-BC (reward-aligned BC) + vanilla BC: 06_10 d405 deliveries
     #    (box, bottles) + tshirt folding. 9 WARP-BC (3 tasks × {sss15,sss30,sss45}

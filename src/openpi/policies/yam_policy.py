@@ -129,6 +129,13 @@ class YamInputs(transforms.DataTransformFn):
         if "condition" in data:
             inputs["condition"] = np.asarray(data["condition"], dtype=np.float32)
 
+        # ODE action head (openpi.policies.ode_policy.ODESplitPrevAction): the reference to integrate from
+        # (same layout as the action, padded like it) and the in-episode mask of the chunk.
+        if "ode_start" in data:
+            inputs["ode_start"] = transforms.pad_to_dim(np.asarray(data["ode_start"], dtype=np.float32), self.action_dim)
+        if "action_valid_mask" in data:
+            inputs["action_valid_mask"] = np.asarray(data["action_valid_mask"], dtype=bool)
+
         return inputs
 
 

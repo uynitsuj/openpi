@@ -182,6 +182,10 @@ class FakeDataset(Dataset):
 
         observation = jax.tree.map(make_from_spec, self._observation_spec)
         action = jax.tree.map(make_from_spec, self._action_spec)
+        if observation.action_valid_mask is not None:  # ODE head: all chunk steps inside the episode
+            observation = dataclasses.replace(
+                observation, action_valid_mask=jnp.ones_like(observation.action_valid_mask)
+            )
 
         return {
             **observation.to_dict(),
@@ -204,7 +208,9 @@ def create_torch_dataset(
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     delta_ts = [t / dataset_meta.fps for t in range(action_horizon)]
-    delta_timestamps = {key: delta_ts for key in data_config.action_sequence_keys}
+    # ODE head: one more action row before the chunk (the reference held when the anchor frame is observed).
+    action_delta_ts = [t / dataset_meta.fps for t in range(-1, action_horizon)] if data_config.ode_head else delta_ts
+    delta_timestamps = {key: action_delta_ts for key in data_config.action_sequence_keys}
     # Extra keys (e.g., repromo_signed_magnitude) get a possibly-longer
     # window when extra_horizon_lookahead_frames > 0 (so RABC aggregators
     # like 'mean_lookahead' can see vel beyond the action chunk).
@@ -629,6 +635,15 @@ def _spot_check_valid_indices(
     logging.info(f"[rabc_precompute] spot-check OK on {len(sampled)} samples")
 
 
+def _ode_normalize_start(data_config: _config.DataConfig, norm_stats) -> list[_transforms.DataTransformFn]:
+    """ODE head: the transform that follows Normalize (start reference in action units, unit slope)."""
+    if not getattr(data_config, "ode_head", False) or not norm_stats:
+        return []
+    from openpi.policies.ode_policy import ODENormalizeStart
+
+    return [ODENormalizeStart(norm_stats, use_quantiles=data_config.use_quantile_norm)]
+
+
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
@@ -644,6 +659,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
         *data_config.repack_transforms.inputs,
         *data_config.data_transforms.inputs,
         _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        *_ode_normalize_start(data_config, norm_stats),
         *data_config.model_transforms.inputs,
     ]
     # Only the per-getitem rejection mode wraps here; the subset mode does its

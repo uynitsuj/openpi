@@ -16,7 +16,7 @@ source .venv/bin/activate
 export GIT_LFS_SKIP_SMUDGE=1
 uv sync
 uv pip install -e .
-python -c "import openpi.training.config as c; c.get_config('pi0_put_bottles_mjwarp_h19base_sidecar'); c.get_config('pi0_put_bottles_mjwarp_no_rabc'); c.get_config('pi0_put_bottles_mjwarp_rabc_sss15'); print('configs ok')"
+python -c "import openpi.training.config as c; c.get_config('pi0_put_bottles_mjwarp_h19base_sidecar'); c.get_config('pi0_put_bottles_mjwarp_no_rabc'); c.get_config('pi0_put_bottles_mjwarp_rabc_sss15'); c.get_config('pi0_ode_put_bottles_h19base_sidecar_bs128'); c.get_config('pi0_ode_put_bottles_infer'); print('configs ok')"
 python -c "import jax; print('jax', jax.__version__)"
 aws --version
 echo "SETUP_OK"

@@ -72,13 +72,20 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
-    return _policy.Policy(
+    ode_inputs = []
+    if data_config.ode_head:
+        from openpi.policies.ode_policy import ODENormalizeStart
+
+        ode_inputs = [ODENormalizeStart(norm_stats, use_quantiles=data_config.use_quantile_norm)]
+
+    policy = _policy.Policy(
         model,
         transforms=[
             *repack_transforms.inputs,
             transforms.InjectDefaultPrompt(default_prompt),
             *data_config.data_transforms.inputs,
             transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            *ode_inputs,
             *data_config.model_transforms.inputs,
         ],
         output_transforms=[
@@ -92,3 +99,30 @@ def create_trained_policy(
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )
+
+    from openpi.models import pi0_ode as _pi0_ode
+
+    if isinstance(train_config.model, _pi0_ode.Pi0ODEConfig):
+        if not data_config.ode_head:
+            raise ValueError(f"{train_config.name}: a Pi0ODE model needs an ODE data config (ode_head=True)")
+        _enable_ode_carry(policy, train_config.model, norm_stats, data_config.use_quantile_norm)
+    return policy
+
+
+def _enable_ode_carry(policy: _policy.Policy, model_config, norm_stats, use_quantiles: bool) -> None:
+    """Wrap the policy's sample function with the per-world carried reference (openpi.policies.ode_policy)."""
+    import os
+
+    from openpi.policies import ode_policy
+
+    executed = int(os.environ.get("OPENPI_ODE_EXECUTED_STEPS", model_config.executed_steps or model_config.action_horizon))
+    _, slope = ode_policy._unit_slope_and_normalize(norm_stats["actions"], use_quantiles)
+    carry = ode_policy.ODECarry(
+        policy._sample_actions,
+        executed_steps=executed,
+        action_slope=transforms.pad_to_dim(slope, model_config.action_dim),
+        jump_dims=ode_policy.yam_arm_dims() if model_config.ode_dim == 14 else tuple(range(model_config.ode_dim)),
+        reset_jump_rad=model_config.reset_jump_rad,
+    )
+    policy.set_ode_carry(carry)
+    logging.info(f"ODE head: carrying the executed reference per world (row {executed - 1} of each chunk)")

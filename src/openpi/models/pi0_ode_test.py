@@ -118,3 +118,46 @@ def test_sample_actions_jits_and_matches_eager(tiny):
 
     jitted = nnx_utils.module_jit(model.sample_actions)
     np.testing.assert_allclose(jitted(jax.random.key(0), obs), model.sample_actions(jax.random.key(0), obs), atol=1e-6)
+
+
+def test_gripper_head_config_validation():
+    assert pi0_ode.Pi0ODEConfig(gripper_head_dims=(6, 13)).gripper_head_dims == (6, 13)
+    for bad in ((6, 6), (14,), (-1,), tuple(range(14))):
+        with pytest.raises(ValueError):
+            pi0_ode.Pi0ODEConfig(gripper_head_dims=bad)
+
+
+def test_gripper_head_model():
+    """gripper_head_dims: those entries come from a direct head on c; the field integrates the others only."""
+    cfg = pi0_ode.Pi0ODEConfig(paligemma_variant="dummy", action_horizon=8, gripper_head_dims=(6, 13))
+    model = cfg.create(jax.random.key(0))
+    keys = set(flatten_dict(nnx.state(model, nnx.Param).to_pure_dict(), sep="/"))
+    assert {k.split("/")[0] for k in keys} == {"PaliGemma", "ode_query", "ode_field", "ode_gripper"}
+    assert model.ode_field.out.kernel.value.shape[-1] == 12
+    assert model.ode_field.inp.kernel.value.shape[0] == 12 + 14  # field state (12) + full proprioception (14)
+    obs = cfg.fake_obs(2)
+    obs = dataclasses.replace(obs, ode_start=jax.random.normal(jax.random.key(1), obs.ode_start.shape))
+    actions = model.sample_actions(jax.random.key(0), obs)
+    assert actions.shape == (2, 8, 32)
+    arm = [i for i in range(14) if i not in (6, 13)]
+    # zero-initialised field: the integrated dims stay at the start; the gripper dims are the head's output
+    np.testing.assert_allclose(actions[:, :, arm], np.broadcast_to(np.asarray(obs.ode_start[:, None, arm]), (2, 8, 12)))
+    c = model.condition(_model_preprocess(obs))
+    np.testing.assert_allclose(actions[:, :, [6, 13]], model.ode_gripper(c), rtol=1e-5, atol=1e-6)
+    # the start of the gripper dims is irrelevant (not integrated)
+    a2 = model.sample_actions(
+        jax.random.key(0), dataclasses.replace(obs, ode_start=obs.ode_start.at[:, [6, 13]].add(5.0))
+    )
+    np.testing.assert_allclose(actions, a2, atol=1e-6)
+    target = jax.random.normal(jax.random.key(3), cfg.fake_act(2).shape)
+    loss = model.compute_loss(jax.random.key(0), obs, target, train=True)
+    assert loss.shape == (2, 8) and np.all(np.isfinite(loss))
+    g = nnx.grad(lambda m: jnp.mean(m.compute_loss(jax.random.key(0), obs, target, train=True)))(model)
+    flat = flatten_dict(g.to_pure_dict(), sep="/")
+    assert sum(float(jnp.sum(jnp.square(v))) for k, v in flat.items() if k.startswith("ode_gripper")) > 0
+
+
+def _model_preprocess(obs):
+    from openpi.models import model as _m
+
+    return _m.preprocess_observation(None, obs, train=False)

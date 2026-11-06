@@ -4,6 +4,7 @@ import pathlib
 from typing import Any
 
 import jax.numpy as jnp
+import numpy as np
 
 import openpi.models.model as _model
 import openpi.policies.policy as _policy
@@ -102,27 +103,52 @@ def create_trained_policy(
 
     from openpi.models import pi0_ode as _pi0_ode
 
+    # "Execute n of H" (serving only; any model): OPENPI_EXECUTE_STEPS=n truncates every returned chunk to n rows, so a
+    # caller that executes whole chunks (abc-rabc batched runner) replans every n steps. OPENPI_ODE_EXECUTED_STEPS is the
+    # older ODE-only name (carried row only, no truncation).
+    execute = os.environ.get("OPENPI_EXECUTE_STEPS")
     if isinstance(train_config.model, _pi0_ode.Pi0ODEConfig):
         if not data_config.ode_head:
             raise ValueError(f"{train_config.name}: a Pi0ODE model needs an ODE data config (ode_head=True)")
-        _enable_ode_carry(policy, train_config.model, norm_stats, data_config.use_quantile_norm)
+        _enable_ode_carry(policy, train_config.model, norm_stats, data_config.use_quantile_norm, execute)
+    if execute:
+        from openpi.policies import ode_policy
+
+        n = int(execute)
+        if not 0 < n <= train_config.model.action_horizon:
+            raise ValueError(f"OPENPI_EXECUTE_STEPS={n} must be in (0, {train_config.model.action_horizon}]")
+        policy._sample_actions = ode_policy.TruncateChunk(policy._sample_actions, n)
+        logging.info(f"Serving: returning (and executing) {n} of {train_config.model.action_horizon} rows per chunk")
     return policy
 
 
-def _enable_ode_carry(policy: _policy.Policy, model_config, norm_stats, use_quantiles: bool) -> None:
+def _enable_ode_carry(policy: _policy.Policy, model_config, norm_stats, use_quantiles: bool, execute=None) -> None:
     """Wrap the policy's sample function with the per-world carried reference (openpi.policies.ode_policy)."""
-    import os
-
     from openpi.policies import ode_policy
 
-    executed = int(os.environ.get("OPENPI_ODE_EXECUTED_STEPS", model_config.executed_steps or model_config.action_horizon))
-    _, slope = ode_policy._unit_slope_and_normalize(norm_stats["actions"], use_quantiles)
+    executed = int(
+        execute
+        or os.environ.get("OPENPI_ODE_EXECUTED_STEPS", model_config.executed_steps or model_config.action_horizon)
+    )
+    normalize, slope = ode_policy._unit_slope_and_normalize(norm_stats["actions"], use_quantiles)
+    # OPENPI_ODE_SNAP_GRIPPER=1: snap integrated YAM grippers (6, 13) to the normalised open/closed command (0 / 1) at
+    # chunk boundaries (paper's rule for a gripper ODE state). No-op for models whose grippers use the direct head.
+    snap_dims, snap_levels = (), None
+    if os.environ.get("OPENPI_ODE_SNAP_GRIPPER", "0") == "1" and model_config.ode_dim == 14:
+        snap_dims = tuple(d for d in (6, 13) if d not in model_config.gripper_head_dims)
+        if snap_dims:
+            lo, hi = normalize(np.zeros(14, np.float32)), normalize(np.ones(14, np.float32))
+            snap_levels = np.stack([[lo[d], hi[d]] for d in snap_dims]).astype(np.float32)
     carry = ode_policy.ODECarry(
         policy._sample_actions,
         executed_steps=executed,
         action_slope=transforms.pad_to_dim(slope, model_config.action_dim),
         jump_dims=ode_policy.yam_arm_dims() if model_config.ode_dim == 14 else tuple(range(model_config.ode_dim)),
         reset_jump_rad=model_config.reset_jump_rad,
+        snap_dims=snap_dims,
+        snap_levels=snap_levels,
     )
     policy.set_ode_carry(carry)
-    logging.info(f"ODE head: carrying the executed reference per world (row {executed - 1} of each chunk)")
+    logging.info(
+        f"ODE head: carrying the executed reference per world (row {executed - 1} of each chunk); snap dims {snap_dims}"
+    )

@@ -107,6 +107,11 @@ class ODECarry:
       * a row's measured arm joints are > reset_jump_rad away from its carried reference (a new episode
         whose initial pose differs; the batched runner never needs this) -> that row.
     Everything is in normalised action units; `action_slope` (d normalised / d raw) converts the jump test to rad.
+
+    snap_dims / snap_levels (optional): integrated near-binary dims (grippers kept in the ODE state) whose carried
+    reference is snapped to the nearer of two levels (normalised open / closed command) at every chunk boundary --
+    the paper's rule for a gripper ODE state (METHOD_NOTES: training always starts it at a demonstrated command, so an
+    unsnapped state drifts away). Only the carried start changes; the returned chunk is untouched.
     """
 
     def __init__(
@@ -117,8 +122,14 @@ class ODECarry:
         action_slope: np.ndarray,
         jump_dims: tuple[int, ...],
         reset_jump_rad: float,
+        snap_dims: tuple[int, ...] = (),
+        snap_levels: np.ndarray | None = None,
     ):
         self._fn = sample_fn
+        self._snap_dims = np.asarray(snap_dims, np.int64)
+        self._snap_levels = None if snap_levels is None else np.asarray(snap_levels, np.float32).reshape(-1, 2)
+        if len(self._snap_dims) and (self._snap_levels is None or len(self._snap_levels) != len(self._snap_dims)):
+            raise ValueError("snap_levels must give (low, high) for every snap dim")
         self.executed_steps = int(executed_steps)
         self._slope = np.asarray(action_slope, np.float32)
         self._jump_dims = np.asarray(jump_dims, np.int64)
@@ -163,11 +174,27 @@ class ODECarry:
         observation = dataclasses.replace(observation, ode_start=jnp.asarray(start, dtype=jnp.float32))
         actions = self._fn(rng, observation, **kwargs)
         self._ref = np.array(actions[:, self.executed_steps - 1, :], dtype=np.float32)
+        if len(self._snap_dims):
+            lo, hi = self._snap_levels[:, 0], self._snap_levels[:, 1]
+            x = self._ref[:, self._snap_dims]
+            self._ref[:, self._snap_dims] = np.where(np.abs(x - lo) <= np.abs(x - hi), lo, hi)
         self._valid = np.ones(self._ref.shape[0], bool)
         self.stats["calls"] += 1
         self.stats["carried_rows"] += int(carried.sum())
         self.stats["fresh_rows"] += int((~carried).sum())
         return actions
+
+
+class TruncateChunk:
+    """Return only the first `steps` rows of every chunk: a caller that executes the whole returned chunk (the abc-rabc
+    batched runner) then replans every `steps` control steps ("execute n of H"). Works for any model."""
+
+    def __init__(self, sample_fn: Callable, steps: int):
+        self._fn = sample_fn
+        self.steps = int(steps)
+
+    def __call__(self, rng, observation, **kwargs):
+        return self._fn(rng, observation, **kwargs)[:, : self.steps]
 
 
 def yam_arm_dims() -> tuple[int, ...]:

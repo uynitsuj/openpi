@@ -110,3 +110,12 @@ def test_migration_is_strict(tiny_pair, mutation):
         fref = {k: v for k, v in fref.items() if not k.startswith("ode_query")}
     with pytest.raises(ValueError):
         owl.migrate(unflatten_dict(fsrc, sep="/"), unflatten_dict(fref, sep="/"))
+
+
+def test_migrate_with_gripper_head(tiny_pair):
+    src, _, _ = tiny_pair
+    cfg = pi0_ode.Pi0ODEConfig(paligemma_variant="dummy", action_horizon=8, gripper_head_dims=(6, 13))
+    ref = nnx.state(nnx.eval_shape(cfg.create, jax.random.key(0)), nnx.Param).to_pure_dict()
+    out = flatten_dict(owl.migrate(src, ref), sep="/")
+    new = {k.split("/")[0] for k, v in out.items() if isinstance(v, jax.ShapeDtypeStruct)}
+    assert new == {"ode_query", "ode_field", "ode_gripper"}

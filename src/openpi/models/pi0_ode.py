@@ -57,8 +57,12 @@ class Pi0ODEConfig(pi0_config.Pi0Config):
     """pi0 VLM + learned query token + ODE head. model_type stays PI0 (same tokenizer / transforms / norm)."""
 
     action_horizon: int = 30
-    # Size of the integrated action state: the first ode_dim entries of the action vector.
+    # Size of the action state handled by the ODE head: the first ode_dim entries of the action vector.
     ode_dim: int = 14
+    # Entries of [0, ode_dim) that are NOT integrated but predicted directly from c by a gripper head (the paper's
+    # design: near-binary grippers do not belong in the ODE state -- METHOD_NOTES "the gripper as an ODE state ...
+    # is fragile"). () = everything integrated (the first port, a151ebd). YAM: (6, 13).
+    gripper_head_dims: tuple[int, ...] = ()
     # Vector field (paper defaults: FiLM residual MLP, 4 x 512, zero-initialised output).
     field_width: int = 512
     field_layers: int = 4
@@ -84,6 +88,14 @@ class Pi0ODEConfig(pi0_config.Pi0Config):
         if not 0 < self.ode_dim <= self.action_dim:
             raise ValueError(f"ode_dim={self.ode_dim} must be in (0, action_dim={self.action_dim}]")
         ode_field.as_std_vector(self.perturb_std, self.ode_dim)
+        if len(set(self.gripper_head_dims)) != len(self.gripper_head_dims) or not all(
+            0 <= i < self.ode_dim for i in self.gripper_head_dims
+        ):
+            raise ValueError(
+                f"gripper_head_dims={self.gripper_head_dims} must be distinct entries of [0, {self.ode_dim})"
+            )
+        if len(self.gripper_head_dims) >= self.ode_dim:
+            raise ValueError("at least one dimension must be integrated")
         if self.executed_steps is not None and not 0 < self.executed_steps <= self.action_horizon:
             raise ValueError("executed_steps must be in (0, action_horizon]")
 
@@ -128,14 +140,19 @@ class Pi0ODE(_model.BaseModel):
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         # The learned readout token (paper: N(0, 0.02^2)).
         self.ode_query = nnx.Param(jax.random.normal(rngs.params(), (1, 1, vlm.width)) * 0.02)
+        grip = tuple(sorted(config.gripper_head_dims))
+        self.grip_idx = grip
+        self.field_idx = tuple(i for i in range(config.ode_dim) if i not in grip)
         self.ode_field = ode_field.VectorField(
             cond_dim=vlm.width,
             state_dim=config.ode_dim,
-            field_dim=config.ode_dim,
+            field_dim=len(self.field_idx),
             width=config.field_width,
             num_layers=config.field_layers,
             rngs=rngs,
         )
+        if grip:
+            self.ode_gripper = ode_field.GripperHead(vlm.width, config.action_horizon, len(grip), rngs=rngs)
         self.ode_dim = config.ode_dim
         self.vel_scale = config.vel_scale
         self.perturb_prob = config.perturb_prob
@@ -160,8 +177,16 @@ class Pi0ODE(_model.BaseModel):
         )
         return out[:, -1].astype(jnp.float32)
 
-    def _integrate(self, a0, s, c):
-        return ode_field.integrate(self.ode_field, a0, s, c, horizon=self.action_horizon, vel_scale=self.vel_scale)
+    def _predict(self, a0, s, c):
+        """[B, H, ode_dim]: integrated field dims from a0 (+ gripper-head dims directly from c)."""
+        fidx = jnp.asarray(self.field_idx)
+        path = ode_field.integrate(
+            self.ode_field, a0[..., fidx], s, c, horizon=self.action_horizon, vel_scale=self.vel_scale
+        )
+        if not self.grip_idx:
+            return path
+        out = jnp.zeros((*path.shape[:-1], self.ode_dim), path.dtype).at[..., fidx].set(path)
+        return out.at[..., jnp.asarray(self.grip_idx)].set(self.ode_gripper(c).astype(path.dtype))
 
     @override
     def compute_loss(
@@ -184,10 +209,12 @@ class Pi0ODE(_model.BaseModel):
             if obs.ode_unit_scale is None:
                 raise ValueError("Start perturbation needs observation.ode_unit_scale (ODENormalizeStart)")
             std = jnp.asarray(self.perturb_std, jnp.float32) * obs.ode_unit_scale[..., :d]
+            if self.grip_idx:  # direct-head dims have no start state to perturb
+                std = std.at[..., jnp.asarray(self.grip_idx)].set(0.0)
             a0, target = ode_field.perturb_start(
                 perturb_rng, a0, target, std, prob=self.perturb_prob, decay=self.perturb_decay
             )
-        path = self._integrate(a0, s, c)
+        path = self._predict(a0, s, c)
         return ode_field.path_loss(path, target, valid, vel_scale=self.vel_scale)
 
     @override
@@ -201,5 +228,5 @@ class Pi0ODE(_model.BaseModel):
         obs = _model.preprocess_observation(None, observation, train=False)
         c = self.condition(obs)
         d = self.ode_dim
-        path = self._integrate(obs.ode_start[..., :d].astype(jnp.float32), obs.state[..., :d].astype(jnp.float32), c)
+        path = self._predict(obs.ode_start[..., :d].astype(jnp.float32), obs.state[..., :d].astype(jnp.float32), c)
         return jnp.pad(path, ((0, 0), (0, 0), (0, self.action_dim - d)))

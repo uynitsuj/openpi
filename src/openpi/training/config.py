@@ -2458,6 +2458,85 @@ _CONFIGS = [
         weight_loader=ode_weight_loader.Pi0ODEWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=7_500,
     ),
+    # ODE arm v2 (diagnosis 2026-11-05 of ode_vanilla_s0 = the config above: 1.1 vs 3.8 bottles/scene). Serving and
+    # the per-world carry are correct. The integrated grippers are the clear defect: in closed loop their carried
+    # reference drifts (2.6% of steps fully closed vs pi0 13%, commands up to 1.67), and since the gripper is part of
+    # the field's state it also slows the arm (snapping it to open/closed at chunk boundaries -- the paper's rule for a
+    # gripper ODE state -- raises arm speed 0.0027 -> 0.0035 rad/step in a local closed-loop run). The paper keeps
+    # grippers out of the ODE (a head on c), so do we: gripper_head_dims=(6, 13). The deterministic MSE head still
+    # regresses to the mean (open loop 0.76x demo speed); that is the method, not a bug.
+    #   _grip      H = 30, the pi0 arms' 30-step blocking protocol (primary A/B arm).
+    #   _grip_h8   H = 8, the paper's chunk; served with the _h8 infer config the abc-rabc runner replans every 8 steps.
+    #              Optional: a head-only proxy fits steps 1-8 equally well at H = 8 and H = 30, and executing 8 of the
+    #              current H = 30 head's 30 rows was SLOWER in closed loop (0.0020 vs 0.0027 rad/step).
+    TrainConfig(
+        name="pi0_ode_put_bottles_h19base_sidecar_bs128_grip_h8",
+        model=pi0_ode.Pi0ODEConfig(action_horizon=8, gripper_head_dims=(6, 13)),
+        data=LeRobotScizorSidecarODEDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            scizor_sidecar_path="",
+            scizor_eps_s=0.5,
+            scizor_weight_mode="binary",
+            scizor_score_column="h19_drop",
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=ode_weight_loader.Pi0ODEWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=100, peak_lr=5e-5, decay_steps=7_500, decay_lr=5e-6),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_ode_put_bottles_grip_h8_infer",
+        model=pi0_ode.Pi0ODEConfig(action_horizon=8, gripper_head_dims=(6, 13)),
+        data=LeRobotYamODEDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=ode_weight_loader.Pi0ODEWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=7_500,
+    ),
+    TrainConfig(
+        name="pi0_ode_put_bottles_h19base_sidecar_bs128_grip",
+        model=pi0_ode.Pi0ODEConfig(action_horizon=30, gripper_head_dims=(6, 13)),
+        data=LeRobotScizorSidecarODEDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+            scizor_sidecar_path="",
+            scizor_eps_s=0.5,
+            scizor_weight_mode="binary",
+            scizor_score_column="h19_drop",
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=ode_weight_loader.Pi0ODEWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=100, peak_lr=5e-5, decay_steps=7_500, decay_lr=5e-6),
+        num_train_steps=7_500,
+        save_interval=2_500,
+        keep_period=2_500,
+        rabc_enabled=True,
+    ),
+    TrainConfig(
+        name="pi0_ode_put_bottles_grip_infer",
+        model=pi0_ode.Pi0ODEConfig(action_horizon=30, gripper_head_dims=(6, 13)),
+        data=LeRobotYamODEDataConfig(
+            repo_id="sim_put_bottles_mjwarp_rmperobj",
+            default_prompt="Put the plastic bottles in the bin",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=128,
+        num_workers=8,
+        weight_loader=ode_weight_loader.Pi0ODEWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=7_500,
+    ),
     # CPU / single-GPU plumbing check: tiny Gemma ("dummy"), fake data, no pretrained weights.
     TrainConfig(
         name="debug_pi0_ode",

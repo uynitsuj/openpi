@@ -40,6 +40,20 @@ def author_linear(in_features: int, out_features: int, *, rngs: nnx.Rngs, zero: 
     return nnx.Linear(in_features, out_features, kernel_init=init, bias_init=init, rngs=rngs)
 
 
+class GripperHead(nnx.Module):
+    """Direct (non-integrated) prediction of near-binary dimensions from the condition (paper: grippers go to a
+    head on c, not into the ODE state). Linear(C, C) -> SiLU -> Linear(C, H * n), as the author's GripperHead."""
+
+    def __init__(self, cond_dim: int, horizon: int, num_dims: int, *, rngs: nnx.Rngs):
+        self.hidden = author_linear(cond_dim, cond_dim, rngs=rngs)
+        self.output = author_linear(cond_dim, horizon * num_dims, rngs=rngs)
+        self.horizon, self.num_dims = horizon, num_dims
+
+    def __call__(self, c):
+        out = self.output(jax.nn.silu(self.hidden(c)))
+        return out.reshape(*c.shape[:-1], self.horizon, self.num_dims)
+
+
 class FiLMLayer(nnx.Module):
     def __init__(self, width: int, cond_dim: int, *, rngs: nnx.Rngs):
         self.lin = author_linear(width, width, rngs=rngs)

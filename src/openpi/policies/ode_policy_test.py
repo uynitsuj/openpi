@@ -275,3 +275,65 @@ def test_websocket_round_trip(tiny_policy):
     obs = _world_obs(np.random.default_rng(2), 1)[0]
     out = client.infer(obs)
     assert np.asarray(out["actions"]).shape == (30, 14)
+
+
+def test_carry_snaps_integrated_gripper_reference():
+    fake = _FakeSample()
+    slope = np.r_[1 / (NORM["actions"].std[:14] + 1e-6), np.zeros(18)].astype(np.float32)
+    carry = ode_policy.ODECarry(
+        fake, executed_steps=30, action_slope=slope, jump_dims=ode_policy.yam_arm_dims(), reset_jump_rad=0.5,
+        snap_dims=(6, 13), snap_levels=np.array([[-1.0, 2.0], [-3.0, 0.5]], np.float32),
+    )  # fmt: skip
+    a1 = np.asarray(carry(None, _obs(np.zeros((3, 32), np.float32))))
+    carry(None, _obs(np.zeros((3, 32), np.float32)))
+    start = np.asarray(fake.starts[1])
+    arm = list(ode_policy.yam_arm_dims())
+    np.testing.assert_allclose(start[:, arm], a1[:, 29, arm])  # arm joints carried as is
+    for d, (lo, hi) in zip((6, 13), ((-1.0, 2.0), (-3.0, 0.5)), strict=True):
+        expect = np.where(np.abs(a1[:, 29, d] - lo) <= np.abs(a1[:, 29, d] - hi), lo, hi)
+        np.testing.assert_allclose(start[:, d], expect)
+
+
+def test_truncate_chunk():
+    fake = _FakeSample()
+    out = ode_policy.TruncateChunk(fake, 8)(None, _obs(np.zeros((2, 32), np.float32)))
+    assert np.asarray(out).shape[1] == 8
+
+
+def test_gripper_head_policy_execute_8_of_30(tmp_path, monkeypatch):
+    """Serving the gripper-head model with OPENPI_EXECUTE_STEPS=8: 8-row chunks, carry from row 7 (per world)."""
+    from flax import nnx
+    import orbax.checkpoint as ocp
+
+    from openpi.models import pi0_ode as _p
+    from openpi.policies import policy_config
+    from openpi.training import config as _config
+
+    monkeypatch.setenv("OPENPI_EXECUTE_STEPS", "8")
+    train_cfg = dataclasses.replace(
+        _config.get_config("pi0_ode_put_bottles_grip_infer"),
+        model=_p.Pi0ODEConfig(paligemma_variant="dummy", action_horizon=30, gripper_head_dims=(6, 13)),
+    )
+    model = train_cfg.model.create(jax.random.key(0))
+    model.ode_field.out.kernel.value = (
+        jax.random.normal(jax.random.key(1), model.ode_field.out.kernel.value.shape) * 0.05
+    )
+    params = jax.tree.map(lambda x: x.astype(jnp.bfloat16), nnx.state(model).to_pure_dict())
+    with ocp.PyTreeCheckpointer() as c:
+        c.save(tmp_path / "params", {"params": params})
+    _normalize.save(tmp_path / "assets" / "sim_put_bottles_mjwarp_rmperobj", NORM)
+    p = policy_config.create_trained_policy(train_cfg, tmp_path)
+    assert p._ode_carry.executed_steps == 8
+    rng = np.random.default_rng(0)
+    obs = _world_obs(rng, 3)
+    a1 = _batched_infer(p, obs)
+    assert a1.shape == (3, 8, 14)
+    obs2 = _world_obs(rng, 3)
+    for o, a in zip(obs2, a1, strict=True):
+        o["state"] = a[-1] + 0.01
+    a2 = _batched_infer(p, obs2)
+    arm = list(ode_policy.yam_arm_dims())
+    assert p._ode_carry.stats["carried_rows"] == 3 and p._ode_carry.stats["jump_resets"] == 0
+    # continues from row 7 per world: the boundary step is an ordinary integration step, not a restart
+    step_in = np.abs(np.diff(a2[:, :, arm], axis=1)).max()
+    assert np.abs(a2[:, 0, arm] - a1[:, -1, arm]).max() <= 1.5 * step_in + 1e-4

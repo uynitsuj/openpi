@@ -3,7 +3,7 @@
 Every parameter of the source checkpoint is either inherited unchanged (PaliGemma: SigLIP image encoder and the
 Gemma 2B VLM stream) or explicitly dropped (pi0's action expert stream `*_1` inside the LLM, and pi0's action /
 state / time projections). The only target parameters that may be missing from the source are the new ODE head
-groups (`ode_query`, `ode_field`), which keep their fresh initialisation. Anything else -- an unexpected extra or
+groups (`ode_query`, `ode_field`, and `ode_gripper` when the model has a gripper head), which keep their fresh initialisation. Anything else -- an unexpected extra or
 missing key, a shape mismatch -- raises. This loader is for initialisation from pi0_base only; resuming or serving
 a trained Pi0ODE checkpoint goes through the normal checkpoint restore.
 """
@@ -37,6 +37,8 @@ EXPERT_MODULES = frozenset(
 PI0_HEADS = frozenset(("state_proj", "action_in_proj", "action_time_mlp_in", "action_time_mlp_out", "action_out_proj"))
 PI0_HEAD_KEYS = frozenset(f"{h}/{p}" for h in PI0_HEADS for p in ("kernel", "bias"))
 NEW_GROUPS = frozenset(("ode_query", "ode_field"))
+# Optional new groups (present only for some Pi0ODEConfig settings): the direct gripper head (gripper_head_dims).
+OPTIONAL_NEW_GROUPS = frozenset(("ode_gripper",))
 
 
 def is_expert_key(key: str) -> bool:
@@ -58,8 +60,11 @@ def plan(src_shapes: dict[str, tuple], ref_shapes: dict[str, tuple]) -> tuple[se
         raise ValueError("Target model unexpectedly has action-expert / pi0 head parameters")
     new = ref - src
     groups = {k.split("/")[0] for k in new}
-    if groups != NEW_GROUPS:
-        raise ValueError(f"Unexpected missing parameter groups {sorted(groups)} (expected {sorted(NEW_GROUPS)})")
+    if not NEW_GROUPS <= groups <= NEW_GROUPS | OPTIONAL_NEW_GROUPS:
+        raise ValueError(
+            f"Unexpected missing parameter groups {sorted(groups)} "
+            f"(expected {sorted(NEW_GROUPS)} + optionally {sorted(OPTIONAL_NEW_GROUPS)})"
+        )
     inherited = src & ref
     for k in sorted(inherited):
         if tuple(src_shapes[k]) != tuple(ref_shapes[k]):
